@@ -5,7 +5,17 @@ Lerne Japanisch spielerisch durch Manga-Panels. Lade ein Manga-Panel hoch, erken
 ## Features
 
 ### Scanner
-Panel hochladen → OCR erkennt japanischen Text (inkl. Bounding Boxes) → Übersetzung anzeigen.
+Panel hochladen → Text-Regionen erkennen (comic-text-detector) → OCR liest japanischen Text → Übersetzung anzeigen.
+
+### Text Detection (comic-text-detector Pipeline)
+Vollständige Implementierung der [comic-text-detector](https://github.com/dmMaze/comic-text-detector) Pipeline:
+- **YOLOv5** Block-Detektor (Bounding Boxes für Textblöcke)
+- **UNet** Segmentierungsmaske (Pixel-Level Text-Erkennung)
+- **DBNet** Text-Linien-Detektor (SegDetectorRepresenter mit Polygon-Unclipping)
+- **Grouping:** Linien → Blöcke zuordnen, Orientierung erkennen (vertikal/horizontal), Font-Größe, Winkel
+- **Merge/Split:** Verstreute Linien zusammenführen, große Blöcke bei Abstandslücken aufteilen
+- **Mask Refinement:** Per-Block Masken-Verfeinerung (Otsu + Top-K Farb-Thresholding)
+- **Reading Order:** Manga-Lesereihenfolge (rechts-nach-links, oben-nach-unten)
 
 ### Lernmodus
 Vokabeln aus gescannten Panels lernen. Wort anzeigen → Bedeutung raten → Fortschritt tracken (dateibasiert).
@@ -23,6 +33,7 @@ manga_language_learner/
 │   │   ├── scanner.py        POST /api/scanner/upload, GET /api/scanner/panels, OCR-Cache
 │   │   └── learning.py       GET /api/learning/panels, Vokabel-Extraktion, Fortschritt
 │   └── services/
+│       ├── text_region_detector.py  Comic-Text-Detector Pipeline (YOLOv5+UNet+DBNet via ONNX)
 │       ├── gemini_service.py  Gemini Vision OCR + Übersetzung (primär)
 │       ├── ollama_service.py  Ollama Vision OCR + Übersetzung (Fallback)
 │       ├── ocr_service.py     Legacy: Google Vision, manga-ocr, EasyOCR (nicht aktiv)
@@ -111,6 +122,8 @@ GOOGLE_PROJECT_ID=your-project-id
 ## Tech Stack
 
 - **Backend:** Python 3.13, FastAPI, Uvicorn
+- **Text Detection:** comic-text-detector (ONNX, OpenCV DNN) – YOLOv5 + UNet + DBNet
 - **OCR/Translation:** Google Gemini Vision API (primär), Ollama + minicpm-v (Fallback)
 - **Frontend:** HTML, CSS, JavaScript (vanilla, kein Framework)
+- **Dependencies:** pyclipper, shapely (für DBNet Polygon-Unclipping)
 - **Infrastruktur:** Ollama auf Remote-GPU-Rechner (10.100.10.112, selber wie KORA-E)

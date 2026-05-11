@@ -1,6 +1,7 @@
 """
 Ollama Vision-based manga OCR + Translation service.
-2-step pipeline: Read all text (vision) → Translate (text-only)
+Pipeline: Read text (vision) → Translate → Detect N regions (OpenCV) → Match
+Ollama determines the text blocks, OpenCV finds where they are on the image.
 """
 import base64
 import json
@@ -12,6 +13,7 @@ import requests
 from PIL import Image
 
 from config import TRANSLATION_TARGET_LANGUAGE, OLLAMA_BASE_URL, OLLAMA_MODEL
+from services.text_region_detector import detect_text_regions
 
 logger = logging.getLogger(__name__)
 
@@ -109,17 +111,18 @@ class OllamaOCRService:
         return r.json().get("response", "").strip()
 
     def _parse_numbered_list(self, text: str) -> List[str]:
-        """Parse a numbered list response into individual items."""
+        """Parse a numbered list response into individual items.
+        Only accepts lines that start with a number (rejects preamble text)."""
         lines = text.strip().split("\n")
         items = []
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-            # Remove numbering like "1.", "1)", "1:"
-            cleaned = re.sub(r'^\d+[\.\)\:]\s*', '', line)
-            if cleaned:
-                items.append(cleaned)
+            # Only accept lines starting with a number (1. / 1) / 1:)
+            m = re.match(r'^(\d+)[\.\)\:]\s*(.*)', line)
+            if m and m.group(2):
+                items.append(m.group(2))
         return items
 
     # ── Step 1: Read all text from image ─────────────────────────
@@ -182,7 +185,7 @@ class OllamaOCRService:
             with open(image_path, "rb") as f:
                 image_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-            # Step 1: Read all text
+            # Step 1: Ollama reads all text from the image
             texts = self._step_read_all(image_b64)
             if not texts:
                 return {
@@ -194,19 +197,38 @@ class OllamaOCRService:
                     "image_height": img_h,
                 }
 
-            # Step 2: Translate
+            # Step 2: Ollama translates
             translations = self._step_translate(texts, target_lang)
 
-            # Build annotations (no bounding boxes from Ollama)
+            # Step 3: OpenCV finds text regions – request exactly as many
+            #         as Ollama found text blocks
+            n_blocks = len(texts)
+            regions = detect_text_regions(image_path, max_regions=n_blocks)
+            logger.info(f"OpenCV returned {len(regions)} regions for {n_blocks} text blocks")
+
+            # Step 4: Match by reading order (both sorted right→left, top→bottom)
             annotations = []
-            for text, translation in zip(texts, translations):
+            for i, (text, translation) in enumerate(zip(texts, translations)):
                 if not text:
                     continue
+                region = regions[i] if i < len(regions) else None
+                # Convert {x, y, width, height} to [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+                # to match the frontend's expected format (Gemini-compatible)
+                bbox = None
+                if region:
+                    rx, ry = region["x"], region["y"]
+                    rw, rh = region["width"], region["height"]
+                    bbox = [
+                        [rx, ry],
+                        [rx + rw, ry],
+                        [rx + rw, ry + rh],
+                        [rx, ry + rh],
+                    ]
                 annotations.append({
                     "text": text,
                     "translated": translation,
                     "confidence": 0.7,
-                    "bbox": None,
+                    "bbox": bbox,
                     "char_count": len(text),
                 })
 

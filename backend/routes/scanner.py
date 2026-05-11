@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from services.image_service import ImageService
 from services.gemini_service import GeminiOCRService
 from services.ollama_service import OllamaOCRService
+from services import manga_ocr_service
 import hashlib
 import json
 import logging
@@ -12,7 +13,8 @@ from config import BASE_DIR
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/scanner", tags=["scanner"])
 
-# Primary: Gemini Vision, Fallback: Ollama local vision model
+# Primary: manga-ocr (comic-text-detector + manga_ocr model)
+# Fallback: Gemini Vision, then Ollama local vision model
 gemini_service = GeminiOCRService()
 ollama_service = OllamaOCRService()
 
@@ -60,12 +62,21 @@ def _save_to_cache(panel_path: Path, result: dict):
 
 
 def _run_ocr(panel_path: Path) -> dict:
-    """Run OCR with caching. Returns cached result if available."""
+    """Run OCR with caching. Primary: manga-ocr, fallback: Gemini/Ollama."""
     cached = _get_cached_result(panel_path)
     if cached:
         logger.info(f"OCR cache hit for {panel_path.name}")
         return cached
 
+    # Primary: manga-ocr (comic-text-detector + manga_ocr model)
+    if manga_ocr_service.is_available():
+        result = manga_ocr_service.extract_and_translate(str(panel_path))
+        if result["success"]:
+            _save_to_cache(panel_path, result)
+            return result
+        logger.warning(f"manga-ocr pipeline failed: {result.get('error')}")
+
+    # Fallback: LLM-based vision services
     for svc in [gemini_service, ollama_service]:
         if svc.is_available():
             result = svc.extract_and_translate(str(panel_path))

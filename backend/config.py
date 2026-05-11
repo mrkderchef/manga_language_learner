@@ -21,8 +21,8 @@ GOOGLE_PROJECT_ID = os.getenv("GOOGLE_PROJECT_ID", "")
 # Gemini API
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# Ollama (remote server – same GPU machine as KORA-E)
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.100.10.112:11434")
+# Ollama (remote GPU server)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.108.19.14:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "minicpm-v:8b")
 
 # API Settings
