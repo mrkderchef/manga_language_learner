@@ -1,7 +1,6 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException
 from pydantic import BaseModel
 from services.image_service import ImageService
-from services.gemini_service import GeminiOCRService
 from services.ollama_service import OllamaOCRService
 from services import manga_ocr_service
 import asyncio
@@ -16,8 +15,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/scanner", tags=["scanner"])
 
 # Primary: manga-ocr (comic-text-detector + manga_ocr model)
-# Fallback: Gemini Vision, then Ollama local vision model
-gemini_service = GeminiOCRService()
+# Fallback: Ollama vision model
 ollama_service = OllamaOCRService()
 
 # OCR result cache directory
@@ -27,8 +25,6 @@ OCR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _get_vision_service():
     """Return the first available vision service."""
-    if gemini_service.is_available():
-        return gemini_service
     if ollama_service.is_available():
         return ollama_service
     return None
@@ -64,7 +60,7 @@ def _save_to_cache(panel_path: Path, result: dict):
 
 
 def _run_ocr(panel_path: Path) -> dict:
-    """Run OCR with caching. Primary: manga-ocr, fallback: Gemini/Ollama."""
+    """Run OCR with caching. Primary: manga-ocr, fallback: Ollama."""
     cached = _get_cached_result(panel_path)
     if cached:
         logger.info(f"OCR cache hit for {panel_path.name}")
@@ -81,8 +77,8 @@ def _run_ocr(panel_path: Path) -> dict:
     except Exception as e:
         logger.error(f"manga-ocr pipeline exception: {e}\n{traceback.format_exc()}")
 
-    # Fallback: LLM-based vision services
-    for svc in [gemini_service, ollama_service]:
+    # Fallback: LLM-based vision service (Ollama)
+    for svc in [ollama_service]:
         try:
             if svc.is_available():
                 result = svc.extract_and_translate(str(panel_path))
@@ -132,12 +128,12 @@ async def scan_panel(filename: str):
 
     if result:
         return result
-    raise HTTPException(status_code=503, detail="No vision service available (Gemini quota exhausted, Ollama not running)")
+    raise HTTPException(status_code=503, detail="No vision service available (Ollama not running)")
 
 
 @router.post("/{filename}/scan-translate")
 async def scan_and_translate(filename: str):
-    """OCR + Übersetzung in einem Schritt - Gemini oder Ollama Fallback"""
+    """OCR + Übersetzung in einem Schritt - Ollama Fallback"""
     panel_path = ImageService.get_panel_by_filename(filename)
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
@@ -151,7 +147,7 @@ async def scan_and_translate(filename: str):
 
     if result:
         return result
-    raise HTTPException(status_code=503, detail="No vision service available (Gemini quota exhausted, Ollama not running)")
+    raise HTTPException(status_code=503, detail="No vision service available (Ollama not running)")
 
 
 @router.post("/translate")

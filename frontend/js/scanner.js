@@ -141,10 +141,6 @@ const Scanner = (() => {
         const scaleX = displayW / imgNatW;
         const scaleY = displayH / imgNatH;
 
-        const container = panelImg.parentElement;
-        const offsetX = (container.clientWidth - displayW) / 2;
-        const offsetY = (container.clientHeight - displayH) / 2;
-
         // Build all boxes in a document fragment (single reflow)
         const frag = document.createDocumentFragment();
 
@@ -152,8 +148,8 @@ const Scanner = (() => {
             if (!ann.bbox || ann.bbox.length < 4) return;
 
             const [[x1, y1], [x2, y2], [x3, y3], [x4, y4]] = ann.bbox;
-            const left = Math.min(x1, x4) * scaleX + offsetX;
-            const top = Math.min(y1, y2) * scaleY + offsetY;
+            const left = Math.min(x1, x4) * scaleX;
+            const top = Math.min(y1, y2) * scaleY;
             const width = (Math.max(x2, x3) - Math.min(x1, x4)) * scaleX;
             const height = (Math.max(y3, y4) - Math.min(y1, y2)) * scaleY;
 

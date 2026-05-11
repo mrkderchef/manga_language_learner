@@ -33,46 +33,42 @@ def _get_mocr():
 
 
 def _translate_texts(texts: list[str], target_lang: str = "en") -> list[str]:
-    """Translate a batch of Japanese texts. Uses available translation backend."""
+    """Translate a batch of Japanese texts using Ollama with manga context."""
     if not texts:
         return []
 
-    # Try Gemini for batch translation (fast, already configured)
-    try:
-        from services.gemini_service import GeminiOCRService
-        from config import GEMINI_API_KEY
-        if GEMINI_API_KEY:
-            svc = GeminiOCRService()
-            if svc.is_available():
-                translations = []
-                for t in texts:
-                    result = svc.translate_text(t, target_lang)
-                    if result.get("success"):
-                        translations.append(result["translated"])
-                    else:
-                        translations.append("")
-                if any(translations):
-                    return translations
-    except Exception as e:
-        logger.warning(f"Gemini translation failed: {e}")
+    lang_names = {"en": "English", "de": "German", "fr": "French", "es": "Spanish"}
+    lang_name = lang_names.get(target_lang, target_lang)
 
-    # Try Google Translate
+    # Primary: Ollama batch translation with context
     try:
-        from services.translation_service import TranslationService
-        svc = TranslationService()
-        if svc.use_google_translate:
+        from services.ollama_service import OllamaOCRService
+        svc = OllamaOCRService()
+        if svc.is_available():
+            translations = _ollama_batch_translate(svc, texts, lang_name)
+            if translations and any(translations):
+                return translations
+    except Exception as e:
+        logger.warning(f"Ollama batch translation failed: {e}")
+
+    # Fallback: per-text Ollama translation
+    try:
+        from services.ollama_service import OllamaOCRService
+        svc = OllamaOCRService()
+        if svc.is_available():
             translations = []
             for t in texts:
-                result = svc.translate_text(t, source_language="ja", target_language=target_lang)
+                result = svc.translate_text(t, target_lang)
                 if result.get("success"):
                     translations.append(result["translated"])
                 else:
                     translations.append("")
-            return translations
+            if any(translations):
+                return translations
     except Exception as e:
-        logger.warning(f"Translation service failed: {e}")
+        logger.warning(f"Ollama per-text translation failed: {e}")
 
-    # Fallback: MyMemory free API
+    # Last resort: MyMemory free API
     try:
         import requests
         translations = []
@@ -94,6 +90,54 @@ def _translate_texts(texts: list[str], target_lang: str = "en") -> list[str]:
     except Exception as e:
         logger.warning(f"Fallback translation also failed: {e}")
         return [""] * len(texts)
+
+
+def _ollama_batch_translate(svc, texts: list[str], lang_name: str) -> list[str]:
+    """Translate all texts in one Ollama call with manga dialogue context."""
+    import json
+    import re
+
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
+    prompt = f"""You are translating Japanese manga dialogue to {lang_name}.
+These are speech bubbles from the same manga page, in reading order.
+Translate naturally and contextually — use conversational tone appropriate for manga.
+Do NOT translate literally. Capture the intent, emotion, and natural speech patterns.
+Keep sound effects descriptive (e.g. ビリリ → *riiip*).
+For short exclamations or reactions, keep them punchy.
+
+Japanese texts:
+{numbered}
+
+Respond with ONLY a JSON array of {lang_name} translations in the same order.
+Example: ["translation 1", "translation 2"]"""
+
+    try:
+        text_model = svc._find_text_model()
+        response = svc._call_ollama(prompt, model=text_model)
+        text = response.strip()
+        # Extract JSON array from response
+        json_match = re.search(r'\[.*\]', text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            if isinstance(result, list):
+                # Pad or truncate to match input length
+                while len(result) < len(texts):
+                    result.append("")
+                return result[:len(texts)]
+    except Exception as e:
+        logger.warning(f"Ollama batch translate parse error: {e}")
+
+    # Fallback: parse as numbered list
+    try:
+        translations = svc._parse_numbered_list(response)
+        if translations:
+            while len(translations) < len(texts):
+                translations.append("")
+            return translations[:len(texts)]
+    except Exception:
+        pass
+
+    return None
 
 
 def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
