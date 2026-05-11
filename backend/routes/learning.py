@@ -1,8 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from services.image_service import ImageService
-from services.ocr_service import OCRService
-from services.translation_service import TranslationService
+from routes.scanner import _run_ocr
 import logging
 import json
 from pathlib import Path
@@ -10,9 +9,6 @@ from config import BASE_DIR
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/learning", tags=["learning"])
-
-ocr_service = OCRService()
-translation_service = TranslationService()
 
 # Simple file-based progress store
 PROGRESS_FILE = BASE_DIR / "backend" / "data" / "progress.json"
@@ -50,29 +46,22 @@ async def get_panel_vocab(filename: str):
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
 
-    # OCR ausführen
-    ocr_result = ocr_service.extract_text_from_image(str(panel_path))
-    if not ocr_result["success"]:
-        raise HTTPException(status_code=500, detail="OCR failed")
+    # Use shared cached OCR pipeline
+    result = _run_ocr(panel_path)
 
-    text = ocr_result.get("text", "")
-    if not text:
-        return {"vocab": [], "panel": filename}
+    if not result or not result.get("success"):
+        raise HTTPException(status_code=503, detail="No vision service available")
 
-    # Text in Wörter/Phrasen zerlegen (einfache Variante: Zeilen)
-    # TODO: Morphologische Analyse (MeCab o.ä.) für bessere Segmentierung
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-
+    annotations = result.get("annotations", [])
     vocab = []
-    for line in lines:
-        # Übersetze jede Zeile einzeln
-        trans_result = translation_service.translate_text(line)
-        meaning = trans_result.get("translated", "") if trans_result.get("success") else ""
-        vocab.append({
-            "japanese": line,
-            "reading": "",  # TODO: Furigana/Reading via NLP
-            "meaning": meaning,
-        })
+    for ann in annotations:
+        jp = ann.get("text", "").strip()
+        if jp:
+            vocab.append({
+                "japanese": jp,
+                "reading": "",
+                "meaning": ann.get("translated", ""),
+            })
 
     return {"vocab": vocab, "panel": filename}
 

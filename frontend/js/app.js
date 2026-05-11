@@ -16,7 +16,7 @@
         const activeLink = document.querySelector(`[data-page="${pageName}"]`);
         if (activeLink) activeLink.classList.add('active');
 
-        // Reload data when navigating to pages
+        // Lazy-load data only when navigating to the page
         if (pageName === 'scanner') Scanner.loadPanels();
         if (pageName === 'learning') Learning.loadPanels();
     }
@@ -36,7 +36,7 @@
         });
     });
 
-    // Initialize modules
+    // Initialize modules (no data loading until navigation)
     Scanner.init();
     Learning.init();
 })();

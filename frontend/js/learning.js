@@ -7,10 +7,10 @@ const Learning = (() => {
     let vocab = [];
     let currentVocabIndex = 0;
     let knownCount = 0;
+    let _panelsLoaded = false;
 
     function init() {
         bindEvents();
-        loadPanels();
     }
 
     function bindEvents() {
@@ -20,10 +20,12 @@ const Learning = (() => {
         document.getElementById('btn-next-panel').addEventListener('click', nextPanel);
     }
 
-    async function loadPanels() {
+    async function loadPanels(force = false) {
+        if (_panelsLoaded && !force) return;
         try {
             const data = await API.getLearningPanels();
             panels = data.panels || [];
+            _panelsLoaded = true;
             if (panels.length > 0) {
                 loadPanel(0);
             }
@@ -37,7 +39,12 @@ const Learning = (() => {
         currentPanelIndex = index;
         const panel = panels[index];
 
-        document.getElementById('learning-panel-img').src = API.panelImageUrl(panel.filename);
+        document.getElementById('learning-panel-img').src = API.panelImageUrl(panel.path || panel.filename);
+
+        // Show loading state on vocab card
+        document.getElementById('vocab-japanese').innerHTML = '<div class="skeleton-text"></div>';
+        document.getElementById('vocab-reading').textContent = '';
+        document.getElementById('vocab-meaning').textContent = '';
 
         try {
             const data = await API.getPanelVocab(panel.filename);

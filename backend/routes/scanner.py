@@ -1,16 +1,80 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException
 from pydantic import BaseModel
 from services.image_service import ImageService
-from services.ocr_service import OCRService
-from services.translation_service import TranslationService
-from PIL import Image
+from services.gemini_service import GeminiOCRService
+from services.ollama_service import OllamaOCRService
+import hashlib
+import json
 import logging
+from pathlib import Path
+from config import BASE_DIR
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/scanner", tags=["scanner"])
 
-ocr_service = OCRService()
-translation_service = TranslationService()
+# Primary: Gemini Vision, Fallback: Ollama local vision model
+gemini_service = GeminiOCRService()
+ollama_service = OllamaOCRService()
+
+# OCR result cache directory
+OCR_CACHE_DIR = BASE_DIR / "backend" / "data" / "ocr_cache"
+OCR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _get_vision_service():
+    """Return the first available vision service."""
+    if gemini_service.is_available():
+        return gemini_service
+    if ollama_service.is_available():
+        return ollama_service
+    return None
+
+
+def _cache_key(panel_path: Path) -> str:
+    """Generate a cache key from file path + modification time."""
+    stat = panel_path.stat()
+    raw = f"{panel_path}:{stat.st_size}:{stat.st_mtime}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _get_cached_result(panel_path: Path):
+    """Return cached OCR result if available and still valid."""
+    key = _cache_key(panel_path)
+    cache_file = OCR_CACHE_DIR / f"{key}.json"
+    if cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return None
+
+
+def _save_to_cache(panel_path: Path, result: dict):
+    """Persist a successful OCR result to disk cache."""
+    key = _cache_key(panel_path)
+    cache_file = OCR_CACHE_DIR / f"{key}.json"
+    try:
+        cache_file.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to write OCR cache: {e}")
+
+
+def _run_ocr(panel_path: Path) -> dict:
+    """Run OCR with caching. Returns cached result if available."""
+    cached = _get_cached_result(panel_path)
+    if cached:
+        logger.info(f"OCR cache hit for {panel_path.name}")
+        return cached
+
+    for svc in [gemini_service, ollama_service]:
+        if svc.is_available():
+            result = svc.extract_and_translate(str(panel_path))
+            if result["success"]:
+                _save_to_cache(panel_path, result)
+                return result
+            logger.warning(f"{type(svc).__name__} failed: {result.get('error')}")
+
+    return None
 
 
 class TranslateRequest(BaseModel):
@@ -40,55 +104,23 @@ async def scan_panel(filename: str):
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
 
-    result = ocr_service.extract_text_from_image(str(panel_path))
-    if not result["success"]:
-        raise HTTPException(status_code=500, detail=result.get("error", "OCR failed"))
-
-    # Add image dimensions for frontend overlay positioning
-    try:
-        img = Image.open(str(panel_path))
-        result["image_width"], result["image_height"] = img.size
-    except Exception:
-        pass
-
-    return result
+    result = _run_ocr(panel_path)
+    if result:
+        return result
+    raise HTTPException(status_code=503, detail="No vision service available (Gemini quota exhausted, Ollama not running)")
 
 
 @router.post("/{filename}/scan-translate")
 async def scan_and_translate(filename: str):
-    """OCR + Übersetzung in einem Schritt - gibt Bounding Boxes mit Übersetzungen zurück"""
+    """OCR + Übersetzung in einem Schritt - Gemini oder Ollama Fallback"""
     panel_path = ImageService.get_panel_by_filename(filename)
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
 
-    ocr_result = ocr_service.extract_text_from_image(str(panel_path))
-    if not ocr_result["success"]:
-        raise HTTPException(status_code=500, detail=ocr_result.get("error", "OCR failed"))
-
-    # Get image dimensions
-    try:
-        img = Image.open(str(panel_path))
-        img_w, img_h = img.size
-    except Exception:
-        img_w, img_h = 0, 0
-
-    # Translate each annotation
-    annotations = ocr_result.get("annotations", [])
-    for ann in annotations:
-        text = ann.get("text", "")
-        if text.strip():
-            trans = translation_service.translate_text(text)
-            ann["translated"] = trans.get("translated", "") if trans.get("success") else ""
-        else:
-            ann["translated"] = ""
-
-    return {
-        "success": True,
-        "text": ocr_result.get("text", ""),
-        "annotations": annotations,
-        "image_width": img_w,
-        "image_height": img_h,
-    }
+    result = _run_ocr(panel_path)
+    if result:
+        return result
+    raise HTTPException(status_code=503, detail="No vision service available (Gemini quota exhausted, Ollama not running)")
 
 
 @router.post("/translate")
@@ -96,7 +128,11 @@ async def translate_text(req: TranslateRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="No text provided")
 
-    result = translation_service.translate_text(req.text)
+    svc = _get_vision_service()
+    if not svc:
+        raise HTTPException(status_code=503, detail="No vision service available")
+
+    result = svc.translate_text(req.text)
     if not result["success"]:
         raise HTTPException(status_code=500, detail=result.get("error", "Translation failed"))
     return result

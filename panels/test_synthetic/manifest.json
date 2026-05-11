@@ -1,0 +1,167 @@
+{
+  "description": "Synthetic manga test panels for OCR evaluation",
+  "panels": [
+    {
+      "id": "test_simple_01",
+      "image": "test_simple_01.png",
+      "bubbles": [
+        {
+          "text": "おはよう",
+          "position": [
+            150,
+            100
+          ],
+          "size": [
+            160,
+            120
+          ]
+        },
+        {
+          "text": "元気ですか",
+          "position": [
+            400,
+            250
+          ],
+          "size": [
+            160,
+            140
+          ]
+        }
+      ]
+    },
+    {
+      "id": "test_vertical_02",
+      "image": "test_vertical_02.png",
+      "bubbles": [
+        {
+          "text": "行くぞ",
+          "position": [
+            120,
+            80
+          ],
+          "size": [
+            100,
+            160
+          ]
+        },
+        {
+          "text": "待って",
+          "position": [
+            350,
+            150
+          ],
+          "size": [
+            100,
+            130
+          ]
+        },
+        {
+          "text": "早く",
+          "position": [
+            500,
+            300
+          ],
+          "size": [
+            90,
+            110
+          ]
+        }
+      ]
+    },
+    {
+      "id": "test_dialog_03",
+      "image": "test_dialog_03.png",
+      "bubbles": [
+        {
+          "text": "何をしているの",
+          "position": [
+            100,
+            60
+          ],
+          "size": [
+            200,
+            130
+          ]
+        },
+        {
+          "text": "勉強しています",
+          "position": [
+            380,
+            200
+          ],
+          "size": [
+            200,
+            130
+          ]
+        },
+        {
+          "text": "すごいね",
+          "position": [
+            150,
+            350
+          ],
+          "size": [
+            150,
+            110
+          ]
+        }
+      ]
+    },
+    {
+      "id": "test_katakana_04",
+      "image": "test_katakana_04.png",
+      "bubbles": [
+        {
+          "text": "コンピュータ",
+          "position": [
+            130,
+            100
+          ],
+          "size": [
+            180,
+            130
+          ]
+        },
+        {
+          "text": "プログラム",
+          "position": [
+            400,
+            250
+          ],
+          "size": [
+            170,
+            120
+          ]
+        }
+      ]
+    },
+    {
+      "id": "test_mixed_05",
+      "image": "test_mixed_05.png",
+      "bubbles": [
+        {
+          "text": "これは日本語です",
+          "position": [
+            100,
+            80
+          ],
+          "size": [
+            220,
+            140
+          ]
+        },
+        {
+          "text": "漫画を読む",
+          "position": [
+            380,
+            250
+          ],
+          "size": [
+            180,
+            130
+          ]
+        }
+      ]
+    }
+  ]
+}
