@@ -4,9 +4,11 @@ from services.image_service import ImageService
 from services.gemini_service import GeminiOCRService
 from services.ollama_service import OllamaOCRService
 from services import manga_ocr_service
+import asyncio
 import hashlib
 import json
 import logging
+import traceback
 from pathlib import Path
 from config import BASE_DIR
 
@@ -69,21 +71,27 @@ def _run_ocr(panel_path: Path) -> dict:
         return cached
 
     # Primary: manga-ocr (comic-text-detector + manga_ocr model)
-    if manga_ocr_service.is_available():
-        result = manga_ocr_service.extract_and_translate(str(panel_path))
-        if result["success"]:
-            _save_to_cache(panel_path, result)
-            return result
-        logger.warning(f"manga-ocr pipeline failed: {result.get('error')}")
-
-    # Fallback: LLM-based vision services
-    for svc in [gemini_service, ollama_service]:
-        if svc.is_available():
-            result = svc.extract_and_translate(str(panel_path))
+    try:
+        if manga_ocr_service.is_available():
+            result = manga_ocr_service.extract_and_translate(str(panel_path))
             if result["success"]:
                 _save_to_cache(panel_path, result)
                 return result
-            logger.warning(f"{type(svc).__name__} failed: {result.get('error')}")
+            logger.warning(f"manga-ocr pipeline failed: {result.get('error')}")
+    except Exception as e:
+        logger.error(f"manga-ocr pipeline exception: {e}\n{traceback.format_exc()}")
+
+    # Fallback: LLM-based vision services
+    for svc in [gemini_service, ollama_service]:
+        try:
+            if svc.is_available():
+                result = svc.extract_and_translate(str(panel_path))
+                if result["success"]:
+                    _save_to_cache(panel_path, result)
+                    return result
+                logger.warning(f"{type(svc).__name__} failed: {result.get('error')}")
+        except Exception as e:
+            logger.error(f"{type(svc).__name__} exception: {e}\n{traceback.format_exc()}")
 
     return None
 
@@ -115,7 +123,13 @@ async def scan_panel(filename: str):
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
 
-    result = _run_ocr(panel_path)
+    try:
+        # Run blocking OCR in thread pool to avoid blocking the event loop
+        result = await asyncio.get_event_loop().run_in_executor(None, _run_ocr, panel_path)
+    except Exception as e:
+        logger.error(f"OCR failed for {filename}: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"OCR processing error: {e}")
+
     if result:
         return result
     raise HTTPException(status_code=503, detail="No vision service available (Gemini quota exhausted, Ollama not running)")
@@ -128,7 +142,13 @@ async def scan_and_translate(filename: str):
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
 
-    result = _run_ocr(panel_path)
+    try:
+        # Run blocking OCR in thread pool to avoid blocking the event loop
+        result = await asyncio.get_event_loop().run_in_executor(None, _run_ocr, panel_path)
+    except Exception as e:
+        logger.error(f"OCR+translate failed for {filename}: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"OCR processing error: {e}")
+
     if result:
         return result
     raise HTTPException(status_code=503, detail="No vision service available (Gemini quota exhausted, Ollama not running)")
