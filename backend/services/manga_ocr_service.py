@@ -37,18 +37,38 @@ def _translate_texts(texts: list[str], target_lang: str = "en") -> list[str]:
     if not texts:
         return []
 
-    # Try Google Translate first
+    # Try Gemini for batch translation (fast, already configured)
+    try:
+        from services.gemini_service import GeminiOCRService
+        from config import GEMINI_API_KEY
+        if GEMINI_API_KEY:
+            svc = GeminiOCRService()
+            if svc.is_available():
+                translations = []
+                for t in texts:
+                    result = svc.translate_text(t, target_lang)
+                    if result.get("success"):
+                        translations.append(result["translated"])
+                    else:
+                        translations.append("")
+                if any(translations):
+                    return translations
+    except Exception as e:
+        logger.warning(f"Gemini translation failed: {e}")
+
+    # Try Google Translate
     try:
         from services.translation_service import TranslationService
         svc = TranslationService()
-        translations = []
-        for t in texts:
-            result = svc.translate_text(t, source_language="ja", target_language=target_lang)
-            if result.get("success"):
-                translations.append(result["translated"])
-            else:
-                translations.append("")
-        return translations
+        if svc.use_google_translate:
+            translations = []
+            for t in texts:
+                result = svc.translate_text(t, source_language="ja", target_language=target_lang)
+                if result.get("success"):
+                    translations.append(result["translated"])
+                else:
+                    translations.append("")
+            return translations
     except Exception as e:
         logger.warning(f"Translation service failed: {e}")
 
@@ -57,15 +77,18 @@ def _translate_texts(texts: list[str], target_lang: str = "en") -> list[str]:
         import requests
         translations = []
         for t in texts:
-            resp = requests.get(
-                "https://api.mymemory.translated.net/get",
-                params={"q": t, "langpair": f"ja|{target_lang}"},
-                timeout=5,
-            )
-            data = resp.json()
-            if data.get("responseStatus") == 200:
-                translations.append(data["responseData"]["translatedText"])
-            else:
+            try:
+                resp = requests.get(
+                    "https://api.mymemory.translated.net/get",
+                    params={"q": t, "langpair": f"ja|{target_lang}"},
+                    timeout=10,
+                )
+                data = resp.json()
+                if data.get("responseStatus") == 200:
+                    translations.append(data["responseData"]["translatedText"])
+                else:
+                    translations.append("")
+            except Exception:
                 translations.append("")
         return translations
     except Exception as e:
@@ -136,8 +159,8 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
     # Step 4: Build response
     annotations = []
     for text, translation, region in zip(recognized_texts, translations, valid_regions):
-        rx, ry = region["x"], region["y"]
-        rw, rh = region["width"], region["height"]
+        rx, ry = int(region["x"]), int(region["y"])
+        rw, rh = int(region["width"]), int(region["height"])
         bbox = [
             [rx, ry],
             [rx + rw, ry],

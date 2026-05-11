@@ -1153,23 +1153,32 @@ def detect_text_regions(image_path: str, max_regions: int | None = None) -> list
     regions = []
     for blk in blk_list:
         x1, y1, x2, y2 = blk.xyxy
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(img.shape[1], x2)
-        y2 = min(img.shape[0], y2)
+        x1 = max(0, int(x1))
+        y1 = max(0, int(y1))
+        x2 = min(img.shape[1], int(x2))
+        y2 = min(img.shape[0], int(y2))
         w, h = x2 - x1, y2 - y1
         if w <= 0 or h <= 0:
             continue
+
+        # Convert lines to plain Python lists (no numpy types)
+        lines_clean = []
+        for line in blk.lines:
+            if isinstance(line, np.ndarray):
+                lines_clean.append(line.tolist())
+            else:
+                lines_clean.append([[int(p[0]), int(p[1])] for p in line])
+
         regions.append({
-            "x": x1,
-            "y": y1,
-            "width": w,
-            "height": h,
-            "vertical": blk.vertical,
-            "language": blk.language,
-            "font_size": blk.font_size,
-            "angle": blk.angle,
-            "lines": blk.lines,
+            "x": int(x1),
+            "y": int(y1),
+            "width": int(w),
+            "height": int(h),
+            "vertical": bool(blk.vertical),
+            "language": str(blk.language),
+            "font_size": int(blk.font_size) if blk.font_size >= 0 else 0,
+            "angle": int(blk.angle),
+            "lines": lines_clean,
         })
 
     if max_regions and len(regions) > max_regions:
