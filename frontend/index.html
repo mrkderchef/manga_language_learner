@@ -1,13 +1,112 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Manga Language Learner</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
+    <link rel="stylesheet" href="css/main.css">
+    <link rel="stylesheet" href="css/scanner.css">
+    <link rel="stylesheet" href="css/learning.css">
+</head>
+<body>
+    <nav id="navbar">
+        <div class="nav-brand">漫画 Manga Learner</div>
+        <div class="nav-links">
+            <a href="#" data-page="home" class="nav-link active">Home</a>
+            <a href="#" data-page="scanner" class="nav-link">Scanner</a>
+            <a href="#" data-page="learning" class="nav-link">Lernmodus</a>
+        </div>
+    </nav>
+
+    <main id="app">
+        <!-- Home Page -->
+        <section id="page-home" class="page active">
+            <div class="hero">
+                <h1>Manga Language Learner</h1>
+                <p>Lerne Japanisch durch Manga-Panels</p>
+                <div class="mode-cards">
+                    <div class="mode-card" data-goto="scanner">
+                        <div class="mode-icon">🔍</div>
+                        <h2>Scanner</h2>
+                        <p>Lade ein Manga-Panel hoch, erkenne den Text per OCR und lass ihn übersetzen.</p>
+                    </div>
+                    <div class="mode-card" data-goto="learning">
+                        <div class="mode-icon">📚</div>
+                        <h2>Lernmodus</h2>
+                        <p>Lerne spielerisch Vokabeln und Grammatik direkt aus Manga-Panels.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Scanner Page -->
+        <section id="page-scanner" class="page">
+            <h1>Panel Scanner</h1>
+            <div class="scanner-layout">
+                <div class="panel-area">
+                    <div class="panel-selector">
+                        <h3>Panel auswählen</h3>
+                        <div id="panel-list" class="panel-grid"></div>
+                        <div class="upload-area" id="upload-area">
+                            <p>+ Panel hochladen</p>
+                            <input type="file" id="panel-upload" accept="image/jpeg,image/png" hidden>
+                        </div>
+                    </div>
+                    <div class="panel-display">
+                        <img id="scanner-panel-img" src="" alt="Manga Panel">
+                        <div id="ocr-overlay" class="ocr-overlay"></div>
+                    </div>
+                </div>
+                <div class="result-area">
+                    <div class="result-card">
+                        <h3>Erkannter Text (JP)</h3>
+                        <div id="ocr-result" class="result-text">Wähle ein Panel aus...</div>
+                    </div>
+                    <div class="result-card">
+                        <h3>Übersetzung</h3>
+                        <div id="translation-result" class="result-text">—</div>
+                    </div>
+                    <button id="btn-scan" class="btn btn-primary" disabled>Scannen & Übersetzen</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Learning Page -->
+        <section id="page-learning" class="page">
+            <h1>Lernmodus</h1>
+            <div class="learning-layout">
+                <div class="learning-panel-area">
+                    <img id="learning-panel-img" src="" alt="Manga Panel">
+                    <div id="learning-overlay" class="learning-overlay"></div>
+                </div>
+                <div class="learning-sidebar">
+                    <div class="progress-card">
+                        <h3>Fortschritt</h3>
+                        <div class="progress-bar">
+                            <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+                        </div>
+                        <p id="progress-text">0 / 0 Wörter</p>
+                    </div>
+                    <div class="vocab-card" id="vocab-card">
+                        <h3>Vokabel</h3>
+                        <div id="vocab-japanese" class="vocab-jp"></div>
+                        <div id="vocab-reading" class="vocab-reading"></div>
+                        <div id="vocab-meaning" class="vocab-meaning hidden"></div>
+                        <button id="btn-reveal" class="btn btn-primary">Bedeutung zeigen</button>
+                        <div class="vocab-actions hidden" id="vocab-actions">
+                            <button id="btn-knew" class="btn btn-success">Wusste ich ✓</button>
+                            <button id="btn-didnt-know" class="btn btn-danger">Wusste ich nicht ✗</button>
+                        </div>
+                    </div>
+                    <button id="btn-next-panel" class="btn btn-secondary">Nächstes Panel →</button>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src="js/api.js"></script>
+    <script src="js/scanner.js"></script>
+    <script src="js/learning.js"></script>
+    <script src="js/app.js"></script>
+</body>
 </html>

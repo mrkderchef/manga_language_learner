@@ -1,16 +1,21 @@
 from typing import List, Dict
-from google.cloud import translate_v2
 import os
 from config import GOOGLE_PROJECT_ID, TRANSLATION_SOURCE_LANGUAGE, TRANSLATION_TARGET_LANGUAGE
 import logging
 
 logger = logging.getLogger(__name__)
 
+try:
+    from google.cloud import translate_v2
+    HAS_GOOGLE_TRANSLATE = True
+except ImportError:
+    HAS_GOOGLE_TRANSLATE = False
+
 
 class TranslationService:
     def __init__(self):
         """Initialize Google Translate client"""
-        self.use_google_translate = bool(GOOGLE_PROJECT_ID)
+        self.use_google_translate = HAS_GOOGLE_TRANSLATE and bool(GOOGLE_PROJECT_ID)
         
         if self.use_google_translate:
             try:

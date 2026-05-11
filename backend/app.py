@@ -1,26 +1,27 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import logging
 from pathlib import Path
-from config import API_HOST, API_PORT, API_TITLE, API_VERSION, PANELS_DIR
-from routes import panels_router
+from config import API_HOST, API_PORT, API_TITLE, API_VERSION, PANELS_DIR, BASE_DIR
+from routes.scanner import router as scanner_router
+from routes.learning import router as learning_router
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app
+FRONTEND_DIR = BASE_DIR / "frontend"
+
 app = FastAPI(
     title=API_TITLE,
     version=API_VERSION,
-    description="Manga Language Learner - Backend API"
+    description="Manga Language Learner - Learn Japanese through manga panels"
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,67 +30,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
-app.include_router(panels_router)
+# Serve panel images as static files
+app.mount("/panels", StaticFiles(directory=str(PANELS_DIR)), name="panels")
+
+# Routes
+app.include_router(scanner_router)
+app.include_router(learning_router)
+
+# Serve frontend static files (CSS, JS)
+app.mount("/css", StaticFiles(directory=str(FRONTEND_DIR / "css")), name="css")
+app.mount("/js", StaticFiles(directory=str(FRONTEND_DIR / "js")), name="js")
 
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
-    return {
-        "message": "Manga Language Learner API",
-        "version": API_VERSION,
-        "status": "running"
-    }
-
-
-@app.get("/panels/{filename}")
-async def get_panel(filename: str):
-    """Serve a panel image file"""
-    # Prevent path traversal attacks
-    if ".." in filename or "/" in filename or "\\" in filename:
-        return JSONResponse(status_code=400, content={"detail": "Invalid filename"})
-    
-    # Try to find the file
-    panel_path = PANELS_DIR / filename
-    upload_path = PANELS_DIR / "uploads" / filename
-    
-    if panel_path.exists() and panel_path.is_file():
-        return FileResponse(panel_path, media_type="image/jpeg")
-    elif upload_path.exists() and upload_path.is_file():
-        return FileResponse(upload_path, media_type="image/jpeg")
-    else:
-        return JSONResponse(status_code=404, content={"detail": "Panel not found"})
-
-
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "manga-language-learner-api"
-    }
-
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    """Global exception handler"""
-    logger.error(f"Unhandled exception: {str(exc)}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"}
-    )
+    return FileResponse(str(FRONTEND_DIR / "index.html"))
 
 
 if __name__ == "__main__":
     import uvicorn
-    
-    logger.info(f"Starting {API_TITLE} v{API_VERSION}")
-    logger.info(f"Server running on http://{API_HOST}:{API_PORT}")
-    
-    uvicorn.run(
-        app,
-        host=API_HOST,
-        port=API_PORT,
-        log_level="info"
-    )
+    uvicorn.run("app:app", host=API_HOST, port=API_PORT, reload=True)
