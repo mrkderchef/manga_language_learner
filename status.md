@@ -1,327 +1,191 @@
-# feedback.md
-
-# Manga Learner – Projektstatus / Feedback / Ideen
+# Manga Learner - Projektstatus
 
 ## Aktueller Stand
 
-Die aktuelle Pipeline basiert hauptsächlich auf:
+Manga Learner besteht aktuell aus drei Kernbausteinen:
 
-- comic-text-detector
-- OCR
-- Übersetzung per LLM
+- **Manga Text Detection Engine**: findet Textbereiche, Speech Bubbles und Textzeilen im Panel.
+- **MangaOCR Pipeline**: liest japanischen Text aus jedem erkannten Crop.
+- **Translation + Learning Layer**: uebersetzt erkannte Texte und macht sie im Lernmodus nutzbar.
 
-Das Projekt orientiert sich aktuell stark an:
-https://github.com/dmMaze/comic-text-detector
-
-Die Detection funktioniert bereits überraschend gut.
-Die Bounding Boxes für Speech Bubbles und Textregionen sehen größtenteils korrekt aus.
-
-Die Hauptprobleme liegen aktuell nicht bei der UI oder der Detection, sondern hauptsächlich bei:
-
-- OCR / Text Recognition
-- vertikalem Text
-- Furigana
-- Reihenfolge der Textboxen
-- OCR Cleanup
-- Übersetzungen bei OCR-Fehlern
+Die Detection funktioniert bereits ueberraschend stabil. Bounding Boxes fuer Textregionen sehen groesstenteils korrekt aus. Die groessten Qualitaetshebel liegen weiterhin bei OCR-Qualitaet, vertikalem Text, Furigana, Reihenfolge, Cleanup und kontextbewusster Uebersetzung.
 
 ---
 
-# Aktuelle Pipeline
-
-Aktuell ungefähr:
+## Aktuelle Pipeline
 
 ```text
-Page
-→ comic-text-detector
-→ OCR
-→ Translation
-→ UI
+Manga page
+-> Manga Text Detection Engine
+-> Textbox crops
+-> OCR preprocessing
+-> MangaOCR
+-> OCR cleanup
+-> Manga reading order
+-> Context-aware translation
+-> UI rendering
 ```
 
-Problem:
-comic-text-detector ist hauptsächlich für Detection zuständig und nicht für hochwertiges Manga-OCR.
-
-Das erklärt warum:
-
-- die roten Boxen gut aussehen
-- der erkannte Text aber oft kaputt ist
+Das Projekt behandelt die Text Detection als eigenes Produktmodul. Die UI und die Backend-Routen sollen deshalb nicht wie ein Wrapper um eine externe Referenz wirken, sondern wie eine zusammenhaengende Manga-Lernanwendung mit eigener Detection-Schicht.
 
 ---
 
-# OCR Probleme
+## Was bereits verbessert wurde
 
-Der aktuelle OCR-Output produziert oft:
+### MangaOCR Integration
 
-- zufällige Hiragana-Ketten
-- falsche Wörter
-- unlesbare Sätze
-- zerstörten Vertikaltext
+MangaOCR ist jetzt als primaere OCR-Stufe eingebunden.
 
-Beispiele:
+Detection und OCR sind getrennt:
 
 ```text
-全国ネピ
-こんではないったくわねえ
+Textregion erkennen
+-> Crop erzeugen
+-> Crop fuer OCR vorbereiten
+-> MangaOCR auf Crop ausfuehren
 ```
 
-Das sind keine echten japanischen Sätze mehr, sondern OCR-Artefakte.
+Das ist deutlich robuster als OCR auf der ganzen Seite oder generisches Dokumenten-OCR.
 
----
+### Preprocessing pro Textbox
 
-# Warum normales OCR bei Manga schlecht funktioniert
+Vor MangaOCR wird jeder Crop vorbereitet:
 
-Normales OCR ist meistens trainiert auf:
+- Upscaling auf 2x bis 4x
+- Grayscale
+- CLAHE fuer lokalen Kontrast
+- Denoising
+- Adaptive Thresholding
 
-- Dokumente
-- klare Fonts
-- horizontale Texte
-- hohe Auflösung
+Ziel: kleine Kana, schwacher Druck, graue Scans und verrauschte Hintergruende besser lesbar machen.
 
-Manga dagegen enthält:
+### Vertical Text Handling
 
-- handschriftartige Fonts
-- vertikale Texte
-- Furigana
-- kleine Kana
-- schlechte Scans
-- alte Druckqualität
-- komplexe Hintergründe
-- variable Schriftgrößen
-
-Dadurch brechen viele Standard-OCR-Modelle schnell auseinander.
-
----
-
-# Größter nächster Schritt
-
-## MangaOCR integrieren
-
-Aktuell scheint generisches OCR verwendet zu werden.
-
-Stattdessen testen:
-
-https://github.com/kha-white/manga-ocr
-
-Installation:
-
-```bash
-pip install manga-ocr
-```
-
-Beispiel:
-
-```python
-from manga_ocr import MangaOcr
-from PIL import Image
-
-mocr = MangaOcr()
-
-text = mocr(Image.open("crop.png"))
-print(text)
-```
-
-Wichtig:
-comic-text-detector sollte nicht ersetzt werden.
-
-Sinnvoller wäre:
+Bei vertikalen Textregionen werden mehrere OCR-Varianten getestet:
 
 ```text
-comic-text-detector
-→ Crop jeder Box
-→ MangaOCR
+preprocessed
+preprocessed_rot90_ccw
+preprocessed_rot90_cw
 ```
 
-Die Detection funktioniert bereits brauchbar.
+Danach waehlt eine einfache Heuristik den plausibelsten OCR-Text aus. Bewertet werden unter anderem japanische Zeichen, Textlaenge und kaputte Zeichen.
 
----
+### Reading Order
 
-# Empfohlene Zielpipeline
+Textboxen werden vor der Batch-Uebersetzung nochmal explizit sortiert:
 
 ```text
-Page
-→ Panel Detection
-→ Text Detection
-→ Crop jeder Textbox
-→ Preprocessing
-→ MangaOCR
-→ Cleanup
-→ Reihenfolge bestimmen
-→ Übersetzung
-→ UI Rendering
+oben nach unten
+innerhalb einer Zeile: rechts nach links
 ```
+
+Das verbessert die Uebersetzung, weil Dialoge in sinnvollerer Reihenfolge beim Sprachmodell landen.
+
+### OCR Cache
+
+Erfolgreiche OCR-Ergebnisse werden anhand von Dateipfad, Dateigroesse und Aenderungszeit gecacht. Wiederholtes Scannen desselben Panels ist dadurch deutlich schneller.
 
 ---
 
-# Preprocessing verbessern
+## Aktuelle Hauptprobleme
 
-Aktuell wirkt es so, als würde OCR direkt auf den Raw-Crops laufen.
+### OCR Artefakte
 
-Vor OCR sollte preprocessing stattfinden.
+Auch mit MangaOCR koennen noch kaputte Texte entstehen:
 
-## Grayscale
+- falsche Kana
+- zusammengezogene Woerter
+- fehlende Zeichen
+- falsch gelesene kleine Zeichen
+- unplausible Vertikaltext-Ergebnisse
 
-```python
-cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-```
+### Furigana
 
-## Contrast Enhancement
+Furigana ist noch nicht separat behandelt. Kleine Lesehilfen koennen Haupttext stoeren oder als eigener Unsinn erkannt werden.
 
-CLAHE testen:
+Moegliche Ansaetze:
 
-```python
-cv2.createCLAHE()
-```
-
-## Thresholding
-
-```python
-cv2.adaptiveThreshold()
-```
-
-## Denoising
-
-```python
-cv2.fastNlMeansDenoising()
-```
-
-## Upscaling
-
-2x oder 4x Upscaling testen.
-
-Möglichkeiten:
-
-- ESRGAN
-- waifu2x
-- RealESRGAN
-- OpenCV resize
-
-MangaOCR profitiert stark von höherer Auflösung.
-
----
-
-# Vertical Text Handling
-
-Vertikaler Text ist aktuell wahrscheinlich einer der größten Failure Points.
-
-Viele Manga nutzen:
-
-- vertikale Leserichtung
-- gemischte Leserichtungen
-- kleine Furigana
-
-Ein einfacher erster Ansatz:
-
-```python
-if height > width:
-    rotate image 90°
-    OCR
-```
-
-Danach zurückdrehen.
-
----
-
-# Furigana Handling
-
-Furigana verursacht aktuell wahrscheinlich viele OCR-Fehler.
-
-Ideen:
-
-- kleine Zeichen filtern
+- sehr kleine Textkomponenten filtern
 - Furigana separat erkennen
-- optional ignorieren
+- Furigana optional ignorieren
+- spaeter: Haupttext und Furigana in getrennten Layern anzeigen
 
----
+### OCR Confidence
 
-# Reihenfolge der Textboxen
+Die API gibt aktuell noch keine echte Modell-Confidence aus. Es gibt eine interne Kandidatenbewertung fuer OCR-Varianten, aber die UI nutzt sie noch nicht als Debug- oder Qualitaetsanzeige.
 
-Aktuell vermutlich noch nicht optimal.
+Gewuenscht:
 
-Japanische Leserichtung:
+- gruen: wahrscheinlich gut
+- gelb: unsicher
+- rot: vermutlich OCR-Problem
 
-```text
-rechts → links
-oben → unten
-```
+### OCR Cleanup Layer
 
-Viele Standard-Pipelines sortieren westlich:
+Aktuell gibt es nur leichtes Cleanup:
 
-```text
-links → rechts
-```
+- Whitespace entfernen
+- vertikale Trennzeichen entfernen
 
-Das zerstört Kontext und Übersetzungen.
-
----
-
-# Panel-aware Verarbeitung
-
-Aktuell wahrscheinlich:
-
-```text
-ganze Seite → OCR
-```
-
-Besser:
-
-```text
-Page
-→ Panels erkennen
-→ OCR pro Panel
-```
-
-Vorteile:
-
-- bessere Reihenfolge
-- besserer Kontext
-- weniger OCR-Konflikte
-- bessere Übersetzungen
-
----
-
-# OCR Cleanup Layer
-
-Aktuell wahrscheinlich:
-
-```text
-OCR → Translate
-```
-
-Problem:
-Wenn OCR Müll produziert, übersetzt der Translator ebenfalls Müll.
-
-Besser:
+Noch nicht umgesetzt:
 
 ```text
 OCR
-→ Cleanup
-→ Translation
+-> plausibilitaetsbasierte Korrektur
+-> Translation
 ```
 
-Mögliche Modelle:
+Ein LLM-Cleanup koennte OCR-Artefakte vor der Uebersetzung reparieren, muss aber vorsichtig sein, damit kein Text frei erfunden wird.
 
-- GPT
-- DeepSeek
-- Qwen
-- lokale Modelle
+### Panel-aware Processing
+
+Aktuell wird das Bild als Ganzes verarbeitet und danach werden Textregionen sortiert. Langfristig waere besser:
+
+```text
+Manga page
+-> Panels erkennen
+-> Textregionen pro Panel erkennen
+-> OCR pro Panel
+-> Uebersetzung pro Panel-Kontext
+```
+
+Das verbessert Lesereihenfolge, Kontext und spaetere Full-Page-Translation.
 
 ---
 
-# Kontext-aware Übersetzung
+## Empfohlene Zielpipeline
 
-Textboxweise Übersetzung ist problematisch.
+```text
+Manga page
+-> Panel segmentation
+-> Manga Text Detection Engine
+-> Textbox crops
+-> OCR preprocessing
+-> MangaOCR
+-> Furigana handling
+-> OCR cleanup
+-> Reading order
+-> Context-aware translation
+-> UI overlay
+-> Learning extraction
+```
 
-Japanisch nutzt oft:
+---
+
+## Kontextbewusste Uebersetzung
+
+Textboxweise Uebersetzung bleibt schwierig, weil Japanisch oft Kontext aus vorherigen Sprechblasen braucht:
 
 - implizite Subjekte
 - ausgelassene Pronomen
-- Kontextreferenzen
+- Satzteile ueber mehrere Boxen
+- emotionale Nuancen
 
-Sinnvoller:
+Besser:
 
 ```text
-alle Boxen eines Panels gemeinsam übersetzen
+alle Boxen eines Panels gemeinsam uebersetzen
 ```
 
 oder:
@@ -330,108 +194,117 @@ oder:
 vorherige Boxen als Kontext mitsenden
 ```
 
----
-
-# OCR Confidence anzeigen
-
-Hilfreich fürs Debugging.
-
-UI Idee:
-
-- grün = hohe confidence
-- gelb = mittel
-- rot = schlecht
-
-Dann sofort sichtbar:
-- wo OCR versagt
+Die aktuelle Batch-Uebersetzung geht bereits in diese Richtung.
 
 ---
 
-# OCR Debug Mode
+## OCR Debug Mode
 
-Nützliche Informationen:
+Ein Debug Mode waere sehr hilfreich.
+
+Sinnvolle Informationen:
 
 - Bounding Boxes
 - OCR crops
 - preprocessing output
-- confidence
 - erkannter Text
-- reading order
-- panel ids
+- ausgewaehlte OCR-Variante
+- interne OCR-Bewertung
+- reading order index
+- panel id
+
+Das wuerde sichtbar machen, ob Fehler aus Detection, Crop, Preprocessing, OCR oder Translation kommen.
 
 ---
 
-# UI Feedback
+## UI Feedback
 
-Die UI wirkt bereits ziemlich sauber.
-
-Das Projekt wirkt aktuell eher wie:
+Die UI wirkt bereits sauber. Das Projekt fuehlt sich aktuell nicht kaputt an, sondern eher wie:
 
 ```text
-gute Detection + schwaches OCR backend
+gute Detection
++ solide UI
++ OCR-Qualitaet als naechster grosser Hebel
 ```
 
-und nicht wie ein grundsätzlich kaputtes System.
+Die Scanner-Ansicht mit Hover-Translation ist ein guter Kern. Als naechstes sollte die UI mehr Diagnoseinformationen anzeigen, wenn OCR unsicher ist.
 
 ---
 
-# Langfristige Ideen
+## Prioritaeten
 
-## Hover Translation
+## Prioritaet 1
+
+- OCR Debug Mode
+- echte oder heuristische OCR Confidence anzeigen
+- Furigana-Probleme sichtbar machen
+- OCR-Varianten in der UI nachvollziehbar machen
+
+## Prioritaet 2
+
+- panel-aware processing
+- besserer Cleanup Layer
+- Translation mit Panel-Kontext
+- Lesereihenfolge weiter verbessern
+
+## Prioritaet 3
+
+- Vocab Features
+- JLPT-Level
+- Kanji Breakdown
+- Beispielsaetze
+- Pitch Accent
+- Spaced Repetition
+
+---
+
+## Langfristige Ideen
+
+### Hover Translation
 
 - Originaltext anzeigen
-- Übersetzung beim Hover
+- Uebersetzung beim Hover
+- Confidence/Debug-Status optional einblenden
 
----
+### Woerter anklickbar machen
 
-## Wörter anklickbar machen
-
-Features:
-
-- JLPT Level
 - Bedeutung
+- Lesung
 - Kanji Breakdown
-- Beispielsätze
-- Pitch Accent
+- Beispielsatz
+- Lernstatus
 
----
+### Spaced Repetition
 
-## Spaced Repetition
+Anki-artiges Lernen direkt aus gescannten Manga-Panels.
 
-Anki-artiges Lernen direkt aus Manga.
+### Audio / TTS
 
----
+Japanischen Text vorlesen lassen.
 
-## Audio / TTS
+Moegliche Richtungen:
 
-Japanese Text vorlesen.
+- lokale TTS-Modelle
+- Cloud TTS
+- spaeter verschiedene Stimmen
 
-Möglichkeiten:
+### Full Manga Translation
 
-- Kokoro TTS
-- Coqui
-- ElevenLabs
-- OpenAI TTS
-
----
-
-# Full Manga Translation
-
-Später eventuell:
+Spaeter eventuell:
 
 ```text
 Page
-→ OCR
-→ Translation
-→ Inpainting
-→ neuen Text rendern
+-> OCR
+-> Translation
+-> Text removal / inpainting
+-> translated text rendering
 ```
 
 ---
 
-# Interessante Modelle später testen
+## Modelle und Technologien fuer spaeter
 
-## OCR
+### OCR
 
 - MangaOCR
 - PaddleOCR Japanese
@@ -440,84 +313,31 @@ Page
 - Florence
 - GOT-OCR
 
-## Detection
+### Detection
 
-- comic-text-detector
-- YOLO
-- GroundingDINO
+- eigene Manga Text Detection Engine weiter ausbauen
+- Panel segmentation
+- layout-aware detection
+- alternative ONNX/YOLO-basierte Modelle testen
 
-## Translation
+### Translation
 
-- GPT
+- Ollama local models
 - Qwen
 - DeepL
+- GPT
 - NLLB
 
 ---
 
-# Weitere Ideen
+## Fazit
 
-## Offline Mode
+Die aktuelle Situation ist gut: Detection und UI sind stabil genug, um iterativ an OCR-Qualitaet zu arbeiten.
 
-Lokale Modelle unterstützen.
-
----
-
-## Mobile Support
-
-Handy Manga Reader.
-
----
-
-## Browser Extension
-
-OCR direkt im Browser.
-
----
-
-## Live Camera OCR
-
-Manga direkt mit Kamera lesen.
-
----
-
-# Prioritäten
-
-## Priorität 1
-
-- MangaOCR integrieren
-- preprocessing verbessern
-- vertical text handling
-
-## Priorität 2
-
-- reading order
-- panel-aware translation
-- OCR confidence
-
-## Priorität 3
-
-- cleanup layer
-- vocab features
-- translation rendering
-
----
-
-# Fazit
-
-Die aktuelle Situation ist eigentlich ziemlich gut.
-
-Die Detection funktioniert bereits relativ stabil.
-Das Hauptproblem ist aktuell die OCR-Qualität.
-
-Das ist deutlich einfacher iterativ zu verbessern als:
-
-- schlechte Detection
-- schlechte Architektur
-- kaputte UI
-
-Der größte Hebel dürfte aktuell sein:
+Der groesste Hebel war und bleibt:
 
 ```text
-MangaOCR + besseres preprocessing
+MangaOCR + besseres preprocessing + bessere Debug-Sichtbarkeit
 ```
+
+Als naechstes sollte nicht blind ein neues Modell eingebaut werden, sondern sichtbar gemacht werden, wo die Pipeline scheitert: Crop, Rotation, Preprocessing, OCR oder Translation.

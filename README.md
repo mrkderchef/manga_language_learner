@@ -1,129 +1,197 @@
 # Manga Language Learner
 
-Lerne Japanisch spielerisch durch Manga-Panels. Lade ein Manga-Panel hoch, erkenne den japanischen Text per OCR und lass ihn übersetzen – oder lerne Vokabeln direkt aus den Panels.
+Lerne Japanisch spielerisch durch Manga-Panels. Lade ein Manga-Panel hoch, erkenne japanischen Text, lass ihn uebersetzen und nutze die erkannten Texte direkt zum Lernen.
 
 ## Features
 
 ### Scanner
-Panel hochladen → Text-Regionen erkennen (comic-text-detector) → OCR liest japanischen Text → Übersetzung anzeigen.
 
-### Text Detection (comic-text-detector Pipeline)
-Vollständige Implementierung der [comic-text-detector](https://github.com/dmMaze/comic-text-detector) Pipeline:
-- **YOLOv5** Block-Detektor (Bounding Boxes für Textblöcke)
-- **UNet** Segmentierungsmaske (Pixel-Level Text-Erkennung)
-- **DBNet** Text-Linien-Detektor (SegDetectorRepresenter mit Polygon-Unclipping)
-- **Grouping:** Linien → Blöcke zuordnen, Orientierung erkennen (vertikal/horizontal), Font-Größe, Winkel
-- **Merge/Split:** Verstreute Linien zusammenführen, große Blöcke bei Abstandslücken aufteilen
-- **Mask Refinement:** Per-Block Masken-Verfeinerung (Otsu + Top-K Farb-Thresholding)
-- **Reading Order:** Manga-Lesereihenfolge (rechts-nach-links, oben-nach-unten)
+```text
+Panel hochladen
+-> Textregionen erkennen
+-> OCR pro Textbox
+-> Uebersetzung anzeigen
+-> Hover-Overlay im Panel
+```
+
+### Manga Text Detection Engine
+
+Die App behandelt Text Detection als eigenes Produktmodul. Die Engine erkennt Textbloecke, Textzeilen, Orientierung und Lesereihenfolge und liefert robuste Regionen fuer die OCR-Pipeline.
+
+Intern nutzt sie eine ONNX-basierte Manga/Text-Detection-Pipeline mit:
+
+- **Block Detection:** Bounding Boxes fuer Textbloecke und Speech-Bubble-Text.
+- **Segmentation Mask:** Pixel-Level Textbereiche fuer feinere Trennung.
+- **Text Line Detection:** einzelne Zeilen/Spalten innerhalb eines Blocks.
+- **Grouping:** Linien werden zu Bloecken zusammengefuehrt.
+- **Orientation:** vertikal/horizontal, Winkel und Fontgroesse.
+- **Merge/Split:** verstreute Linien verbinden, zu grosse Bloecke trennen.
+- **Mask Refinement:** Textmasken pro Block verbessern.
+- **Reading Order:** Manga-Lesereihenfolge rechts-nach-links, oben-nach-unten.
+
+### MangaOCR Pipeline
+
+Die OCR laeuft nicht auf der ganzen Seite, sondern auf den erkannten Textbox-Crops:
+
+```text
+Textregion
+-> Crop mit Padding
+-> OCR Preprocessing
+-> MangaOCR
+-> OCR Cleanup
+-> Translation
+```
+
+Vor OCR werden Crops verbessert:
+
+- 2x bis 4x Upscaling
+- Grayscale
+- CLAHE-Kontrastverbesserung
+- Denoising
+- Adaptive Thresholding
+- Rotationsvarianten fuer vertikalen Text
 
 ### Lernmodus
-Vokabeln aus gescannten Panels lernen. Wort anzeigen → Bedeutung raten → Fortschritt tracken (dateibasiert).
+
+Vokabeln aus gescannten Panels lernen:
+
+- Panel auswaehlen
+- erkannte Texte als Lernkarten nutzen
+- Bedeutung raten
+- Fortschritt dateibasiert speichern
 
 ## Architektur
 
-```
+```text
 manga_language_learner/
-├── backend/                  Python (FastAPI) Backend
-│   ├── app.py                Hauptanwendung, Thumbnail-Cache, Static-File-Serving
-│   ├── config.py             Zentrale Konfiguration (Pfade, API-Keys, Ollama-URL)
-│   ├── requirements.txt
-│   ├── data/                 Lernfortschritt, OCR-Cache, Thumbnails (gitignored)
-│   ├── routes/
-│   │   ├── scanner.py        POST /api/scanner/upload, GET /api/scanner/panels, OCR-Cache
-│   │   └── learning.py       GET /api/learning/panels, Vokabel-Extraktion, Fortschritt
-│   └── services/
-│       ├── text_region_detector.py  Comic-Text-Detector Pipeline (YOLOv5+UNet+DBNet via ONNX)
-│       ├── gemini_service.py  Gemini Vision OCR + Übersetzung (primär)
-│       ├── ollama_service.py  Ollama Vision OCR + Übersetzung (Fallback)
-│       ├── ocr_service.py     Legacy: Google Vision, manga-ocr, EasyOCR (nicht aktiv)
-│       ├── translation_service.py  Google Cloud Translate (standalone)
-│       └── image_service.py   Panel-Verwaltung (Dateisystem)
-├── frontend/                 Vanilla HTML/CSS/JS (kein Framework)
-│   ├── index.html
-│   ├── css/
-│   │   ├── main.css          Globale Styles, Navigation, Home
-│   │   ├── scanner.css       Scanner-Ansicht
-│   │   └── learning.css      Lernmodus-Ansicht
-│   └── js/
-│       ├── api.js            API-Client mit Response-Cache
-│       ├── app.js            Router, Navigation, View-Management
-│       ├── scanner.js        Panel-Upload, OCR-Anzeige, Bounding-Box-Overlay
-│       └── learning.js       Vokabel-Karten, Fortschritt
-├── panels/                   Manga-Panel-Bilder
-│   ├── uploads/              Vom Benutzer hochgeladene Panels (gitignored)
-│   └── test_synthetic/       Synthetische Test-Panels mit Ground-Truth
-├── setup_ollama_remote.sh    Script für Ollama-Installation auf dem GPU-Rechner
-└── .env.example              Vorlage für Konfiguration
+|-- backend/                  Python FastAPI Backend
+|   |-- app.py                App, Thumbnail-Cache, Static-File-Serving
+|   |-- config.py             Pfade, API-Keys, Ollama-URL
+|   |-- requirements.txt
+|   |-- data/                 Lernfortschritt, OCR-Cache, Thumbnails (gitignored)
+|   |-- routes/
+|   |   |-- scanner.py        Upload, Panel-Liste, OCR/Translation
+|   |   `-- learning.py       Lernmodus, Vokabel-Extraktion, Fortschritt
+|   `-- services/
+|       |-- text_region_detector.py  Manga Text Detection Engine
+|       |-- manga_ocr_service.py     MangaOCR + Preprocessing + Translation
+|       |-- ollama_service.py        Ollama Vision/Text Fallback
+|       |-- gemini_service.py        Gemini Vision Service
+|       |-- ocr_service.py           Legacy OCR Services
+|       |-- translation_service.py   Google Cloud Translate Legacy
+|       `-- image_service.py         Panel-Verwaltung
+|-- frontend/                 Vanilla HTML/CSS/JS
+|   |-- index.html
+|   |-- css/
+|   |   |-- main.css
+|   |   |-- scanner.css
+|   |   `-- learning.css
+|   `-- js/
+|       |-- api.js
+|       |-- app.js
+|       |-- scanner.js
+|       `-- learning.js
+|-- panels/                   Manga-Panel-Bilder
+|   |-- uploads/              Benutzer-Uploads (gitignored)
+|   `-- test_synthetic/       Synthetische Test-Panels
+|-- setup_ollama_remote.sh    Ollama Setup fuer GPU-Rechner
+`-- .env.example              Konfigurationsvorlage
 ```
 
-## OCR-Ansätze (Chronologie)
+## OCR/Translation Strategie
 
-| Ansatz | Status | Anmerkungen |
-|--------|--------|-------------|
-| **Google Cloud Vision** | ❌ Verworfen | Gute Ergebnisse, aber kostenpflichtig und erfordert GCP-Projekt-Setup |
-| **manga-ocr** (kha-white) | ❌ Verworfen | Spezialisiert auf Manga, aber braucht PyTorch + GPU, zu langsam auf CPU |
-| **EasyOCR** | ❌ Verworfen | Japanisch-Support schwach, schlechte Erkennung bei vertikalem Text |
-| **Gemini Vision** (gemini-2.0-flash) | ✅ Primär | Bester Ansatz: OCR + Übersetzung + Bounding Boxes in einem API-Call. Gratis API-Key |
-| **Ollama Vision** (minicpm-v:8b) | ✅ Fallback | Läuft auf Remote-GPU-Rechner (10.100.10.112). 2-Step: Text lesen → Übersetzen |
+| Komponente | Status | Rolle |
+| --- | --- | --- |
+| Manga Text Detection Engine | aktiv | erkennt Textregionen, Orientierung und Lesereihenfolge |
+| MangaOCR | aktiv | primaere japanische Manga-OCR pro Crop |
+| OCR Preprocessing | aktiv | verbessert kleine, verrauschte oder kontrastarme Crops |
+| Ollama `llama3.1:8b` | aktiv | kontextbewusste Textuebersetzung |
+| Ollama `minicpm-v:8b` | Fallback | Vision-basierte OCR/Translation, falls noetig |
+| Google/Gemini Services | optional/legacy | alternative Services fuer Experimente |
 
 ## Setup
 
-### 1. Backend (dieser Rechner)
+### 1. Backend
 
 ```powershell
-# Virtual Environment erstellen
 cd manga_language_learner
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 
-# Abhängigkeiten installieren
 pip install -r backend/requirements.txt
-pip install Pillow python-dotenv google-genai
 
-# Konfiguration
 copy .env.example .env
-# .env bearbeiten: GEMINI_API_KEY eintragen (https://aistudio.google.com/apikey)
 
-# Server starten
 cd backend
 python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-→ Website öffnen: **http://localhost:8000**
+Website:
 
-### 2. Ollama auf Remote-GPU-Rechner (optional, Fallback)
+```text
+http://localhost:8000
+```
+
+### 2. Ollama lokal oder remote
+
+Die App kann Ollama lokal oder auf einem GPU-Rechner verwenden.
+
+Benoetigte Modelle:
 
 ```bash
-# Auf dem GPU-Rechner (10.100.10.112) ausführen:
-ssh user@10.100.10.112
+ollama pull minicpm-v:8b
+ollama pull llama3.1:8b
+```
+
+Remote-Setup:
+
+```bash
+ssh user@GPU_HOST
 bash setup_ollama_remote.sh
 ```
 
-Das Script installiert Ollama, konfiguriert Netzwerk-Zugriff und lädt die Modelle:
-- `minicpm-v:8b` – Vision-Modell für Manga-Text-Erkennung
-- `llama3.1:8b` – Text-Modell für Übersetzungen
-
-### 3. Umgebungsvariablen (.env)
+### 3. Umgebungsvariablen
 
 ```env
-# Gemini API (primär, empfohlen)
-GEMINI_API_KEY=dein-api-key
-
-# Ollama Remote (Fallback)
-OLLAMA_BASE_URL=http://10.100.10.112:11434
+OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=minicpm-v:8b
 
-# Google Cloud (optional, Legacy)
-GOOGLE_APPLICATION_CREDENTIALS=path/to/credentials.json
-GOOGLE_PROJECT_ID=your-project-id
+GEMINI_API_KEY=optional
+GOOGLE_APPLICATION_CREDENTIALS=optional
+GOOGLE_PROJECT_ID=optional
+```
+
+## API Kurzueberblick
+
+```text
+GET  /api/scanner/panels
+POST /api/scanner/upload
+POST /api/scanner/{filename}/ocr
+POST /api/scanner/{filename}/scan-translate
+POST /api/scanner/translate
+
+GET  /api/learning/panels
+GET  /api/learning/{filename}/vocab
+POST /api/learning/{filename}/answer
+GET  /api/learning/progress
 ```
 
 ## Tech Stack
 
-- **Backend:** Python 3.13, FastAPI, Uvicorn
-- **Text Detection:** comic-text-detector (ONNX, OpenCV DNN) – YOLOv5 + UNet + DBNet
-- **OCR/Translation:** Google Gemini Vision API (primär), Ollama + minicpm-v (Fallback)
-- **Frontend:** HTML, CSS, JavaScript (vanilla, kein Framework)
-- **Dependencies:** pyclipper, shapely (für DBNet Polygon-Unclipping)
-- **Infrastruktur:** Ollama auf Remote-GPU-Rechner (10.100.10.112, selber wie KORA-E)
+- **Backend:** Python, FastAPI, Uvicorn
+- **Detection:** eigene Manga Text Detection Engine mit ONNX/OpenCV DNN
+- **OCR:** MangaOCR mit Crop-Preprocessing
+- **Translation:** Ollama Textmodell, optional externe Services
+- **Frontend:** Vanilla HTML/CSS/JS
+- **Bildverarbeitung:** OpenCV, Pillow, NumPy
+- **Geometry/Postprocessing:** pyclipper, shapely
+
+## Aktueller Fokus
+
+Die UI und Detection sind stabil genug fuer Iteration. Der groesste Hebel liegt aktuell bei:
+
+- OCR Debug Mode
+- bessere Confidence-Anzeige
+- Furigana Handling
+- Panel-aware Processing
+- Cleanup Layer vor der Uebersetzung
