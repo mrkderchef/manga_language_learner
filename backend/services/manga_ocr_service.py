@@ -6,8 +6,7 @@ This replaces the LLM-based OCR approach with a proper deep-learning OCR model
 """
 
 import logging
-from pathlib import Path
-from typing import Optional
+import re
 
 import cv2
 import numpy as np
@@ -140,6 +139,147 @@ Example: ["translation 1", "translation 2"]"""
     return None
 
 
+_JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+
+
+def _cleanup_ocr_text(text: str) -> str:
+    """Normalize manga-ocr output without changing the recognized wording."""
+    text = text.strip()
+    text = re.sub(r"\s+", "", text)
+    text = text.replace("｜", "").replace("|", "")
+    return text
+
+
+def _ocr_score(text: str) -> int:
+    """Score OCR candidates so preprocessing/rotation variants can compete."""
+    if not text:
+        return -100
+    japanese_chars = len(_JAPANESE_RE.findall(text))
+    bad_chars = text.count("�") + text.count("?")
+    return japanese_chars * 3 + len(text) - bad_chars * 8
+
+
+def _preprocess_crop_for_ocr(crop: Image.Image, upscale: int = 3) -> Image.Image:
+    """
+    Prepare a text crop for manga-ocr.
+
+    Manga scans often have low contrast, noisy paper texture, and tiny kana.
+    CLAHE + denoising + adaptive thresholding gives manga-ocr a cleaner,
+    higher-resolution glyph image while keeping the crop as a normal RGB PIL
+    image for the model API.
+    """
+    rgb = np.array(crop.convert("RGB"))
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    h, w = bgr.shape[:2]
+    scale = max(2, min(upscale, 4))
+    if min(w, h) < 96:
+        scale = 4
+    bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    gray = cv2.fastNlMeansDenoising(gray, None, h=10, templateWindowSize=7, searchWindowSize=21)
+
+    block_size = 31 if min(gray.shape[:2]) >= 120 else 21
+    if block_size % 2 == 0:
+        block_size += 1
+    thresholded = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        block_size,
+        9,
+    )
+
+    return Image.fromarray(cv2.cvtColor(thresholded, cv2.COLOR_GRAY2RGB))
+
+
+def _ocr_crop(mocr, crop: Image.Image, region: dict) -> tuple[str, dict]:
+    """Run manga-ocr on preprocessed variants and keep the best result."""
+    vertical = bool(region.get("vertical")) or crop.height > crop.width * 1.25
+    variants: list[tuple[str, Image.Image]] = [
+        ("preprocessed", _preprocess_crop_for_ocr(crop)),
+    ]
+
+    if vertical:
+        # Try both directions: detector orientation and scan quirks can disagree.
+        variants.append(("preprocessed_rot90_ccw", variants[0][1].rotate(90, expand=True)))
+        variants.append(("preprocessed_rot90_cw", variants[0][1].rotate(-90, expand=True)))
+
+    best_text = ""
+    best_meta = {"variant": "", "vertical_candidate": vertical, "score": -100}
+
+    for variant_name, variant_img in variants:
+        try:
+            text = _cleanup_ocr_text(mocr(variant_img))
+        except Exception as e:
+            logger.debug("manga-ocr failed for %s variant: %s", variant_name, e)
+            continue
+
+        score = _ocr_score(text)
+        if score > best_meta["score"]:
+            best_text = text
+            best_meta = {
+                "variant": variant_name,
+                "vertical_candidate": vertical,
+                "score": score,
+            }
+
+    # If aggressive preprocessing produced nothing useful, fall back to raw crop.
+    if not best_text:
+        try:
+            best_text = _cleanup_ocr_text(mocr(crop))
+            best_meta = {
+                "variant": "raw_fallback",
+                "vertical_candidate": vertical,
+                "score": _ocr_score(best_text),
+            }
+        except Exception as e:
+            logger.debug("manga-ocr raw fallback failed: %s", e)
+
+    return best_text, best_meta
+
+
+def _sort_regions_reading_order(regions: list[dict]) -> list[dict]:
+    """
+    Sort text blocks in manga reading order.
+
+    comic-text-detector already does some sorting, but keeping it explicit here
+    protects translation context when detector output order changes. Blocks are
+    grouped into rough horizontal bands from top to bottom; inside each band,
+    Japanese manga order is right to left.
+    """
+    if len(regions) <= 1:
+        return regions
+
+    heights = sorted(max(1, int(r.get("height", 1))) for r in regions)
+    median_height = heights[len(heights) // 2]
+    row_tolerance = max(24, int(median_height * 0.7))
+
+    rows: list[list[dict]] = []
+    for region in sorted(regions, key=lambda r: (r["y"], -r["x"])):
+        center_y = region["y"] + region["height"] / 2
+        placed = False
+        for row in rows:
+            row_center = sum(r["y"] + r["height"] / 2 for r in row) / len(row)
+            if abs(center_y - row_center) <= row_tolerance:
+                row.append(region)
+                placed = True
+                break
+        if not placed:
+            rows.append([region])
+
+    ordered: list[dict] = []
+    for row in rows:
+        row.sort(key=lambda r: r["x"] + r["width"] / 2, reverse=True)
+        ordered.extend(row)
+
+    return ordered
+
+
 def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
     """
     Full pipeline: detect text regions → OCR each region → translate.
@@ -155,7 +295,7 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
     im_h, im_w = img.shape[:2]
 
     # Step 1: Detect text regions with comic-text-detector
-    regions = detect_text_regions(image_path)
+    regions = _sort_regions_reading_order(detect_text_regions(image_path))
     logger.info(f"manga-ocr pipeline: {len(regions)} text regions detected")
 
     if not regions:
@@ -187,13 +327,17 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
 
         crop = pil_img.crop((x1, y1, x2, y2))
 
-        # Run manga-ocr on the crop
-        text = mocr(crop).strip()
+        # Run manga-ocr on preprocessed crop variants.
+        text, ocr_meta = _ocr_crop(mocr, crop, region)
 
         if text:
             recognized_texts.append(text)
+            region["ocr_meta"] = ocr_meta
             valid_regions.append(region)
-            logger.debug(f"  Region ({x},{y} {w}x{h}): '{text}'")
+            logger.debug(
+                "  Region (%s,%s %sx%s, %s): '%s'",
+                x, y, w, h, ocr_meta.get("variant"), text,
+            )
 
     logger.info(f"manga-ocr recognized text in {len(recognized_texts)}/{len(regions)} regions")
 
@@ -217,6 +361,8 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
             "confidence": 0.95,
             "bbox": bbox,
             "char_count": len(text),
+            "vertical": bool(region.get("vertical")),
+            "ocr_variant": region.get("ocr_meta", {}).get("variant", ""),
         })
 
     full_text = "\n".join(recognized_texts)
