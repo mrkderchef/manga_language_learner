@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from services.image_service import ImageService
 from services.ollama_service import OllamaOCRService
 from services import manga_ocr_service
+from services.panel_renderer import render_translated_panel
 import asyncio
 import hashlib
 import json
@@ -21,6 +22,7 @@ ollama_service = OllamaOCRService()
 # OCR result cache directory
 OCR_CACHE_DIR = BASE_DIR / "backend" / "data" / "ocr_cache"
 OCR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MISSING_TRANSLATION_TEXT = "No translation available"
 
 
 def _get_vision_service():
@@ -28,6 +30,26 @@ def _get_vision_service():
     if ollama_service.is_available():
         return ollama_service
     return None
+
+
+def _normalize_scan_result(result: dict | None) -> dict | None:
+    if not result or not result.get("success"):
+        return result
+
+    normalized = dict(result)
+    annotations = []
+    for ann in result.get("annotations", []) or []:
+        copy = dict(ann)
+        translated = str(copy.get("translated") or "").strip()
+        has_bbox = bool(copy.get("bbox"))
+        if not has_bbox:
+            copy["localization_missing"] = True
+        elif translated in {"", "—", "..."}:
+            copy["translated"] = MISSING_TRANSLATION_TEXT
+            copy["translation_missing"] = True
+        annotations.append(copy)
+    normalized["annotations"] = annotations
+    return normalized
 
 
 def _cache_key(panel_path: Path) -> str:
@@ -43,7 +65,7 @@ def _get_cached_result(panel_path: Path):
     cache_file = OCR_CACHE_DIR / f"{key}.json"
     if cache_file.exists():
         try:
-            return json.loads(cache_file.read_text(encoding="utf-8"))
+            return _normalize_scan_result(json.loads(cache_file.read_text(encoding="utf-8")))
         except Exception:
             pass
     return None
@@ -71,6 +93,7 @@ def _run_ocr(panel_path: Path) -> dict:
         if manga_ocr_service.is_available():
             result = manga_ocr_service.extract_and_translate(str(panel_path))
             if result["success"]:
+                result = _normalize_scan_result(result)
                 _save_to_cache(panel_path, result)
                 return result
             logger.warning(f"manga-ocr pipeline failed: {result.get('error')}")
@@ -83,6 +106,7 @@ def _run_ocr(panel_path: Path) -> dict:
             if svc.is_available():
                 result = svc.extract_and_translate(str(panel_path))
                 if result["success"]:
+                    result = _normalize_scan_result(result)
                     _save_to_cache(panel_path, result)
                     return result
                 logger.warning(f"{type(svc).__name__} failed: {result.get('error')}")
@@ -90,6 +114,18 @@ def _run_ocr(panel_path: Path) -> dict:
             logger.error(f"{type(svc).__name__} exception: {e}\n{traceback.format_exc()}")
 
     return None
+
+
+def _run_scan_translate(panel_path: Path) -> dict:
+    """Run cached OCR/translation, then attach a generated translated panel."""
+    result = _run_ocr(panel_path)
+    if not result or not result.get("success"):
+        return result
+
+    enriched = dict(result)
+    render_result = render_translated_panel(panel_path, enriched)
+    enriched.update(render_result)
+    return enriched
 
 
 class TranslateRequest(BaseModel):
@@ -140,7 +176,7 @@ async def scan_and_translate(filename: str):
 
     try:
         # Run blocking OCR in thread pool to avoid blocking the event loop
-        result = await asyncio.get_event_loop().run_in_executor(None, _run_ocr, panel_path)
+        result = await asyncio.get_event_loop().run_in_executor(None, _run_scan_translate, panel_path)
     except Exception as e:
         logger.error(f"OCR+translate failed for {filename}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"OCR processing error: {e}")

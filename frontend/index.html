@@ -13,7 +13,7 @@
         <div class="nav-brand">漫画 Manga Learner</div>
         <div class="nav-links">
             <a href="#" data-page="home" class="nav-link active">Home</a>
-            <a href="#" data-page="scanner" class="nav-link">Scanner</a>
+            <a href="#" data-page="scanner" class="nav-link">Reader</a>
             <a href="#" data-page="learning" class="nav-link">Lernmodus</a>
         </div>
     </nav>
@@ -27,8 +27,8 @@
                 <div class="mode-cards">
                     <div class="mode-card" data-goto="scanner">
                         <div class="mode-icon">🔍</div>
-                        <h2>Scanner</h2>
-                        <p>Lade ein Manga-Panel hoch, erkenne den Text per OCR und lass ihn übersetzen.</p>
+                        <h2>Reader</h2>
+                        <p>Lies Manga-Panels im Original oder mit platzierter Übersetzung.</p>
                     </div>
                     <div class="mode-card" data-goto="learning">
                         <div class="mode-icon">📚</div>
@@ -39,37 +39,53 @@
             </div>
         </section>
 
-        <!-- Scanner Page -->
+        <!-- Reader Page -->
         <section id="page-scanner" class="page">
-            <h1>Panel Scanner</h1>
-            <div class="scanner-layout">
-                <div class="panel-area">
-                    <div class="panel-selector">
-                        <h3>Panel auswählen</h3>
+            <div class="reader-shell">
+                <header class="reader-topbar">
+                    <div class="reader-library">
                         <div id="panel-list" class="panel-grid"></div>
-                        <div class="upload-area" id="upload-area">
-                            <p>+ Panel hochladen</p>
-                            <input type="file" id="panel-upload" accept="image/jpeg,image/png" hidden>
-                        </div>
+                        <button class="upload-area reader-upload" id="upload-area" type="button">
+                            Upload
+                        </button>
+                        <input type="file" id="panel-upload" accept="image/jpeg,image/png" hidden>
                     </div>
+                    <div class="reader-actions">
+                        <button id="btn-scan" class="btn btn-primary reader-scan" disabled>Scan & Translate</button>
+                        <button id="btn-debug-toggle" class="reader-control-button" type="button" aria-expanded="false" aria-controls="reader-debug-panel">Debug</button>
+                    </div>
+                </header>
+
+                <div class="reader-stage">
                     <div class="panel-display">
-                        <div class="panel-img-wrapper">
-                            <img id="scanner-panel-img" class="hidden" src="" alt="Manga Panel">
+                        <div class="panel-img-wrapper" id="reader-panel-wrapper">
+                            <img id="scanner-panel-img" class="hidden" src="" alt="Manga panel">
+                            <img id="translated-panel-img" class="translated-panel-img hidden" src="" alt="Translated manga panel" aria-hidden="true">
+                            <button id="btn-reader-fullscreen" class="reader-panel-button reader-fullscreen-button" type="button" aria-label="Fullscreen">⛶</button>
+                            <div id="translation-controls" class="translation-controls hidden">
+                                <button id="btn-translation-toggle" class="translation-toggle" type="button">JP</button>
+                                <input id="translation-slider" class="translation-slider" type="range" min="0" max="100" value="0" aria-label="Translation reveal">
+                                <div id="translation-handle" class="translation-handle" role="slider" aria-label="Translation reveal" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
+                                    <span class="translation-handle-grip" aria-hidden="true"></span>
+                                </div>
+                            </div>
                             <div id="ocr-overlay" class="ocr-overlay"></div>
                         </div>
                     </div>
                 </div>
-                <div class="result-area">
-                    <div class="result-card">
-                        <h3>Erkannter Text (JP)</h3>
-                        <div id="ocr-result" class="result-text">Wähle ein Panel aus...</div>
+
+                <aside id="reader-debug-panel" class="reader-debug-panel hidden" aria-live="polite">
+                    <div class="reader-debug-header">
+                        <h2>Recognized Text</h2>
+                        <button id="btn-debug-close" class="reader-debug-close" type="button" aria-label="Close debug panel">×</button>
                     </div>
-                    <div class="result-card">
-                        <h3>Übersetzung</h3>
-                        <div id="translation-result" class="result-text">—</div>
-                    </div>
-                    <button id="btn-scan" class="btn btn-primary" disabled>Scannen & Übersetzen</button>
-                </div>
+                    <div id="reader-debug-content" class="reader-debug-content">Select a panel...</div>
+                </aside>
+            </div>
+
+            <div id="reader-fullscreen" class="reader-fullscreen hidden" role="dialog" aria-modal="true" aria-label="Fullscreen manga panel">
+                <button id="btn-fullscreen-close" class="reader-fullscreen-close" type="button" aria-label="Close fullscreen">×</button>
+                <img id="reader-fullscreen-img" src="" alt="Fullscreen manga panel">
             </div>
         </section>
 

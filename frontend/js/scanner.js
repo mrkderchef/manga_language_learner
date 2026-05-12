@@ -5,7 +5,9 @@
 const Scanner = (() => {
     let selectedPanel = null;
     let ocrText = '';
+    let latestScan = null;
     let _panelsLoaded = false;
+    let controlsHideTimer = null;
 
     function init() {
         bindEvents();
@@ -18,6 +20,91 @@ const Scanner = (() => {
 
         document.getElementById('panel-upload').addEventListener('change', handleUpload);
         document.getElementById('btn-scan').addEventListener('click', handleScanTranslate);
+        document.getElementById('btn-debug-toggle').addEventListener('click', () => toggleDebugPanel());
+        document.getElementById('btn-debug-close').addEventListener('click', () => toggleDebugPanel(false));
+        document.getElementById('btn-reader-fullscreen').addEventListener('click', openReaderFullscreen);
+        document.getElementById('btn-fullscreen-close').addEventListener('click', closeReaderFullscreen);
+        document.getElementById('translation-slider').addEventListener('input', (e) => {
+            setTranslationReveal(Number(e.target.value));
+        });
+        bindTranslationHandle();
+        bindReaderPanelControls();
+        document.getElementById('btn-translation-toggle').addEventListener('click', () => {
+            const slider = document.getElementById('translation-slider');
+            const next = Number(slider.value) >= 50 ? 0 : 100;
+            setTranslationReveal(next);
+        });
+        document.getElementById('scanner-panel-img').addEventListener('load', rerenderLatestOverlays);
+        window.addEventListener('resize', rerenderLatestOverlays);
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                closeReaderFullscreen();
+            }
+        });
+    }
+
+    function bindReaderPanelControls() {
+        const wrapper = document.getElementById('reader-panel-wrapper');
+        if (!wrapper) return;
+
+        wrapper.addEventListener('mousemove', showReaderPanelControls);
+        wrapper.addEventListener('pointerdown', showReaderPanelControls);
+        wrapper.addEventListener('mouseleave', () => {
+            window.clearTimeout(controlsHideTimer);
+            wrapper.classList.remove('reader-controls-visible');
+        });
+    }
+
+    function showReaderPanelControls() {
+        const wrapper = document.getElementById('reader-panel-wrapper');
+        wrapper.classList.add('reader-controls-visible');
+        window.clearTimeout(controlsHideTimer);
+        controlsHideTimer = window.setTimeout(() => {
+            wrapper.classList.remove('reader-controls-visible');
+        }, 1500);
+    }
+
+    function bindTranslationHandle() {
+        const handle = document.getElementById('translation-handle');
+        if (!handle) return;
+
+        handle.addEventListener('pointerdown', (e) => {
+            e.preventDefault();
+            handle.setPointerCapture?.(e.pointerId);
+            updateRevealFromPointer(e);
+
+            const move = (moveEvent) => updateRevealFromPointer(moveEvent);
+            const up = (upEvent) => {
+                handle.releasePointerCapture?.(upEvent.pointerId);
+                window.removeEventListener('pointermove', move);
+                window.removeEventListener('pointerup', up);
+            };
+
+            window.addEventListener('pointermove', move);
+            window.addEventListener('pointerup', up);
+        });
+
+        handle.addEventListener('keydown', (e) => {
+            const slider = document.getElementById('translation-slider');
+            const current = Number(slider.value) || 0;
+            let next = current;
+            if (e.key === 'ArrowLeft') next = current - 5;
+            if (e.key === 'ArrowRight') next = current + 5;
+            if (e.key === 'Home') next = 0;
+            if (e.key === 'End') next = 100;
+            if (next !== current) {
+                e.preventDefault();
+                setTranslationReveal(next);
+            }
+        });
+    }
+
+    function updateRevealFromPointer(e) {
+        const wrapper = document.querySelector('.panel-img-wrapper');
+        const rect = wrapper.getBoundingClientRect();
+        if (!rect.width) return;
+        const reveal = ((e.clientX - rect.left) / rect.width) * 100;
+        setTranslationReveal(reveal);
     }
 
     async function loadPanels(force = false) {
@@ -65,9 +152,10 @@ const Scanner = (() => {
         panelImg.src = API.panelImageUrl(panel.path || panel.filename);
         panelImg.classList.remove('hidden');
         document.getElementById('btn-scan').disabled = false;
-        document.getElementById('ocr-result').textContent = 'Bereit zum Scannen...';
-        document.getElementById('translation-result').textContent = '—';
         document.getElementById('ocr-overlay').innerHTML = '';
+        latestScan = null;
+        resetTranslationView();
+        setDebugStatus('Ready to scan.');
         ocrText = '';
     }
 
@@ -90,42 +178,161 @@ const Scanner = (() => {
         if (!selectedPanel) return;
 
         const btn = document.getElementById('btn-scan');
-        const ocrResult = document.getElementById('ocr-result');
-        const transResult = document.getElementById('translation-result');
 
         btn.disabled = true;
         btn.classList.add('loading');
-        btn.innerHTML = '<span class="spinner"></span>Scanne...';
-        ocrResult.innerHTML = '<div class="skeleton-text"></div><div class="skeleton-text short"></div>';
-        ocrResult.classList.add('loading');
-        transResult.innerHTML = '<div class="skeleton-text"></div>';
-        transResult.classList.add('loading');
+        btn.innerHTML = '<span class="spinner"></span>Scanning...';
         document.getElementById('ocr-overlay').innerHTML = '';
+        latestScan = null;
+        resetTranslationView();
+        setDebugStatus('Scanning...');
 
         try {
             const result = await API.scanAndTranslate(selectedPanel.filename);
+            latestScan = result;
             ocrText = result.text || '';
-            ocrResult.textContent = ocrText || 'Kein Text erkannt';
-            ocrResult.classList.remove('loading');
-
-            const translations = (result.annotations || [])
-                .map(a => a.translated)
-                .filter(t => t)
-                .join('\n');
-            transResult.textContent = translations || '—';
-            transResult.classList.remove('loading');
-
+            renderDebugPanel(result);
             renderOverlays(result.annotations || [], result.image_width, result.image_height);
+            showTranslatedPanel(result.translated_image_url);
+            if (result.render_warnings && result.render_warnings.length) {
+                console.warn('Panel render warnings:', result.render_warnings);
+            }
         } catch (err) {
-            ocrResult.textContent = 'Fehler: ' + err.message;
-            ocrResult.classList.remove('loading');
-            transResult.textContent = '—';
-            transResult.classList.remove('loading');
+            setDebugStatus('Error: ' + err.message);
         } finally {
             btn.disabled = false;
             btn.classList.remove('loading');
-            btn.textContent = 'Scannen & Übersetzen';
+            btn.textContent = 'Scan & Translate';
         }
+    }
+
+    function showTranslatedPanel(url) {
+        const translatedImg = document.getElementById('translated-panel-img');
+        const controls = document.getElementById('translation-controls');
+        if (!url) {
+            resetTranslationView();
+            return;
+        }
+
+        translatedImg.src = new URL(url, window.location.origin).toString();
+        translatedImg.classList.remove('hidden');
+        controls.classList.remove('hidden');
+        setTranslationReveal(0);
+    }
+
+    function resetTranslationView() {
+        const translatedImg = document.getElementById('translated-panel-img');
+        const controls = document.getElementById('translation-controls');
+        translatedImg.removeAttribute('src');
+        translatedImg.classList.add('hidden');
+        controls.classList.add('hidden');
+        setTranslationReveal(0);
+    }
+
+    function setTranslationReveal(value) {
+        const reveal = Math.max(0, Math.min(100, Number(value) || 0));
+        const wrapper = document.querySelector('.panel-img-wrapper');
+        const translatedImg = document.getElementById('translated-panel-img');
+        const slider = document.getElementById('translation-slider');
+        const toggle = document.getElementById('btn-translation-toggle');
+        const handle = document.getElementById('translation-handle');
+        wrapper.style.setProperty('--translation-reveal', `${reveal}%`);
+        translatedImg.style.setProperty('--translation-reveal', `${reveal}%`);
+        slider.value = String(reveal);
+        toggle.textContent = reveal >= 50 ? 'EN' : 'JP';
+        toggle.setAttribute('aria-label', reveal >= 50 ? 'English translation visible' : 'Japanese original visible');
+        handle.setAttribute('aria-valuenow', String(Math.round(reveal)));
+        handle.setAttribute('aria-valuetext', `${Math.round(reveal)} percent English`);
+        wrapper.classList.toggle('translation-active', reveal > 8 && !translatedImg.classList.contains('hidden'));
+    }
+
+    function toggleDebugPanel(force) {
+        const panel = document.getElementById('reader-debug-panel');
+        const btn = document.getElementById('btn-debug-toggle');
+        const nextOpen = typeof force === 'boolean' ? force : panel.classList.contains('hidden');
+        panel.classList.toggle('hidden', !nextOpen);
+        btn.setAttribute('aria-expanded', String(nextOpen));
+    }
+
+    function setDebugStatus(message) {
+        const content = document.getElementById('reader-debug-content');
+        content.innerHTML = '';
+        const empty = document.createElement('div');
+        empty.className = 'reader-debug-empty';
+        empty.textContent = message;
+        content.appendChild(empty);
+    }
+
+    function renderDebugPanel(result) {
+        const content = document.getElementById('reader-debug-content');
+        const annotations = result.annotations || [];
+        content.innerHTML = '';
+
+        if (!annotations.length) {
+            setDebugStatus('No text recognized.');
+            return;
+        }
+
+        const frag = document.createDocumentFragment();
+        annotations.forEach((ann, index) => {
+            const entry = document.createElement('div');
+            entry.className = 'reader-debug-entry';
+
+            const title = document.createElement('div');
+            title.className = 'reader-debug-title';
+            title.textContent = `Box ${ann.reading_order || index + 1}`;
+
+            const jp = document.createElement('div');
+            jp.className = 'reader-debug-jp';
+            jp.textContent = ann.text || '';
+
+            const en = document.createElement('div');
+            en.className = 'reader-debug-en';
+            en.textContent = ann.translated || 'No translation available';
+
+            entry.appendChild(title);
+            entry.appendChild(jp);
+            entry.appendChild(en);
+            frag.appendChild(entry);
+        });
+
+        content.appendChild(frag);
+    }
+
+    function openReaderFullscreen() {
+        const src = getCurrentReaderImageSrc();
+        if (!src) return;
+
+        const overlay = document.getElementById('reader-fullscreen');
+        const img = document.getElementById('reader-fullscreen-img');
+        img.src = src;
+        overlay.classList.remove('hidden');
+        document.body.classList.add('reader-fullscreen-open');
+    }
+
+    function closeReaderFullscreen() {
+        const overlay = document.getElementById('reader-fullscreen');
+        if (overlay.classList.contains('hidden')) return;
+
+        overlay.classList.add('hidden');
+        document.getElementById('reader-fullscreen-img').removeAttribute('src');
+        document.body.classList.remove('reader-fullscreen-open');
+    }
+
+    function getCurrentReaderImageSrc() {
+        const slider = document.getElementById('translation-slider');
+        const translatedImg = document.getElementById('translated-panel-img');
+        const originalImg = document.getElementById('scanner-panel-img');
+        const showEnglish = Number(slider.value) >= 50;
+        if (showEnglish && !translatedImg.classList.contains('hidden') && translatedImg.src) {
+            return translatedImg.src;
+        }
+        return originalImg.src || '';
+    }
+
+    function rerenderLatestOverlays() {
+        if (!latestScan) return;
+        renderOverlays(latestScan.annotations || [], latestScan.image_width, latestScan.image_height);
     }
 
     function renderOverlays(annotations, imgNatW, imgNatH) {

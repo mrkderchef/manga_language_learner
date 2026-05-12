@@ -346,7 +346,7 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
 
     # Step 4: Build response
     annotations = []
-    for text, translation, region in zip(recognized_texts, translations, valid_regions):
+    for idx, (text, translation, region) in enumerate(zip(recognized_texts, translations, valid_regions), start=1):
         rx, ry = int(region["x"]), int(region["y"])
         rw, rh = int(region["width"]), int(region["height"])
         bbox = [
@@ -356,6 +356,7 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
             [rx, ry + rh],
         ]
         annotations.append({
+            "id": f"ann_{idx:04d}",
             "text": text,
             "translated": translation,
             "confidence": 0.95,
@@ -363,6 +364,10 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
             "char_count": len(text),
             "vertical": bool(region.get("vertical")),
             "ocr_variant": region.get("ocr_meta", {}).get("variant", ""),
+            "reading_order": idx,
+            "font_size": int(region.get("font_size") or 0),
+            "angle": int(region.get("angle") or 0),
+            "lines": region.get("lines", []),
         })
 
     full_text = "\n".join(recognized_texts)

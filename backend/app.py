@@ -7,7 +7,16 @@ import logging
 from pathlib import Path
 from PIL import Image
 import io
-from config import API_HOST, API_PORT, API_TITLE, API_VERSION, PANELS_DIR, BASE_DIR, UPLOADS_DIR
+from config import (
+    API_HOST,
+    API_PORT,
+    API_TITLE,
+    API_VERSION,
+    PANELS_DIR,
+    BASE_DIR,
+    UPLOADS_DIR,
+    RENDERED_PANELS_DIR,
+)
 from routes.scanner import router as scanner_router
 from routes.learning import router as learning_router
 
@@ -40,6 +49,7 @@ app.add_middleware(
 
 # Serve panel images as static files
 app.mount("/panels", StaticFiles(directory=str(PANELS_DIR)), name="panels")
+app.mount("/rendered-panels", StaticFiles(directory=str(RENDERED_PANELS_DIR)), name="rendered-panels")
 
 # Routes
 app.include_router(scanner_router)
