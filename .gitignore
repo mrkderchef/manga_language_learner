@@ -11,6 +11,9 @@ __pycache__/
 # Data / Progress
 backend/data/
 
+# Upstream comic-text-detector reference template
+template/
+
 # Uploads (user-generated)
 panels/uploads/
 
