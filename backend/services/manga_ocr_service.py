@@ -7,11 +7,14 @@ This replaces the LLM-based OCR approach with a proper deep-learning OCR model
 
 import logging
 import re
+import hashlib
+from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image
 
+from config import OCR_DEBUG_DIR
 from services.text_region_detector import detect_text_regions
 
 logger = logging.getLogger(__name__)
@@ -140,6 +143,7 @@ Example: ["translation 1", "translation 2"]"""
 
 
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+OCR_DEBUG_URL_PREFIX = "/ocr-debug"
 
 
 def _cleanup_ocr_text(text: str) -> str:
@@ -159,15 +163,54 @@ def _ocr_score(text: str) -> int:
     return japanese_chars * 3 + len(text) - bad_chars * 8
 
 
-def _preprocess_crop_for_ocr(crop: Image.Image, upscale: int = 3) -> Image.Image:
-    """
-    Prepare a text crop for manga-ocr.
+def _ocr_debug_warnings(text: str, score: int, candidates: list[dict]) -> list[str]:
+    """Return human-readable OCR quality hints for the debug panel."""
+    warnings = []
+    if not text:
+        return ["empty_ocr"]
 
-    Manga scans often have low contrast, noisy paper texture, and tiny kana.
-    CLAHE + denoising + adaptive thresholding gives manga-ocr a cleaner,
-    higher-resolution glyph image while keeping the crop as a normal RGB PIL
-    image for the model API.
-    """
+    japanese_chars = len(_JAPANESE_RE.findall(text))
+    if japanese_chars == 0:
+        warnings.append("no_japanese_chars")
+    elif japanese_chars / max(1, len(text)) < 0.55:
+        warnings.append("low_japanese_ratio")
+
+    if len(text) <= 2:
+        warnings.append("very_short_text")
+    if "?" in text or "ï¿½" in text:
+        warnings.append("replacement_or_question_marks")
+    if re.search(r"(.)\1{5,}", text):
+        warnings.append("repeated_character_run")
+
+    sorted_scores = sorted((int(c.get("score", -100)) for c in candidates), reverse=True)
+    if len(sorted_scores) > 1 and sorted_scores[0] - sorted_scores[1] <= 3:
+        warnings.append("close_ocr_variant_scores")
+    if score < 8:
+        warnings.append("low_ocr_score")
+
+    return warnings
+
+
+def _ocr_confidence_from_debug(text: str, score: int, warnings: list[str]) -> tuple[float, str]:
+    """Map heuristic OCR debug data to a practical UI confidence bucket."""
+    if not text:
+        return 0.0, "bad"
+
+    confidence = 0.55 + min(max(score, 0), 60) / 150
+    confidence -= min(len(warnings), 4) * 0.08
+    if {"empty_ocr", "no_japanese_chars", "low_ocr_score"}.intersection(warnings):
+        confidence -= 0.18
+
+    confidence = max(0.05, min(0.98, confidence))
+    if confidence >= 0.78 and not warnings:
+        return confidence, "good"
+    if confidence >= 0.52:
+        return confidence, "warn"
+    return confidence, "bad"
+
+
+def _upscale_crop(crop: Image.Image, upscale: int = 3) -> np.ndarray:
+    """Return an RGB crop as resized BGR OpenCV image."""
     rgb = np.array(crop.convert("RGB"))
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
@@ -175,18 +218,33 @@ def _preprocess_crop_for_ocr(crop: Image.Image, upscale: int = 3) -> Image.Image
     scale = max(2, min(upscale, 4))
     if min(w, h) < 96:
         scale = 4
-    bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
+
+def _bgr_to_pil_rgb(bgr: np.ndarray) -> Image.Image:
+    return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
+
+def _preprocess_crop_variants(crop: Image.Image, upscale: int = 3) -> list[tuple[str, Image.Image]]:
+    """
+    Prepare several text crop variants for manga-ocr.
+
+    Manga scans often have low contrast, noisy paper texture, and tiny kana.
+    Different pages react differently to preprocessing, so the OCR scorer gets
+    raw, contrast-enhanced, and thresholded versions to compare.
+    """
+    bgr = _upscale_crop(crop, upscale)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    gray = cv2.fastNlMeansDenoising(gray, None, h=10, templateWindowSize=7, searchWindowSize=21)
 
-    block_size = 31 if min(gray.shape[:2]) >= 120 else 21
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrast_gray = clahe.apply(gray)
+    denoised = cv2.fastNlMeansDenoising(contrast_gray, None, h=10, templateWindowSize=7, searchWindowSize=21)
+
+    block_size = 31 if min(denoised.shape[:2]) >= 120 else 21
     if block_size % 2 == 0:
         block_size += 1
     thresholded = cv2.adaptiveThreshold(
-        gray,
+        denoised,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
@@ -194,52 +252,124 @@ def _preprocess_crop_for_ocr(crop: Image.Image, upscale: int = 3) -> Image.Image
         9,
     )
 
-    return Image.fromarray(cv2.cvtColor(thresholded, cv2.COLOR_GRAY2RGB))
+    return [
+        ("raw_upscaled", _bgr_to_pil_rgb(bgr)),
+        ("contrast", Image.fromarray(cv2.cvtColor(denoised, cv2.COLOR_GRAY2RGB))),
+        ("threshold", Image.fromarray(cv2.cvtColor(thresholded, cv2.COLOR_GRAY2RGB))),
+    ]
 
 
-def _ocr_crop(mocr, crop: Image.Image, region: dict) -> tuple[str, dict]:
+def _save_debug_preview(image: Image.Image, name: str) -> str:
+    """Save a compact OCR debug preview image and return its static URL."""
+    preview = image.convert("RGB")
+    preview.thumbnail((520, 520), Image.LANCZOS)
+    path = OCR_DEBUG_DIR / f"{name}.png"
+    preview.save(path, optimize=True)
+    return f"{OCR_DEBUG_URL_PREFIX}/{path.name}"
+
+
+def _ocr_crop(mocr, crop: Image.Image, region: dict, debug_slug: str | None = None) -> tuple[str, dict]:
     """Run manga-ocr on preprocessed variants and keep the best result."""
     vertical = bool(region.get("vertical")) or crop.height > crop.width * 1.25
-    variants: list[tuple[str, Image.Image]] = [
-        ("preprocessed", _preprocess_crop_for_ocr(crop)),
-    ]
+    base_variants = _preprocess_crop_variants(crop)
+    variants: list[tuple[str, Image.Image]] = list(base_variants)
 
     if vertical:
         # Try both directions: detector orientation and scan quirks can disagree.
-        variants.append(("preprocessed_rot90_ccw", variants[0][1].rotate(90, expand=True)))
-        variants.append(("preprocessed_rot90_cw", variants[0][1].rotate(-90, expand=True)))
+        for variant_name, variant_img in base_variants:
+            variants.append((f"{variant_name}_rot90_ccw", variant_img.rotate(90, expand=True)))
+            variants.append((f"{variant_name}_rot90_cw", variant_img.rotate(-90, expand=True)))
 
     best_text = ""
-    best_meta = {"variant": "", "vertical_candidate": vertical, "score": -100}
+    candidates: list[dict] = []
+    previews = {}
+    if debug_slug:
+        previews["crop"] = _save_debug_preview(crop, f"{debug_slug}_crop")
+    best_meta = {
+        "variant": "",
+        "vertical_candidate": vertical,
+        "score": -100,
+        "candidates": candidates,
+        "previews": previews,
+    }
 
     for variant_name, variant_img in variants:
+        preview_url = None
+        if debug_slug:
+            preview_url = _save_debug_preview(variant_img, f"{debug_slug}_{variant_name}")
         try:
             text = _cleanup_ocr_text(mocr(variant_img))
         except Exception as e:
             logger.debug("manga-ocr failed for %s variant: %s", variant_name, e)
+            candidates.append({
+                "variant": variant_name,
+                "text": "",
+                "score": -100,
+                "error": str(e),
+                "preview_url": preview_url,
+            })
             continue
 
         score = _ocr_score(text)
+        candidates.append({
+            "variant": variant_name,
+            "text": text,
+            "score": score,
+            "width": variant_img.width,
+            "height": variant_img.height,
+            "preview_url": preview_url,
+        })
         if score > best_meta["score"]:
             best_text = text
             best_meta = {
                 "variant": variant_name,
                 "vertical_candidate": vertical,
                 "score": score,
+                "candidates": candidates,
+                "previews": previews,
+                "selected_preview_url": preview_url,
             }
 
     # If aggressive preprocessing produced nothing useful, fall back to raw crop.
     if not best_text:
         try:
             best_text = _cleanup_ocr_text(mocr(crop))
+            fallback_score = _ocr_score(best_text)
+            fallback_preview_url = previews.get("crop")
+            candidates.append({
+                "variant": "raw_fallback",
+                "text": best_text,
+                "score": fallback_score,
+                "width": crop.width,
+                "height": crop.height,
+                "preview_url": fallback_preview_url,
+            })
             best_meta = {
                 "variant": "raw_fallback",
                 "vertical_candidate": vertical,
-                "score": _ocr_score(best_text),
+                "score": fallback_score,
+                "candidates": candidates,
+                "previews": previews,
+                "selected_preview_url": fallback_preview_url,
             }
         except Exception as e:
             logger.debug("manga-ocr raw fallback failed: %s", e)
+            candidates.append({
+                "variant": "raw_fallback",
+                "text": "",
+                "score": -100,
+                "error": str(e),
+                "preview_url": previews.get("crop"),
+            })
 
+    best_meta["warnings"] = _ocr_debug_warnings(best_text, int(best_meta.get("score", -100)), candidates)
+    confidence, quality = _ocr_confidence_from_debug(
+        best_text,
+        int(best_meta.get("score", -100)),
+        best_meta["warnings"],
+    )
+    best_meta["confidence"] = confidence
+    best_meta["quality"] = quality
     return best_text, best_meta
 
 
@@ -311,11 +441,15 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
     # Step 2: Crop each region and run manga-ocr
     mocr = _get_mocr()
     pil_img = Image.open(image_path).convert("RGB")
+    scan_path = Path(image_path)
+    scan_stat = scan_path.stat()
+    scan_slug_raw = f"{scan_path}:{scan_stat.st_size}:{scan_stat.st_mtime}"
+    scan_slug = hashlib.md5(scan_slug_raw.encode("utf-8")).hexdigest()[:12]
 
     recognized_texts: list[str] = []
     valid_regions: list[dict] = []
 
-    for region in regions:
+    for region_index, region in enumerate(regions, start=1):
         x, y, w, h = region["x"], region["y"], region["width"], region["height"]
 
         # Add small padding for better OCR
@@ -328,7 +462,9 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
         crop = pil_img.crop((x1, y1, x2, y2))
 
         # Run manga-ocr on preprocessed crop variants.
-        text, ocr_meta = _ocr_crop(mocr, crop, region)
+        debug_slug = f"{scan_slug}_r{region_index:03d}"
+        text, ocr_meta = _ocr_crop(mocr, crop, region, debug_slug)
+        ocr_meta["crop_box"] = [int(x1), int(y1), int(x2), int(y2)]
 
         if text:
             recognized_texts.append(text)
@@ -355,19 +491,38 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
             [rx + rw, ry + rh],
             [rx, ry + rh],
         ]
+        ocr_meta = region.get("ocr_meta", {})
         annotations.append({
             "id": f"ann_{idx:04d}",
             "text": text,
             "translated": translation,
-            "confidence": 0.95,
+            "confidence": float(ocr_meta.get("confidence", 0.0)),
             "bbox": bbox,
             "char_count": len(text),
             "vertical": bool(region.get("vertical")),
-            "ocr_variant": region.get("ocr_meta", {}).get("variant", ""),
+            "ocr_variant": ocr_meta.get("variant", ""),
             "reading_order": idx,
             "font_size": int(region.get("font_size") or 0),
             "angle": int(region.get("angle") or 0),
             "lines": region.get("lines", []),
+            "ocr_debug": {
+                "selected_variant": ocr_meta.get("variant", ""),
+                "score": ocr_meta.get("score", -100),
+                "quality": ocr_meta.get("quality", "bad"),
+                "warnings": ocr_meta.get("warnings", []),
+                "candidates": ocr_meta.get("candidates", []),
+                "previews": ocr_meta.get("previews", {}),
+                "selected_preview_url": ocr_meta.get("selected_preview_url"),
+                "vertical_candidate": bool(ocr_meta.get("vertical_candidate")),
+                "crop_box": ocr_meta.get("crop_box"),
+                "detected_box": [rx, ry, rw, rh],
+                "detector": {
+                    "vertical": bool(region.get("vertical")),
+                    "font_size": int(region.get("font_size") or 0),
+                    "angle": int(region.get("angle") or 0),
+                    "lines": len(region.get("lines", []) or []),
+                },
+            },
         })
 
     full_text = "\n".join(recognized_texts)

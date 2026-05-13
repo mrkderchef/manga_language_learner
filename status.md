@@ -2,39 +2,44 @@
 
 ## Aktueller Stand
 
-Manga Learner besteht aktuell aus drei Kernbausteinen:
+Manga Learner besteht aktuell aus vier Kernbausteinen:
 
 - **Manga Text Detection Engine**: findet Textbereiche, Speech Bubbles und Textzeilen im Panel.
 - **MangaOCR Pipeline**: liest japanischen Text aus jedem erkannten Crop.
-- **Translation + Learning Layer**: uebersetzt erkannte Texte und macht sie im Lernmodus nutzbar.
+- **Translation Layer**: uebersetzt erkannte Texte im Batch und gibt Annotationen fuer die UI zurueck.
+- **Translated Panel Renderer**: entfernt japanischen Text bestmoeglich aus dem Panel, rendert die englische Uebersetzung ins Bild und macht sie per JP/EN-Slider vergleichbar.
 
-Die Detection funktioniert bereits ueberraschend stabil. Bounding Boxes fuer Textregionen sehen groesstenteils korrekt aus. Die groessten Qualitaetshebel liegen weiterhin bei OCR-Qualitaet, vertikalem Text, Furigana, Reihenfolge, Cleanup und kontextbewusster Uebersetzung.
+Die Detection funktioniert bereits ueberraschend stabil. Bounding Boxes fuer Textregionen sehen groesstenteils korrekt aus. Seit Emirs Merge ist das Projekt nicht mehr nur eine OCR-/Hover-Ansicht, sondern hat eine echte erste Manga-Translation-Ansicht mit gerendertem englischem Panel.
+
+Die groessten offenen Qualitaetshebel liegen weiterhin bei OCR-Qualitaet, Furigana, echter Confidence, besserem Debugging, Tokenisierung und den eigentlichen Lernfeatures.
 
 ---
 
 ## Aktuelle Pipeline
 
 ```text
-Manga page
+Manga page / panel
 -> Manga Text Detection Engine
 -> Textbox crops
 -> OCR preprocessing
 -> MangaOCR
 -> OCR cleanup
 -> Manga reading order
--> Context-aware translation
--> UI rendering
+-> Batch translation
+-> Annotation normalization
+-> Translated panel rendering
+-> Scanner UI with OCR boxes + JP/EN slider
 ```
 
-Das Projekt behandelt die Text Detection als eigenes Produktmodul. Die UI und die Backend-Routen sollen deshalb nicht wie ein Wrapper um eine externe Referenz wirken, sondern wie eine zusammenhaengende Manga-Lernanwendung mit eigener Detection-Schicht.
+Das Projekt behandelt die Text Detection und den nativen Renderer als eigene Produktmodule. Die App soll deshalb nicht wie ein Wrapper um eine externe Referenz wirken, sondern wie eine zusammenhaengende Manga-Lernanwendung mit eigener Detection-, OCR-, Rendering- und Learning-Schicht.
 
 ---
 
-## Was bereits verbessert wurde
+## Was bereits umgesetzt ist
 
 ### MangaOCR Integration
 
-MangaOCR ist jetzt als primaere OCR-Stufe eingebunden.
+MangaOCR ist als primaere OCR-Stufe eingebunden.
 
 Detection und OCR sind getrennt:
 
@@ -73,7 +78,7 @@ Danach waehlt eine einfache Heuristik den plausibelsten OCR-Text aus. Bewertet w
 
 ### Reading Order
 
-Textboxen werden vor der Batch-Uebersetzung nochmal explizit sortiert:
+Textboxen werden vor der Batch-Uebersetzung explizit sortiert:
 
 ```text
 oben nach unten
@@ -86,13 +91,111 @@ Das verbessert die Uebersetzung, weil Dialoge in sinnvollerer Reihenfolge beim S
 
 Erfolgreiche OCR-Ergebnisse werden anhand von Dateipfad, Dateigroesse und Aenderungszeit gecacht. Wiederholtes Scannen desselben Panels ist dadurch deutlich schneller.
 
+### Native Translated Panel Renderer
+
+Neu umgesetzt:
+
+- `backend/services/panel_renderer.py`
+- Render-Cache unter `backend/data/rendered_panels/`
+- Static Route `/rendered-panels`
+- Scan Response mit `translated_image_url`, `render_method` und `render_warnings`
+- Textmasken aus OCR-Lines oder Bounding Boxes
+- OpenCV Inpainting/Cleanup der japanischen Textbereiche
+- englisches Text-Fitting mit Pillow
+- Platzierungslogik gegen ueberlappende Uebersetzungen
+- neutraler Platzhalter fuer fehlende Uebersetzungen
+
+Das ist die erste echte Version von:
+
+```text
+OCR annotations
+-> Text removal / inpainting
+-> translated text rendering
+-> translated panel image
+```
+
+### JP/EN Slider im Frontend
+
+Neu umgesetzt:
+
+- Originalbild und gerendertes Uebersetzungsbild liegen uebereinander.
+- Der Slider steuert, wie viel vom englischen Panel sichtbar ist.
+- Der JP/EN Toggle bewegt den Slider zu Original oder Uebersetzung.
+- OCR-Hoverboxen bleiben als Overlay ueber dem Bild.
+- Es gibt einen Fullscreen-Button fuer die Panelansicht.
+
+### OCR Debug Panel
+
+Der Debug Panel ist ausgebaut:
+
+- Debug-Toggle in der Scanner UI
+- Anzeige pro Box mit Reihenfolge, japanischem OCR-Text und Uebersetzung
+- heuristische OCR-Confidence pro Box
+- Qualitaetsstufen `good`, `warn`, `bad`
+- farbige OCR-Boxen im Overlay
+- ausgewaehlte OCR-Variante und Score
+- ausklappbare Liste aller getesteten OCR-Kandidaten
+- Original-Crop-Preview und Preview der gewaehlten OCR-Variante
+- Preview-Bilder fuer alle OCR-Kandidaten
+- OCR vergleicht mehrere Preprocessing-Modi: `raw_upscaled`, `contrast`, `threshold`
+- vertikale Regionen testen diese Modi zusaetzlich mit `rot90_ccw` und `rot90_cw`
+- OCR-Warnungen wie `low_ocr_score`, `very_short_text` oder `close_ocr_variant_scores`
+- erkannte Box, Crop-Box, Richtung, Winkel, Font-Groesse und Lines-Anzahl
+
+Das ist noch keine echte Modell-Confidence, aber jetzt ist sichtbar, warum die Pipeline eine OCR-Variante gewaehlt hat.
+
 ---
 
-## Aktuelle Hauptprobleme
+## Noch nicht umgesetzt / weiterhin offen
+
+### Rich Inspector statt kleiner Hoverbox
+
+Aktuell gibt es weiterhin einfache Hover-Tooltips auf den OCR-Boxen. Noch offen:
+
+- groesserer Inspector
+- Click-to-pin Verhalten
+- aktive Box markieren
+- lange Texte sauber scrollen/wrappen
+- Debugdaten und Lernbereiche in einer stabilen Karte anzeigen
+
+### Japanische Tokenisierung
+
+Noch nicht umgesetzt:
+
+- SudachiPy oder MeCab Integration
+- Tokens pro Annotation
+- Short/Middle/Long Split Modes
+- Phrase Candidates
+- tokenization status in der API
+
+Ohne Tokenisierung koennen Kanji, Woerter und Phrasen noch nicht kontrolliert anklickbar gemacht werden.
+
+### Kanji-, Wort- und Phrasen-Lookups
+
+Noch nicht umgesetzt:
+
+- `GET /api/learning/kanji/{character}`
+- `GET /api/learning/word?text=...`
+- Lookup-Cache unter `backend/data/lookup_cache/`
+- kanjiapi.dev Integration
+- Kanji Alive oder KanjiPortraits als optionale Quellen
+- UI fuer Bedeutungen, Lesungen, Stroke Count, JLPT, Beispiele
+
+Der vorhandene Learning Mode erzeugt weiterhin einfache Karten aus ganzen OCR-Annotationen. Er ist noch nicht scanner-aware auf Token-/Kanji-Ebene.
+
+### Echte OCR Confidence
+
+Die API gibt aktuell noch keine echte Modell-Confidence aus. Stattdessen gibt es jetzt eine heuristische Confidence aus OCR-Score und Warnungen.
+
+Weiterhin gewuenscht:
+
+- echte OCR-Modellwahrscheinlichkeit, falls das Modell oder eine Alternative sie liefert
+- bessere Kalibrierung der heuristischen Confidence mit echten Beispielen
+- bessere Gewichtung, welcher Preprocessing-Modus wann gewinnen sollte
 
 ### OCR Artefakte
 
-Auch mit MangaOCR koennen noch kaputte Texte entstehen:
+Auch mit MangaOCR entstehen noch kaputte Texte:
 
 - falsche Kana
 - zusammengezogene Woerter
@@ -111,24 +214,15 @@ Moegliche Ansaetze:
 - Furigana optional ignorieren
 - spaeter: Haupttext und Furigana in getrennten Layern anzeigen
 
-### OCR Confidence
-
-Die API gibt aktuell noch keine echte Modell-Confidence aus. Es gibt eine interne Kandidatenbewertung fuer OCR-Varianten, aber die UI nutzt sie noch nicht als Debug- oder Qualitaetsanzeige.
-
-Gewuenscht:
-
-- gruen: wahrscheinlich gut
-- gelb: unsicher
-- rot: vermutlich OCR-Problem
-
 ### OCR Cleanup Layer
 
 Aktuell gibt es nur leichtes Cleanup:
 
 - Whitespace entfernen
 - vertikale Trennzeichen entfernen
+- fehlende Uebersetzungen normalisieren
 
-Noch nicht umgesetzt:
+Noch offen:
 
 ```text
 OCR
@@ -148,108 +242,51 @@ Manga page
 -> Textregionen pro Panel erkennen
 -> OCR pro Panel
 -> Uebersetzung pro Panel-Kontext
+-> Rendering pro Panel oder ganze Seite
 ```
 
 Das verbessert Lesereihenfolge, Kontext und spaetere Full-Page-Translation.
 
----
+### Renderer-Qualitaet
 
-## Empfohlene Zielpipeline
+Die native Renderer-Version ist umgesetzt, aber qualitativ noch ausbaufaehig:
 
-```text
-Manga page
--> Panel segmentation
--> Manga Text Detection Engine
--> Textbox crops
--> OCR preprocessing
--> MangaOCR
--> Furigana handling
--> OCR cleanup
--> Reading order
--> Context-aware translation
--> UI overlay
--> Learning extraction
-```
+- bessere Speech-Bubble-Innenraumerkennung
+- bessere Textfarben-/Stil-Erkennung
+- optional bessere Inpainting-Methode
+- Umgang mit SFX und stark dekorativem Text
+- visuelle QA auf verschiedenen Manga-Stilen
 
 ---
 
-## Kontextbewusste Uebersetzung
-
-Textboxweise Uebersetzung bleibt schwierig, weil Japanisch oft Kontext aus vorherigen Sprechblasen braucht:
-
-- implizite Subjekte
-- ausgelassene Pronomen
-- Satzteile ueber mehrere Boxen
-- emotionale Nuancen
-
-Besser:
-
-```text
-alle Boxen eines Panels gemeinsam uebersetzen
-```
-
-oder:
-
-```text
-vorherige Boxen als Kontext mitsenden
-```
-
-Die aktuelle Batch-Uebersetzung geht bereits in diese Richtung.
-
----
-
-## OCR Debug Mode
-
-Ein Debug Mode waere sehr hilfreich.
-
-Sinnvolle Informationen:
-
-- Bounding Boxes
-- OCR crops
-- preprocessing output
-- erkannter Text
-- ausgewaehlte OCR-Variante
-- interne OCR-Bewertung
-- reading order index
-- panel id
-
-Das wuerde sichtbar machen, ob Fehler aus Detection, Crop, Preprocessing, OCR oder Translation kommen.
-
----
-
-## UI Feedback
-
-Die UI wirkt bereits sauber. Das Projekt fuehlt sich aktuell nicht kaputt an, sondern eher wie:
-
-```text
-gute Detection
-+ solide UI
-+ OCR-Qualitaet als naechster grosser Hebel
-```
-
-Die Scanner-Ansicht mit Hover-Translation ist ein guter Kern. Als naechstes sollte die UI mehr Diagnoseinformationen anzeigen, wenn OCR unsicher ist.
-
----
-
-## Prioritaeten
+## Aktualisierte Prioritaeten
 
 ## Prioritaet 1
 
-- OCR Debug Mode
-- echte oder heuristische OCR Confidence anzeigen
+- Rich Inspector mit Click-to-pin statt nur Hover-Tooltip
+- heuristische OCR Confidence anhand echter Scanbeispiele kalibrieren
 - Furigana-Probleme sichtbar machen
-- OCR-Varianten in der UI nachvollziehbar machen
 
 ## Prioritaet 2
 
-- panel-aware processing
-- besserer Cleanup Layer
-- Translation mit Panel-Kontext
-- Lesereihenfolge weiter verbessern
+- Furigana-Erkennung/Filterung experimentell verbessern
+- Preprocessing-Modi anhand echter Panels auswerten und gewichten
+- OCR Cleanup Layer vor der Uebersetzung einfuehren
+- Reading Order mit sichtbaren Indizes gegen echte Panels pruefen
 
 ## Prioritaet 3
 
-- Vocab Features
+- panel-aware processing
+- Translation mit Panel-Kontext
+- Renderer-Qualitaet verbessern
+
+## Prioritaet 4
+
+- Backend-Tokenisierung mit SudachiPy
+- kontrolliert anklickbare japanische Tokens im Inspector
+- Kanji-Lookup mit Cache
+- Wort-Lookup und erste Phrase Candidates
+- scanner-aware Learning Mode
 - JLPT-Level
 - Kanji Breakdown
 - Beispielsaetze
@@ -258,86 +295,41 @@ Die Scanner-Ansicht mit Hover-Translation ist ein guter Kern. Als naechstes soll
 
 ---
 
-## Langfristige Ideen
+## Naechster sinnvoller Meilenstein
 
-### Hover Translation
-
-- Originaltext anzeigen
-- Uebersetzung beim Hover
-- Confidence/Debug-Status optional einblenden
-
-### Woerter anklickbar machen
-
-- Bedeutung
-- Lesung
-- Kanji Breakdown
-- Beispielsatz
-- Lernstatus
-
-### Spaced Repetition
-
-Anki-artiges Lernen direkt aus gescannten Manga-Panels.
-
-### Audio / TTS
-
-Japanischen Text vorlesen lassen.
-
-Moegliche Richtungen:
-
-- lokale TTS-Modelle
-- Cloud TTS
-- spaeter verschiedene Stimmen
-
-### Full Manga Translation
-
-Spaeter eventuell:
+Der beste naechste Produkt-Meilenstein ist jetzt OCR-Qualitaet, nicht Lookup:
 
 ```text
-Page
--> OCR
--> Translation
--> Text removal / inpainting
--> translated text rendering
+Scan eines schwierigen Panels
+-> Debug Panel zeigt Gewinner und OCR-Kandidaten
+-> Crop/Preprocessing-Probleme werden ueber Preview-Bilder sichtbar
+-> Furigana und unsichere Regionen werden markiert
+-> Heuristiken koennen gezielt verbessert werden
 ```
 
----
-
-## Modelle und Technologien fuer spaeter
-
-### OCR
-
-- MangaOCR
-- PaddleOCR Japanese
-- TrOCR
-- PARSeq
-- Florence
-- GOT-OCR
-
-### Detection
-
-- eigene Manga Text Detection Engine weiter ausbauen
-- Panel segmentation
-- layout-aware detection
-- alternative ONNX/YOLO-basierte Modelle testen
-
-### Translation
-
-- Ollama local models
-- Qwen
-- DeepL
-- GPT
-- NLLB
+Damit wird die Grundlage stabil, bevor Lernfeatures auf den erkannten Texten aufbauen.
 
 ---
 
 ## Fazit
 
-Die aktuelle Situation ist gut: Detection und UI sind stabil genug, um iterativ an OCR-Qualitaet zu arbeiten.
-
-Der groesste Hebel war und bleibt:
+Die aktuelle Situation ist besser als der alte Status vermuten liess:
 
 ```text
-MangaOCR + besseres preprocessing + bessere Debug-Sichtbarkeit
+gute Detection
++ MangaOCR Pipeline
++ Batch Translation
++ nativer translated panel renderer
++ JP/EN Slider
++ erster Debug Panel
 ```
 
-Als naechstes sollte nicht blind ein neues Modell eingebaut werden, sondern sichtbar gemacht werden, wo die Pipeline scheitert: Crop, Rotation, Preprocessing, OCR oder Translation.
+Der groesste offene Hebel ist jetzt nicht mehr "uebersetzten Text irgendwann ins Bild rendern" und auch noch nicht "Kanji-Lookups", sondern:
+
+```text
+OCR-Qualitaet sichtbar machen
++ Debugdaten an echten Panels auswerten
++ Preprocessing/Furigana/Cleanup verbessern
+```
+
+Als naechstes sollte also nicht blind ein neues Modell eingebaut werden und auch noch nicht die Token-/Lookup-Schicht. Erst muessen Fehler aus Detection, Crop, Rotation, Preprocessing, OCR und Translation sichtbar und vergleichbar werden.

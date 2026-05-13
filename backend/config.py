@@ -11,10 +11,12 @@ BASE_DIR = Path(__file__).parent.parent
 PANELS_DIR = BASE_DIR / "panels"
 UPLOADS_DIR = PANELS_DIR / "uploads"
 RENDERED_PANELS_DIR = BASE_DIR / "backend" / "data" / "rendered_panels"
+OCR_DEBUG_DIR = BASE_DIR / "backend" / "data" / "ocr_debug"
 
 PANELS_DIR.mkdir(exist_ok=True)
 UPLOADS_DIR.mkdir(exist_ok=True)
 RENDERED_PANELS_DIR.mkdir(parents=True, exist_ok=True)
+OCR_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Google Cloud Settings
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")

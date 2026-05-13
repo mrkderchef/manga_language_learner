@@ -275,12 +275,30 @@ const Scanner = (() => {
 
         const frag = document.createDocumentFragment();
         annotations.forEach((ann, index) => {
+            const debug = ann.ocr_debug || {};
+            const quality = debug.quality || qualityFromConfidence(ann.confidence);
             const entry = document.createElement('div');
-            entry.className = 'reader-debug-entry';
+            entry.className = `reader-debug-entry ocr-quality-${quality}`;
 
             const title = document.createElement('div');
             title.className = 'reader-debug-title';
             title.textContent = `Box ${ann.reading_order || index + 1}`;
+
+            const meta = document.createElement('div');
+            meta.className = 'reader-debug-meta';
+            [
+                `quality: ${quality}`,
+                `confidence: ${formatConfidence(ann.confidence)}`,
+                `variant: ${debug.selected_variant || ann.ocr_variant || 'unknown'}`,
+                `score: ${debug.score ?? 'n/a'}`,
+                `vertical: ${debug.detector?.vertical ? 'yes' : 'no'}`,
+                `angle: ${debug.detector?.angle ?? ann.angle ?? 0}`,
+                `font: ${debug.detector?.font_size ?? ann.font_size ?? 0}`,
+            ].forEach(item => {
+                const pill = document.createElement('span');
+                pill.textContent = item;
+                meta.appendChild(pill);
+            });
 
             const jp = document.createElement('div');
             jp.className = 'reader-debug-jp';
@@ -291,8 +309,71 @@ const Scanner = (() => {
             en.textContent = ann.translated || 'No translation available';
 
             entry.appendChild(title);
+            entry.appendChild(meta);
             entry.appendChild(jp);
             entry.appendChild(en);
+
+            if (debug.warnings && debug.warnings.length) {
+                const warnings = document.createElement('div');
+                warnings.className = 'reader-debug-warnings';
+                warnings.textContent = `Warnings: ${debug.warnings.join(', ')}`;
+                entry.appendChild(warnings);
+            }
+
+            if (debug.crop_box || debug.detected_box) {
+                const boxes = document.createElement('div');
+                boxes.className = 'reader-debug-boxes';
+                boxes.textContent = [
+                    debug.detected_box ? `detected [${debug.detected_box.join(', ')}]` : '',
+                    debug.crop_box ? `crop [${debug.crop_box.join(', ')}]` : '',
+                ].filter(Boolean).join(' | ');
+                entry.appendChild(boxes);
+            }
+
+            if (debug.previews?.crop || debug.selected_preview_url) {
+                const previews = document.createElement('div');
+                previews.className = 'reader-debug-previews';
+                [
+                    ['Crop', debug.previews?.crop],
+                    ['Selected', debug.selected_preview_url],
+                ].forEach(([label, url]) => {
+                    if (!url) return;
+                    previews.appendChild(createDebugPreview(label, url));
+                });
+                entry.appendChild(previews);
+            }
+
+            if (debug.candidates && debug.candidates.length) {
+                const details = document.createElement('details');
+                details.className = 'reader-debug-candidates';
+                const summary = document.createElement('summary');
+                summary.textContent = `OCR candidates (${debug.candidates.length})`;
+                details.appendChild(summary);
+
+                debug.candidates.forEach(candidate => {
+                    const row = document.createElement('div');
+                    row.className = candidate.variant === debug.selected_variant
+                        ? 'reader-debug-candidate selected'
+                        : 'reader-debug-candidate';
+
+                    const head = document.createElement('div');
+                    head.className = 'reader-debug-candidate-head';
+                    head.textContent = `${candidate.variant || 'unknown'} | score ${candidate.score ?? 'n/a'}`;
+
+                    const text = document.createElement('div');
+                    text.className = 'reader-debug-candidate-text';
+                    text.textContent = candidate.error ? `Error: ${candidate.error}` : (candidate.text || '(empty)');
+
+                    row.appendChild(head);
+                    if (candidate.preview_url) {
+                        row.appendChild(createDebugPreview('Preview', candidate.preview_url));
+                    }
+                    row.appendChild(text);
+                    details.appendChild(row);
+                });
+                entry.appendChild(details);
+            }
+
             frag.appendChild(entry);
         });
 
@@ -361,8 +442,10 @@ const Scanner = (() => {
             const height = (Math.max(y3, y4) - Math.min(y1, y2)) * scaleY;
 
             const box = document.createElement('div');
-            box.className = 'ocr-box';
+            const quality = ann.ocr_debug?.quality || qualityFromConfidence(ann.confidence);
+            box.className = `ocr-box ocr-quality-${quality}`;
             box.style.cssText = `left:${left}px;top:${top}px;width:${width}px;height:${height}px`;
+            box.title = `OCR ${quality} | ${ann.ocr_variant || 'unknown'} | ${formatConfidence(ann.confidence)}`;
 
             const tooltip = document.createElement('div');
             tooltip.className = 'ocr-tooltip';
@@ -372,14 +455,48 @@ const Scanner = (() => {
             const enDiv = document.createElement('div');
             enDiv.className = 'ocr-tooltip-en';
             enDiv.textContent = ann.translated || '...';
+            const metaDiv = document.createElement('div');
+            metaDiv.className = 'ocr-tooltip-meta';
+            metaDiv.textContent = `${quality.toUpperCase()} | ${ann.ocr_variant || 'unknown'} | ${formatConfidence(ann.confidence)}`;
             tooltip.appendChild(jpDiv);
             tooltip.appendChild(enDiv);
+            tooltip.appendChild(metaDiv);
             box.appendChild(tooltip);
 
             frag.appendChild(box);
         });
 
         overlay.appendChild(frag);
+    }
+
+    function qualityFromConfidence(confidence) {
+        const value = Number(confidence) || 0;
+        if (value >= 0.78) return 'good';
+        if (value >= 0.52) return 'warn';
+        return 'bad';
+    }
+
+    function formatConfidence(confidence) {
+        const value = Number(confidence);
+        if (!Number.isFinite(value)) return 'n/a';
+        return `${Math.round(value * 100)}%`;
+    }
+
+    function createDebugPreview(label, url) {
+        const figure = document.createElement('figure');
+        figure.className = 'reader-debug-preview';
+
+        const img = document.createElement('img');
+        img.src = new URL(url, window.location.origin).toString();
+        img.alt = label;
+        img.loading = 'lazy';
+
+        const caption = document.createElement('figcaption');
+        caption.textContent = label;
+
+        figure.appendChild(img);
+        figure.appendChild(caption);
+        return figure;
     }
 
     return { init, loadPanels };

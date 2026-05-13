@@ -16,6 +16,7 @@ from config import (
     BASE_DIR,
     UPLOADS_DIR,
     RENDERED_PANELS_DIR,
+    OCR_DEBUG_DIR,
 )
 from routes.scanner import router as scanner_router
 from routes.learning import router as learning_router
@@ -50,6 +51,7 @@ app.add_middleware(
 # Serve panel images as static files
 app.mount("/panels", StaticFiles(directory=str(PANELS_DIR)), name="panels")
 app.mount("/rendered-panels", StaticFiles(directory=str(RENDERED_PANELS_DIR)), name="rendered-panels")
+app.mount("/ocr-debug", StaticFiles(directory=str(OCR_DEBUG_DIR)), name="ocr-debug")
 
 # Routes
 app.include_router(scanner_router)

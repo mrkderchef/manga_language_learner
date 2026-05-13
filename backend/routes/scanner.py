@@ -22,6 +22,7 @@ ollama_service = OllamaOCRService()
 # OCR result cache directory
 OCR_CACHE_DIR = BASE_DIR / "backend" / "data" / "ocr_cache"
 OCR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+OCR_CACHE_VERSION = "ocr-preprocessing-matrix-v1"
 MISSING_TRANSLATION_TEXT = "No translation available"
 
 
@@ -55,7 +56,7 @@ def _normalize_scan_result(result: dict | None) -> dict | None:
 def _cache_key(panel_path: Path) -> str:
     """Generate a cache key from file path + modification time."""
     stat = panel_path.stat()
-    raw = f"{panel_path}:{stat.st_size}:{stat.st_mtime}"
+    raw = f"{OCR_CACHE_VERSION}:{panel_path}:{stat.st_size}:{stat.st_mtime}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
