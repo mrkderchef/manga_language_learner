@@ -78,14 +78,83 @@ const API = (() => {
             return request(`/api/scanner/${filename}/ocr`, { method: 'POST' });
         },
 
-        scanAndTranslate(filename) {
-            return request(`/api/scanner/${filename}/scan-translate`, { method: 'POST' });
+        scanAndTranslate(filename, options = {}) {
+            return request(`/api/scanner/${filename}/scan-translate`, {
+                method: 'POST',
+                body: JSON.stringify(options),
+            }).then(data => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                return data;
+            });
         },
 
-        translateText(text) {
+        translateText(text, options = {}) {
             return request('/api/scanner/translate', {
                 method: 'POST',
-                body: JSON.stringify({ text }),
+                body: JSON.stringify({ text, ...options }),
+            });
+        },
+
+        getCacheStatus(filename) {
+            return request(`/api/scanner/${filename}/cache-status`);
+        },
+
+        deletePanelCache(filename, kind = null) {
+            const query = kind ? `?kind=${encodeURIComponent(kind)}` : '';
+            return request(`/api/scanner/${filename}/cache${query}`, { method: 'DELETE' }).then(data => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                return data;
+            });
+        },
+
+        getOcrEngines() {
+            return request('/api/scanner/ocr-engines');
+        },
+
+        getTranslationEngines() {
+            return request('/api/scanner/translation-engines');
+        },
+
+        getOllamaModels() {
+            return request('/api/scanner/ollama/models');
+        },
+
+        overrideRegion(filename, regionId, data) {
+            return request(`/api/scanner/${filename}/regions/${regionId}/override`, {
+                method: 'POST',
+                body: JSON.stringify(data),
+            }).then(result => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                return result;
+            });
+        },
+
+        recomputeRegion(filename, regionId, options = {}) {
+            return request(`/api/scanner/${filename}/regions/${regionId}/recompute`, {
+                method: 'POST',
+                body: JSON.stringify(options),
+            }).then(result => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                return result;
+            });
+        },
+
+        addRegion(filename, data) {
+            return request(`/api/scanner/${filename}/regions`, {
+                method: 'POST',
+                body: JSON.stringify(data),
+            }).then(result => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                return result;
+            });
+        },
+
+        deleteRegion(filename, regionId) {
+            return request(`/api/scanner/${filename}/regions/${regionId}`, {
+                method: 'DELETE',
+            }).then(result => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                return result;
             });
         },
 
@@ -107,6 +176,22 @@ const API = (() => {
 
         getProgress() {
             return request('/api/learning/progress');
+        },
+
+        lookupText(text) {
+            return request(`/api/learning/lookup?text=${encodeURIComponent(text)}`);
+        },
+
+        lookupKanji(character) {
+            return request(`/api/learning/kanji/${encodeURIComponent(character)}`);
+        },
+
+        lookupWord(text) {
+            return request(`/api/learning/word?text=${encodeURIComponent(text)}`);
+        },
+
+        lookupReading(reading) {
+            return request(`/api/learning/reading/${encodeURIComponent(reading)}`);
         },
 
         // === Image URL helpers ===

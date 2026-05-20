@@ -11,7 +11,7 @@ __pycache__/
 
 # Data / Progress
 backend/data/
-
+inspiration_from_github/
 # Upstream comic-text-detector reference template
 template/
 

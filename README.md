@@ -75,10 +75,11 @@ manga_language_learner/
 |   `-- services/
 |       |-- text_region_detector.py  Manga Text Detection Engine
 |       |-- manga_ocr_service.py     MangaOCR + Preprocessing + Translation
-|       |-- ollama_service.py        Ollama Vision/Text Fallback
-|       |-- gemini_service.py        Gemini Vision Service
+|       |-- translation_engine.py    selectable translation engines
+|       |-- ollama_service.py        Ollama Vision OCR experiment
+|       |-- gemini_service.py        Gemini Vision OCR/Translation experiment
 |       |-- ocr_service.py           Legacy OCR Services
-|       |-- translation_service.py   Google Cloud Translate Legacy
+|       |-- japanese_learning_service.py  tokenization/readings/lookups
 |       `-- image_service.py         Panel-Verwaltung
 |-- frontend/                 Vanilla HTML/CSS/JS
 |   |-- index.html
@@ -105,9 +106,9 @@ manga_language_learner/
 | Manga Text Detection Engine | aktiv | erkennt Textregionen, Orientierung und Lesereihenfolge |
 | MangaOCR | aktiv | primaere japanische Manga-OCR pro Crop |
 | OCR Preprocessing | aktiv | verbessert kleine, verrauschte oder kontrastarme Crops |
-| Ollama `llama3.1:8b` | aktiv | kontextbewusste Textuebersetzung |
-| Ollama `minicpm-v:8b` | Fallback | Vision-basierte OCR/Translation, falls noetig |
-| Google/Gemini Services | optional/legacy | alternative Services fuer Experimente |
+| Ollama Textmodell | aktiv/default | selectable translation engine |
+| Ollama Vision | optional | selectable OCR experiment |
+| Gemini | optional | selectable OCR/translation experiment, never hidden fallback |
 
 ## Setup
 
@@ -158,7 +159,6 @@ OLLAMA_MODEL=minicpm-v:8b
 
 GEMINI_API_KEY=optional
 GOOGLE_APPLICATION_CREDENTIALS=optional
-GOOGLE_PROJECT_ID=optional
 ```
 
 ## API Kurzueberblick

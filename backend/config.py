@@ -26,7 +26,7 @@ GOOGLE_PROJECT_ID = os.getenv("GOOGLE_PROJECT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # Ollama (remote GPU server)
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.108.19.14:11434")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "minicpm-v:8b")
 
 # API Settings

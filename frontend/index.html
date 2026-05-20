@@ -36,6 +36,19 @@
                         <p>Lerne spielerisch Vokabeln und Grammatik direkt aus Manga-Panels.</p>
                     </div>
                 </div>
+                <div class="home-model-panel" aria-label="Ollama translation model">
+                    <div>
+                        <h3>Ollama translation model</h3>
+                        <p>Default model used by Reader scans. This is separate from Lernmodus.</p>
+                    </div>
+                    <div class="home-model-controls">
+                        <select id="home-ollama-model" aria-label="Ollama model">
+                            <option value="">Auto</option>
+                        </select>
+                        <input id="home-custom-model" type="text" placeholder="Custom model name">
+                    </div>
+                    <div id="home-ollama-status" class="home-model-status">Loading Ollama models...</div>
+                </div>
             </div>
         </section>
 
@@ -45,23 +58,111 @@
                 <header class="reader-topbar">
                     <div class="reader-library">
                         <div id="panel-list" class="panel-grid"></div>
-                        <button class="upload-area reader-upload" id="upload-area" type="button">
-                            Upload
-                        </button>
                         <input type="file" id="panel-upload" accept="image/jpeg,image/png" hidden>
                     </div>
                     <div class="reader-actions">
-                        <button id="btn-scan" class="btn btn-primary reader-scan" disabled>Scan & Translate</button>
-                        <button id="btn-debug-toggle" class="reader-control-button" type="button" aria-expanded="false" aria-controls="reader-debug-panel">Debug</button>
+                        <button class="reader-main-button upload-area reader-upload" id="upload-area" type="button">
+                            Upload
+                        </button>
+                        <div class="scan-combo">
+                            <button id="btn-scan-options" class="reader-main-button btn btn-primary scan-options-toggle" type="button" aria-expanded="false" aria-controls="scan-options-panel" aria-label="Scan options">🔧</button>
+                            <button id="btn-scan" class="reader-main-button btn btn-primary reader-scan" disabled>Scan &amp; Translate</button>
+                        </div>
+                        <button id="btn-debug-toggle" class="reader-main-button reader-control-button" type="button" aria-expanded="false" aria-controls="reader-debug-panel">Details</button>
                     </div>
                 </header>
+
+                <aside id="scan-options-panel" class="scan-options-panel hidden" aria-label="Scan options">
+                    <section class="scan-options-section cache-options-section">
+                        <div class="scan-options-title">Panel cache</div>
+                        <div id="panel-cache-summary" class="panel-cache-summary">
+                            <div class="cache-pill cache-pill-miss">OCR ✕</div>
+                            <div class="cache-pill cache-pill-miss">Translation ✕</div>
+                            <div class="cache-pill cache-pill-miss">Learning ✕</div>
+                        </div>
+                        <div class="cache-actions">
+                            <button class="cache-action" type="button" data-cache-kind="ocr">Clear OCR</button>
+                            <button class="cache-action" type="button" data-cache-kind="translation">Clear translation</button>
+                            <button class="cache-action" type="button" data-cache-kind="learning">Clear learning</button>
+                            <button id="btn-clear-panel-cache" class="cache-action cache-action-danger" type="button">Clear panel caches</button>
+                        </div>
+                    </section>
+                    <label title="Reuse cached OCR and translation results when they match these settings.">
+                        <span>Use cache</span>
+                        <input id="scan-use-cache" type="checkbox" checked>
+                    </label>
+                    <label title="Ignore derived OCR/translation cache and recompute automatically.">
+                        <span>Fresh auto scan</span>
+                        <input id="scan-fresh" type="checkbox">
+                    </label>
+                    <label title="Choose which OCR engine reads the panel. No hidden fallback is used.">
+                        <span>OCR engine</span>
+                        <select id="scan-ocr-engine"><option value="mangaocr">MangaOCR</option></select>
+                    </label>
+                    <label title="Controls how much extra OCR work is attempted.">
+                        <span>OCR quality</span>
+                        <select id="scan-ocr-quality">
+                            <option value="balanced">Balanced</option>
+                            <option value="fast">Fast</option>
+                            <option value="deep">Deep</option>
+                        </select>
+                    </label>
+                    <label title="How strongly vertical manga text is preferred over rotated OCR candidates.">
+                        <span>Vertical preference</span>
+                        <select id="scan-vertical-preference">
+                            <option value="normal">Normal</option>
+                            <option value="strong">Strong</option>
+                            <option value="off">Off</option>
+                        </select>
+                    </label>
+                    <label title="Rotated OCR must beat unrotated OCR by this many points to win.">
+                        <span>Rotation win margin</span>
+                        <input id="scan-rotation-margin" type="number" min="0" max="60" value="15">
+                    </label>
+                    <label title="Choose the translation engine. Ollama is the default.">
+                        <span>Translation engine</span>
+                        <select id="scan-translation-engine"><option value="ollama">Ollama</option></select>
+                    </label>
+                    <label title="Choose an installed Ollama model or type a custom model below.">
+                        <span>Ollama model</span>
+                        <select id="scan-translation-model"><option value="">Auto</option></select>
+                    </label>
+                    <label title="Optional custom Ollama model name. This must be installed in Ollama.">
+                        <span>Custom model</span>
+                        <input id="scan-custom-model" type="text" placeholder="e.g. llama3.1:8b">
+                    </label>
+                    <label title="Translation target language code.">
+                        <span>Target language</span>
+                        <input id="scan-target-lang" type="text" value="en">
+                    </label>
+                    <label title="Natural is best for manga; literal is closer to Japanese; learner-friendly explains more plainly.">
+                        <span>Style</span>
+                        <select id="scan-translation-style">
+                            <option value="natural">Natural manga</option>
+                            <option value="literal">Literal</option>
+                            <option value="learner">Learner-friendly</option>
+                        </select>
+                    </label>
+                    <label title="Higher values make translations more varied but less stable.">
+                        <span>Temperature</span>
+                        <input id="scan-temperature" type="number" min="0" max="1" step="0.05" value="0.1">
+                    </label>
+                    <label title="Clear manual box/orientation edits on this scan.">
+                        <span>Reset manual edits</span>
+                        <input id="scan-reset-edits" type="checkbox">
+                    </label>
+                </aside>
 
                 <div class="reader-stage">
                     <div class="panel-display">
                         <div class="panel-img-wrapper" id="reader-panel-wrapper">
                             <img id="scanner-panel-img" class="hidden" src="" alt="Manga panel">
                             <img id="translated-panel-img" class="translated-panel-img hidden" src="" alt="Translated manga panel" aria-hidden="true">
-                            <button id="btn-reader-fullscreen" class="reader-panel-button reader-fullscreen-button" type="button" aria-label="Fullscreen">⛶</button>
+                            <div class="reader-panel-actions" aria-label="Reader tools">
+                                <button id="btn-add-box" class="reader-panel-button reader-add-button" type="button" aria-pressed="false" disabled>Add</button>
+                                <button id="btn-edit-boxes" class="reader-panel-button reader-edit-button" type="button" aria-pressed="false">Edit</button>
+                                <button id="btn-reader-fullscreen" class="reader-panel-button reader-fullscreen-button" type="button" aria-label="Fullscreen">⛶</button>
+                            </div>
                             <div id="translation-controls" class="translation-controls hidden">
                                 <button id="btn-translation-toggle" class="translation-toggle" type="button">JP</button>
                                 <input id="translation-slider" class="translation-slider" type="range" min="0" max="100" value="0" aria-label="Translation reveal">
@@ -76,7 +177,7 @@
 
                 <aside id="reader-debug-panel" class="reader-debug-panel hidden" aria-live="polite">
                     <div class="reader-debug-header">
-                        <h2>Recognized Text</h2>
+                        <h2>Details</h2>
                         <button id="btn-debug-close" class="reader-debug-close" type="button" aria-label="Close debug panel">×</button>
                     </div>
                     <div id="reader-debug-content" class="reader-debug-content">Select a panel...</div>

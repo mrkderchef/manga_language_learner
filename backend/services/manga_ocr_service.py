@@ -15,6 +15,8 @@ import numpy as np
 from PIL import Image
 
 from config import OCR_DEBUG_DIR
+from services import japanese_learning_service
+from services import translation_engine
 from services.text_region_detector import detect_text_regions
 
 logger = logging.getLogger(__name__)
@@ -34,112 +36,32 @@ def _get_mocr():
     return _mocr
 
 
-def _translate_texts(texts: list[str], target_lang: str = "en") -> list[str]:
-    """Translate a batch of Japanese texts using Ollama with manga context."""
-    if not texts:
-        return []
-
-    lang_names = {"en": "English", "de": "German", "fr": "French", "es": "Spanish"}
-    lang_name = lang_names.get(target_lang, target_lang)
-
-    # Primary: Ollama batch translation with context
+def _translate_texts(texts: list[str], options: dict | None = None) -> dict:
+    """Translate a batch of Japanese texts through the explicit translation engine."""
+    options = options or {}
     try:
-        from services.ollama_service import OllamaOCRService
-        svc = OllamaOCRService()
-        if svc.is_available():
-            translations = _ollama_batch_translate(svc, texts, lang_name)
-            if translations and any(translations):
-                return translations
-    except Exception as e:
-        logger.warning(f"Ollama batch translation failed: {e}")
-
-    # Fallback: per-text Ollama translation
-    try:
-        from services.ollama_service import OllamaOCRService
-        svc = OllamaOCRService()
-        if svc.is_available():
-            translations = []
-            for t in texts:
-                result = svc.translate_text(t, target_lang)
-                if result.get("success"):
-                    translations.append(result["translated"])
-                else:
-                    translations.append("")
-            if any(translations):
-                return translations
-    except Exception as e:
-        logger.warning(f"Ollama per-text translation failed: {e}")
-
-    # Last resort: MyMemory free API
-    try:
-        import requests
-        translations = []
-        for t in texts:
-            try:
-                resp = requests.get(
-                    "https://api.mymemory.translated.net/get",
-                    params={"q": t, "langpair": f"ja|{target_lang}"},
-                    timeout=10,
-                )
-                data = resp.json()
-                if data.get("responseStatus") == 200:
-                    translations.append(data["responseData"]["translatedText"])
-                else:
-                    translations.append("")
-            except Exception:
-                translations.append("")
-        return translations
-    except Exception as e:
-        logger.warning(f"Fallback translation also failed: {e}")
-        return [""] * len(texts)
-
-
-def _ollama_batch_translate(svc, texts: list[str], lang_name: str) -> list[str]:
-    """Translate all texts in one Ollama call with manga dialogue context."""
-    import json
-    import re
-
-    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
-    prompt = f"""You are translating Japanese manga dialogue to {lang_name}.
-These are speech bubbles from the same manga page, in reading order.
-Translate naturally and contextually — use conversational tone appropriate for manga.
-Do NOT translate literally. Capture the intent, emotion, and natural speech patterns.
-Keep sound effects descriptive (e.g. ビリリ → *riiip*).
-For short exclamations or reactions, keep them punchy.
-
-Japanese texts:
-{numbered}
-
-Respond with ONLY a JSON array of {lang_name} translations in the same order.
-Example: ["translation 1", "translation 2"]"""
-
-    try:
-        text_model = svc._find_text_model()
-        response = svc._call_ollama(prompt, model=text_model)
-        text = response.strip()
-        # Extract JSON array from response
-        json_match = re.search(r'\[.*\]', text, re.DOTALL)
-        if json_match:
-            result = json.loads(json_match.group())
-            if isinstance(result, list):
-                # Pad or truncate to match input length
-                while len(result) < len(texts):
-                    result.append("")
-                return result[:len(texts)]
-    except Exception as e:
-        logger.warning(f"Ollama batch translate parse error: {e}")
-
-    # Fallback: parse as numbered list
-    try:
-        translations = svc._parse_numbered_list(response)
-        if translations:
-            while len(translations) < len(texts):
-                translations.append("")
-            return translations[:len(texts)]
-    except Exception:
-        pass
-
-    return None
+        return translation_engine.translate_batch(
+            texts,
+            target_lang=options.get("target_lang", "en"),
+            engine=options.get("translation_engine", "ollama"),
+            model=options.get("translation_model") or None,
+            style=options.get("translation_style", "natural"),
+            temperature=float(options.get("temperature", 0.1)),
+        )
+    except Exception as exc:
+        logger.warning("Translation unavailable: %s", exc)
+        return {
+            "success": False,
+            "translations": [""] * len(texts),
+            "translation_engine_requested": options.get("translation_engine", "ollama"),
+            "translation_engine_used": None,
+            "translation_model": options.get("translation_model"),
+            "translation_target_lang": options.get("target_lang", "en"),
+            "translation_style": options.get("translation_style", "natural"),
+            "translation_prompt_version": translation_engine.PROMPT_VERSION,
+            "fallback_used": False,
+            "translation_error": str(exc),
+        }
 
 
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
@@ -154,13 +76,88 @@ def _cleanup_ocr_text(text: str) -> str:
     return text
 
 
-def _ocr_score(text: str) -> int:
-    """Score OCR candidates so preprocessing/rotation variants can compete."""
+def _legacy_ocr_score(text: str) -> int:
     if not text:
         return -100
     japanese_chars = len(_JAPANESE_RE.findall(text))
     bad_chars = text.count("�") + text.count("?")
     return japanese_chars * 3 + len(text) - bad_chars * 8
+
+
+def _variant_orientation(variant: str) -> str:
+    return "horizontal" if "_rot90_" in variant else "vertical"
+
+
+def _score_candidate(candidate: dict, candidates: list[dict], expected_orientation: str, options: dict | None = None) -> dict:
+    """Score an OCR candidate with visible component breakdown."""
+    options = options or {}
+    text = candidate.get("text") or ""
+    if not text:
+        return {
+            "total": -100,
+            "script_quality": -100,
+            "layout_fit": 0,
+            "variant_consensus": 0,
+            "semantic_plausibility": 0,
+            "orientation_bias": 0,
+            "penalties": {"empty": -100},
+        }
+
+    length = len(text)
+    japanese_chars = len(_JAPANESE_RE.findall(text))
+    bad_chars = text.count("�") + text.count("?") + text.count("ï¿½")
+    weird_chars = len(re.findall(r"[^\u3040-\u30ff\u3400-\u9fff。、！？…ー・\w]", text))
+    jp_ratio = japanese_chars / max(1, length)
+
+    script_quality = japanese_chars * 2.4 + min(length, 32) * 0.8 - bad_chars * 14 - weird_chars * 4
+
+    orientation = _variant_orientation(candidate.get("variant", ""))
+    layout_fit = 10 if orientation == expected_orientation else -12
+
+    rotation_preference = str(options.get("vertical_preference", "normal"))
+    orientation_bias = 0
+    if expected_orientation == "vertical":
+        orientation_bias = {"off": 0, "normal": 8, "strong": 14}.get(rotation_preference, 8)
+        if orientation != "vertical":
+            orientation_bias *= -1
+
+    same_text = [
+        c for c in candidates
+        if c.get("text") == text and "_rot90_" not in c.get("variant", "")
+    ]
+    variant_consensus = 0
+    if "_rot90_" not in candidate.get("variant", ""):
+        variant_consensus = min(len(same_text), 3) * 8
+    elif len(same_text):
+        variant_consensus = -8
+
+    semantic = japanese_learning_service.token_plausibility(text)
+    semantic_plausibility = semantic["score"]
+
+    penalties = {}
+    if jp_ratio < 0.55:
+        penalties["low_japanese_ratio"] = -12
+    if re.search(r"(.)\1{5,}", text):
+        penalties["repeated_character_run"] = -10
+    if length > 48:
+        penalties["overlong"] = -min(16, (length - 48) * 0.5)
+
+    total = script_quality + layout_fit + variant_consensus + semantic_plausibility + orientation_bias + sum(penalties.values())
+    return {
+        "total": int(round(total)),
+        "script_quality": round(script_quality, 2),
+        "layout_fit": layout_fit,
+        "variant_consensus": variant_consensus,
+        "semantic_plausibility": semantic_plausibility,
+        "semantic_details": semantic,
+        "orientation_bias": orientation_bias,
+        "penalties": penalties,
+    }
+
+
+def _ocr_score(text: str) -> int:
+    """Compatibility wrapper for old callers/debug data."""
+    return _legacy_ocr_score(text)
 
 
 def _ocr_debug_warnings(text: str, score: int, candidates: list[dict]) -> list[str]:
@@ -268,9 +265,14 @@ def _save_debug_preview(image: Image.Image, name: str) -> str:
     return f"{OCR_DEBUG_URL_PREFIX}/{path.name}"
 
 
-def _ocr_crop(mocr, crop: Image.Image, region: dict, debug_slug: str | None = None) -> tuple[str, dict]:
+def _ocr_crop(mocr, crop: Image.Image, region: dict, debug_slug: str | None = None, options: dict | None = None) -> tuple[str, dict]:
     """Run manga-ocr on preprocessed variants and keep the best result."""
+    options = options or {}
+    forced_orientation = region.get("forced_orientation") or region.get("orientation_override")
     vertical = bool(region.get("vertical")) or crop.height > crop.width * 1.25
+    if forced_orientation in {"vertical", "horizontal"}:
+        vertical = forced_orientation == "vertical"
+    expected_orientation = "vertical" if vertical else "horizontal"
     base_variants = _preprocess_crop_variants(crop)
     variants: list[tuple[str, Image.Image]] = list(base_variants)
 
@@ -289,8 +291,11 @@ def _ocr_crop(mocr, crop: Image.Image, region: dict, debug_slug: str | None = No
         "variant": "",
         "vertical_candidate": vertical,
         "score": -100,
+        "score_breakdown": {"total": -100},
         "candidates": candidates,
         "previews": previews,
+        "recognized_orientation": expected_orientation,
+        "orientation_source": "manual" if forced_orientation else "detector",
     }
 
     for variant_name, variant_img in variants:
@@ -310,25 +315,62 @@ def _ocr_crop(mocr, crop: Image.Image, region: dict, debug_slug: str | None = No
             })
             continue
 
-        score = _ocr_score(text)
+        score = _legacy_ocr_score(text)
         candidates.append({
             "variant": variant_name,
             "text": text,
             "score": score,
+            "legacy_score": score,
+            "recognized_orientation": _variant_orientation(variant_name),
             "width": variant_img.width,
             "height": variant_img.height,
             "preview_url": preview_url,
         })
-        if score > best_meta["score"]:
-            best_text = text
+
+    for candidate in candidates:
+        if candidate.get("error"):
+            continue
+        breakdown = _score_candidate(candidate, candidates, expected_orientation, options)
+        candidate["score_breakdown"] = breakdown
+        candidate["score"] = breakdown["total"]
+        if candidate["score"] > best_meta["score"]:
+            best_text = candidate.get("text", "")
             best_meta = {
-                "variant": variant_name,
+                "variant": candidate.get("variant", ""),
                 "vertical_candidate": vertical,
-                "score": score,
+                "score": candidate["score"],
+                "score_breakdown": breakdown,
                 "candidates": candidates,
                 "previews": previews,
-                "selected_preview_url": preview_url,
+                "selected_preview_url": candidate.get("preview_url"),
+                "recognized_orientation": candidate.get("recognized_orientation", expected_orientation),
+                "orientation_source": "manual" if forced_orientation else "auto_score",
             }
+
+    # Guard against rotated hallucinations: rotated variants must clearly beat
+    # the best unrotated candidate before they can override the detector layout.
+    margin = int(options.get("rotation_win_margin", 15))
+    if best_meta.get("variant") and "_rot90_" in best_meta["variant"]:
+        unrotated = [
+            c for c in candidates
+            if c.get("text") and "_rot90_" not in c.get("variant", "") and not c.get("error")
+        ]
+        if unrotated:
+            best_unrotated = max(unrotated, key=lambda c: int(c.get("score", -100)))
+            if int(best_unrotated.get("score", -100)) >= int(best_meta["score"]) - margin:
+                best_text = best_unrotated.get("text", "")
+                best_meta = {
+                    "variant": best_unrotated.get("variant", ""),
+                    "vertical_candidate": vertical,
+                    "score": int(best_unrotated.get("score", -100)),
+                    "score_breakdown": best_unrotated.get("score_breakdown", {}),
+                    "candidates": candidates,
+                    "previews": previews,
+                    "selected_preview_url": best_unrotated.get("preview_url"),
+                    "recognized_orientation": best_unrotated.get("recognized_orientation", expected_orientation),
+                    "orientation_source": "manual" if forced_orientation else "auto_score",
+                    "selection_note": f"unrotated preferred within rotation margin {margin}",
+                }
 
     # If aggressive preprocessing produced nothing useful, fall back to raw crop.
     if not best_text:
@@ -348,9 +390,12 @@ def _ocr_crop(mocr, crop: Image.Image, region: dict, debug_slug: str | None = No
                 "variant": "raw_fallback",
                 "vertical_candidate": vertical,
                 "score": fallback_score,
+                "score_breakdown": {"total": fallback_score, "fallback": True},
                 "candidates": candidates,
                 "previews": previews,
                 "selected_preview_url": fallback_preview_url,
+                "recognized_orientation": expected_orientation,
+                "orientation_source": "manual" if forced_orientation else "fallback",
             }
         except Exception as e:
             logger.debug("manga-ocr raw fallback failed: %s", e)
@@ -410,7 +455,7 @@ def _sort_regions_reading_order(regions: list[dict]) -> list[dict]:
     return ordered
 
 
-def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
+def extract_and_translate(image_path: str, target_lang: str = "en", options: dict | None = None, regions_override: list[dict] | None = None) -> dict:
     """
     Full pipeline: detect text regions → OCR each region → translate.
 
@@ -424,8 +469,11 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
 
     im_h, im_w = img.shape[:2]
 
-    # Step 1: Detect text regions with comic-text-detector
-    regions = _sort_regions_reading_order(detect_text_regions(image_path))
+    options = options or {}
+
+    # Step 1: Detect text regions with comic-text-detector, unless the caller
+    # provides panel-state regions with manual overrides already applied.
+    regions = _sort_regions_reading_order(regions_override or detect_text_regions(image_path))
     logger.info(f"manga-ocr pipeline: {len(regions)} text regions detected")
 
     if not regions:
@@ -463,7 +511,7 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
 
         # Run manga-ocr on preprocessed crop variants.
         debug_slug = f"{scan_slug}_r{region_index:03d}"
-        text, ocr_meta = _ocr_crop(mocr, crop, region, debug_slug)
+        text, ocr_meta = _ocr_crop(mocr, crop, region, debug_slug, options)
         ocr_meta["crop_box"] = [int(x1), int(y1), int(x2), int(y2)]
 
         if text:
@@ -478,7 +526,10 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
     logger.info(f"manga-ocr recognized text in {len(recognized_texts)}/{len(regions)} regions")
 
     # Step 3: Translate all texts
-    translations = _translate_texts(recognized_texts, target_lang)
+    translation_options = dict(options)
+    translation_options.setdefault("target_lang", target_lang)
+    translation_result = _translate_texts(recognized_texts, translation_options)
+    translations = translation_result.get("translations", [])
 
     # Step 4: Build response
     annotations = []
@@ -492,6 +543,7 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
             [rx, ry + rh],
         ]
         ocr_meta = region.get("ocr_meta", {})
+        learning = japanese_learning_service.tokenize_text(text)
         annotations.append({
             "id": f"ann_{idx:04d}",
             "text": text,
@@ -501,6 +553,13 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
             "char_count": len(text),
             "vertical": bool(region.get("vertical")),
             "ocr_variant": ocr_meta.get("variant", ""),
+            "region_id": region.get("region_id") or f"region_{idx:04d}",
+            "recognized_orientation": ocr_meta.get("recognized_orientation", "vertical" if region.get("vertical") else "horizontal"),
+            "orientation_source": ocr_meta.get("orientation_source", "detector"),
+            "reading_kana": learning.get("reading_kana", ""),
+            "reading_romaji": learning.get("reading_romaji", ""),
+            "tokens": learning.get("tokens", []),
+            "kanji_spans": learning.get("kanji_spans", []),
             "reading_order": idx,
             "font_size": int(region.get("font_size") or 0),
             "angle": int(region.get("angle") or 0),
@@ -509,6 +568,8 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
                 "selected_variant": ocr_meta.get("variant", ""),
                 "score": ocr_meta.get("score", -100),
                 "quality": ocr_meta.get("quality", "bad"),
+                "score_breakdown": ocr_meta.get("score_breakdown", {}),
+                "selection_note": ocr_meta.get("selection_note"),
                 "warnings": ocr_meta.get("warnings", []),
                 "candidates": ocr_meta.get("candidates", []),
                 "previews": ocr_meta.get("previews", {}),
@@ -532,6 +593,17 @@ def extract_and_translate(image_path: str, target_lang: str = "en") -> dict:
         "text": full_text,
         "annotations": annotations,
         "method": "manga-ocr",
+        "ocr_engine_requested": options.get("ocr_engine", "mangaocr"),
+        "ocr_engine_used": "mangaocr",
+        "fallback_used": False,
+        "fallback_reason": None,
+        "translation_engine_requested": translation_result.get("translation_engine_requested"),
+        "translation_engine_used": translation_result.get("translation_engine_used"),
+        "translation_model": translation_result.get("translation_model"),
+        "translation_target_lang": translation_result.get("translation_target_lang"),
+        "translation_style": translation_result.get("translation_style"),
+        "translation_prompt_version": translation_result.get("translation_prompt_version"),
+        "translation_error": translation_result.get("translation_error"),
         "image_width": im_w,
         "image_height": im_h,
     }

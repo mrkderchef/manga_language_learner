@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from services.image_service import ImageService
+from services import japanese_learning_service
 from routes.scanner import _run_ocr
 import logging
 import json
@@ -59,7 +60,9 @@ async def get_panel_vocab(filename: str):
         if jp:
             vocab.append({
                 "japanese": jp,
-                "reading": "",
+                "reading": ann.get("reading_romaji") or ann.get("reading_kana", ""),
+                "reading_kana": ann.get("reading_kana", ""),
+                "tokens": ann.get("tokens", []),
                 "meaning": ann.get("translated", ""),
             })
 
@@ -96,3 +99,31 @@ async def get_progress():
         "panels_completed": progress["panels_completed"],
         "words": progress["words"],
     }
+
+
+@router.get("/lookup")
+async def lookup_text(text: str):
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No text provided")
+    return japanese_learning_service.lookup_text(text)
+
+
+@router.get("/kanji/{character}")
+async def lookup_kanji(character: str):
+    if not character:
+        raise HTTPException(status_code=400, detail="No kanji provided")
+    return japanese_learning_service.lookup_kanji(character)
+
+
+@router.get("/word")
+async def lookup_word(text: str):
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No text provided")
+    return japanese_learning_service.lookup_word(text)
+
+
+@router.get("/reading/{reading}")
+async def lookup_reading(reading: str):
+    if not reading:
+        raise HTTPException(status_code=400, detail="No reading provided")
+    return japanese_learning_service.lookup_reading(reading)
