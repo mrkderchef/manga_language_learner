@@ -69,44 +69,180 @@ const API = (() => {
                 body: formData,
             }).then(r => r.json()).then(data => {
                 invalidateCache('/api/scanner/panels');
-                invalidateCache('/api/learning/panels');
+                invalidateCache('/api/rabbithole/panels');
                 return data;
             });
         },
 
-        scanPanel(filename) {
-            return request(`/api/scanner/${filename}/ocr`, { method: 'POST' });
-        },
-
-        scanAndTranslate(filename) {
-            return request(`/api/scanner/${filename}/scan-translate`, { method: 'POST' });
-        },
-
-        translateText(text) {
-            return request('/api/scanner/translate', {
+        scanPanel(filename, options = {}) {
+            return request(`/api/scanner/${filename}/ocr`, {
                 method: 'POST',
-                body: JSON.stringify({ text }),
+                body: JSON.stringify(options),
+            }).then(data => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                invalidateCache(`/api/scanner/${filename}/regions`);
+                return data;
             });
         },
 
-        // === Learning Endpoints ===
-        getLearningPanels() {
-            return request('/api/learning/panels');
+        scanAndTranslate(filename, options = {}) {
+            return request(`/api/scanner/${filename}/scan-translate`, {
+                method: 'POST',
+                body: JSON.stringify(options),
+            }).then(data => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                invalidateCache(`/api/scanner/${filename}/regions`);
+                return data;
+            });
+        },
+
+        buildRabbithole(filename, options = {}) {
+            return request(`/api/scanner/${filename}/rabbithole`, {
+                method: 'POST',
+                body: JSON.stringify(options),
+            }).then(data => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                return data;
+            });
+        },
+
+        getCachedRabbithole(filename, options = {}) {
+            return request(`/api/scanner/${filename}/rabbithole`, {
+                method: 'POST',
+                body: JSON.stringify({ ...options, cache_only: true }),
+            });
+        },
+
+        translatePanel(filename, options = {}) {
+            return request(`/api/scanner/${filename}/translate`, {
+                method: 'POST',
+                body: JSON.stringify(options),
+            }).then(data => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                return data;
+            });
+        },
+
+        getCachedTranslation(filename, options = {}) {
+            return request(`/api/scanner/${filename}/translate`, {
+                method: 'POST',
+                body: JSON.stringify({ ...options, cache_only: true }),
+            });
+        },
+
+        translateText(text, options = {}) {
+            return request('/api/scanner/translate', {
+                method: 'POST',
+                body: JSON.stringify({ text, ...options }),
+            });
+        },
+
+        getCacheStatus(filename) {
+            return request(`/api/scanner/${filename}/cache-status`);
+        },
+
+        getRegions(filename) {
+            return request(`/api/scanner/${filename}/regions`);
+        },
+
+        deletePanelCache(filename, kind = null) {
+            const query = kind ? `?kind=${encodeURIComponent(kind)}` : '';
+            return request(`/api/scanner/${filename}/cache${query}`, { method: 'DELETE' }).then(data => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                invalidateCache(`/api/scanner/${filename}/regions`);
+                return data;
+            });
+        },
+
+        getOcrEngines() {
+            return request('/api/scanner/ocr-engines');
+        },
+
+        getTranslationEngines() {
+            return request('/api/scanner/translation-engines');
+        },
+
+        getOllamaModels() {
+            return request('/api/scanner/ollama/models');
+        },
+
+        overrideRegion(filename, regionId, data) {
+            return request(`/api/scanner/${filename}/regions/${regionId}/override`, {
+                method: 'POST',
+                body: JSON.stringify(data),
+            }).then(result => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                invalidateCache(`/api/scanner/${filename}/regions`);
+                return result;
+            });
+        },
+
+        recomputeRegion(filename, regionId, options = {}) {
+            return request(`/api/scanner/${filename}/regions/${regionId}/recompute`, {
+                method: 'POST',
+                body: JSON.stringify(options),
+            }).then(result => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                invalidateCache(`/api/scanner/${filename}/regions`);
+                return result;
+            });
+        },
+
+        addRegion(filename, data) {
+            return request(`/api/scanner/${filename}/regions`, {
+                method: 'POST',
+                body: JSON.stringify(data),
+            }).then(result => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                invalidateCache(`/api/scanner/${filename}/regions`);
+                return result;
+            });
+        },
+
+        deleteRegion(filename, regionId) {
+            return request(`/api/scanner/${filename}/regions/${regionId}`, {
+                method: 'DELETE',
+            }).then(result => {
+                invalidateCache(`/api/scanner/${filename}/cache-status`);
+                invalidateCache(`/api/scanner/${filename}/regions`);
+                return result;
+            });
+        },
+
+        // === Rabbithole Endpoints ===
+        getRabbitholePanels() {
+            return request('/api/rabbithole/panels');
         },
 
         getPanelVocab(filename) {
-            return request(`/api/learning/${filename}/vocab`);
+            return request(`/api/rabbithole/${filename}/vocab`);
         },
 
         submitAnswer(filename, word, knew) {
-            return request(`/api/learning/${filename}/answer`, {
+            return request(`/api/rabbithole/${filename}/answer`, {
                 method: 'POST',
                 body: JSON.stringify({ word, knew }),
             });
         },
 
         getProgress() {
-            return request('/api/learning/progress');
+            return request('/api/rabbithole/progress');
+        },
+
+        lookupText(text) {
+            return request(`/api/rabbithole/lookup?text=${encodeURIComponent(text)}`);
+        },
+
+        lookupKanji(character) {
+            return request(`/api/rabbithole/kanji/${encodeURIComponent(character)}`);
+        },
+
+        lookupWord(text) {
+            return request(`/api/rabbithole/word?text=${encodeURIComponent(text)}`);
+        },
+
+        lookupReading(reading) {
+            return request(`/api/rabbithole/reading/${encodeURIComponent(reading)}`);
         },
 
         // === Image URL helpers ===

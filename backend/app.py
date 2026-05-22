@@ -15,17 +15,19 @@ from config import (
     PANELS_DIR,
     BASE_DIR,
     UPLOADS_DIR,
-    RENDERED_PANELS_DIR,
-    OCR_DEBUG_DIR,
+    PANEL_DATA_DIR,
 )
+from services.bootstrap import ensure_runtime_assets
 from routes.scanner import router as scanner_router
-from routes.learning import router as learning_router
+from routes.rabbithole import router as rabbithole_router
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 FRONTEND_DIR = BASE_DIR / "frontend"
 THUMB_CACHE_DIR = BASE_DIR / "backend" / "data" / "thumbs"
@@ -50,16 +52,24 @@ app.add_middleware(
 
 # Serve panel images as static files
 app.mount("/panels", StaticFiles(directory=str(PANELS_DIR)), name="panels")
-app.mount("/rendered-panels", StaticFiles(directory=str(RENDERED_PANELS_DIR)), name="rendered-panels")
-app.mount("/ocr-debug", StaticFiles(directory=str(OCR_DEBUG_DIR)), name="ocr-debug")
+app.mount("/ocr-debug", StaticFiles(directory=str(PANEL_DATA_DIR)), name="ocr-debug")
+# Serve per-panel data directories (new panel-centric structure)
+app.mount("/data/panels", StaticFiles(directory=str(PANEL_DATA_DIR)), name="data-panels")
 
 # Routes
 app.include_router(scanner_router)
-app.include_router(learning_router)
+app.include_router(rabbithole_router)
 
 # Serve frontend static files (CSS, JS)
 app.mount("/css", StaticFiles(directory=str(FRONTEND_DIR / "css")), name="css")
 app.mount("/js", StaticFiles(directory=str(FRONTEND_DIR / "js")), name="js")
+app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR / "assets")), name="assets")
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    status = ensure_runtime_assets()
+    logger.info("Startup assets ready: %s", status)
 
 
 @app.get("/api/thumb/{filename}")

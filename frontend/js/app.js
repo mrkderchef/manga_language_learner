@@ -18,7 +18,7 @@
 
         // Lazy-load data only when navigating to the page
         if (pageName === 'scanner') Scanner.loadPanels();
-        if (pageName === 'learning') Learning.loadPanels();
+        if (pageName === 'rabbithole') Rabbithole.loadPanels();
     }
 
     // Nav link clicks
@@ -38,5 +38,5 @@
 
     // Initialize modules (no data loading until navigation)
     Scanner.init();
-    Learning.init();
+    Rabbithole.init();
 })();

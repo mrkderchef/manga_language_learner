@@ -1,0 +1,155 @@
+/* Rabbithole Layout */
+.rabbithole-layout {
+    position: relative;
+    z-index: 100000; /* Ensure rabbithole UI stacks above other controls (slider) */
+    display: grid;
+    grid-template-columns: 1fr 350px;
+    gap: 2rem;
+    margin-top: 1.5rem;
+}
+
+.rabbithole-panel-area {
+    position: relative;
+    background: var(--bg-card);
+    border-radius: var(--border-radius);
+    padding: 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 500px;
+}
+
+.rabbithole-panel-area img {
+    max-width: 100%;
+    max-height: 600px;
+    border-radius: 8px;
+}
+
+.rabbithole-overlay {
+    position: absolute;
+    top: 1rem;
+    left: 1rem;
+    right: 1rem;
+    bottom: 1rem;
+    pointer-events: none;
+    z-index: 100001; /* overlay above layout */
+}
+
+.rabbithole-word {
+    position: absolute;
+    padding: 2px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    pointer-events: auto;
+    transition: all 0.2s;
+    font-size: 0.9rem;
+}
+
+.rabbithole-word.unknown {
+    background: rgba(233, 69, 96, 0.3);
+    border: 1px solid var(--accent);
+}
+
+.rabbithole-word.known {
+    background: rgba(78, 205, 196, 0.3);
+    border: 1px solid var(--success);
+}
+
+.rabbithole-word.active {
+    background: rgba(233, 69, 96, 0.6);
+    transform: scale(1.1);
+}
+
+.rabbithole-sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+}
+
+.progress-card {
+    background: var(--bg-card);
+    border-radius: var(--border-radius);
+    padding: 1.25rem;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.progress-card h3 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    margin-bottom: 0.75rem;
+    letter-spacing: 0.5px;
+}
+
+.progress-bar {
+    height: 8px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 0.5rem;
+}
+
+.progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--success));
+    border-radius: 4px;
+    transition: width 0.4s ease;
+}
+
+#progress-text {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+.vocab-card {
+    background: var(--bg-card);
+    border-radius: var(--border-radius);
+    padding: 1.5rem;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    text-align: center;
+}
+
+.vocab-card h3 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    margin-bottom: 1rem;
+    letter-spacing: 0.5px;
+}
+
+.vocab-jp {
+    font-size: 2.5rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+}
+
+.vocab-reading {
+    font-size: 1.1rem;
+    color: var(--text-secondary);
+    margin-bottom: 1rem;
+}
+
+.vocab-meaning {
+    font-size: 1.3rem;
+    color: var(--success);
+    margin-bottom: 1rem;
+    padding: 0.75rem;
+    background: rgba(78, 205, 196, 0.1);
+    border-radius: 8px;
+}
+
+.vocab-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+}
+
+.vocab-actions .btn {
+    margin-top: 0;
+}
+
+@media (max-width: 900px) {
+    .rabbithole-layout {
+        grid-template-columns: 1fr;
+    }
+}

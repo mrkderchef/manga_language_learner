@@ -1,0 +1,11 @@
+{
+  "name": "ollama",
+  "enabled": true,
+  "steps": {
+    "detection": "vision",
+    "preprocess": {"variants": ["default"]},
+    "recognition": {"engine": "ollama_vision", "model": "ollama/default"},
+    "translation": {"engine": "ollama"}
+  },
+  "defaults": {"target_lang": "en", "translation_style": "natural"}
+}

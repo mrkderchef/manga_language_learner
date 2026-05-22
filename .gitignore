@@ -4,14 +4,14 @@ __pycache__/
 *.py[cod]
 *.log
 .pytest_cache/
-
+.DS_Store
 .env
 .env.*
 !.env.example
 
 # Data / Progress
 backend/data/
-
+inspiration_from_github/
 # Upstream comic-text-detector reference template
 template/
 
