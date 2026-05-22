@@ -1,0 +1,11 @@
+{
+  "name": "mangaocr",
+  "enabled": true,
+  "steps": {
+    "detection": "text_region_detector",
+    "preprocess": {"variants": ["default", "contrast", "sharpen"]},
+    "recognition": {"engine": "manga_ocr", "confidence_threshold": 0.5},
+    "translation": {"engine": "none"}
+  },
+  "defaults": {"target_lang": "en"}
+}

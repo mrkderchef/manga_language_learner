@@ -6,7 +6,7 @@
     <title>Manga Language Learner</title>
     <link rel="stylesheet" href="css/main.css">
     <link rel="stylesheet" href="css/scanner.css">
-    <link rel="stylesheet" href="css/learning.css">
+    <link rel="stylesheet" href="css/rabbithole.css">
 </head>
 <body>
     <nav id="navbar">
@@ -14,7 +14,7 @@
         <div class="nav-links">
             <a href="#" data-page="home" class="nav-link active">Home</a>
             <a href="#" data-page="scanner" class="nav-link">Reader</a>
-            <a href="#" data-page="learning" class="nav-link">Lernmodus</a>
+            <a href="#" data-page="rabbithole" class="nav-link">Rabbithole</a>
         </div>
     </nav>
 
@@ -30,25 +30,13 @@
                         <h2>Reader</h2>
                         <p>Lies Manga-Panels im Original oder mit platzierter Übersetzung.</p>
                     </div>
-                    <div class="mode-card" data-goto="learning">
+                    <div class="mode-card" data-goto="rabbithole">
                         <div class="mode-icon">📚</div>
-                        <h2>Lernmodus</h2>
+                        <h2>Rabbithole</h2>
                         <p>Lerne spielerisch Vokabeln und Grammatik direkt aus Manga-Panels.</p>
                     </div>
                 </div>
-                <div class="home-model-panel" aria-label="Ollama translation model">
-                    <div>
-                        <h3>Ollama translation model</h3>
-                        <p>Default model used by Reader scans. This is separate from Lernmodus.</p>
-                    </div>
-                    <div class="home-model-controls">
-                        <select id="home-ollama-model" aria-label="Ollama model">
-                            <option value="">Auto</option>
-                        </select>
-                        <input id="home-custom-model" type="text" placeholder="Custom model name">
-                    </div>
-                    <div id="home-ollama-status" class="home-model-status">Loading Ollama models...</div>
-                </div>
+                <!-- Ollama Home panel removed -->
             </div>
         </section>
 
@@ -64,9 +52,15 @@
                         <button class="reader-main-button upload-area reader-upload" id="upload-area" type="button">
                             Upload
                         </button>
+                        <button id="btn-scan-options" class="reader-main-button scan-options-toggle reader-tool-button" type="button" aria-expanded="false" aria-controls="scan-options-panel" aria-label="Settings">
+                            <svg class="reader-tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                                <path d="M10.5 3.75h3l.45 2.05a6.6 6.6 0 0 1 1.56.65l1.78-1.1 2.12 2.12-1.1 1.78c.27.5.48 1.03.63 1.58l2.06.42v3l-2.06.42a6.9 6.9 0 0 1-.63 1.58l1.1 1.78-2.12 2.12-1.78-1.1a6.6 6.6 0 0 1-1.56.65l-.45 2.05h-3l-.45-2.05a6.6 6.6 0 0 1-1.56-.65l-1.78 1.1-2.12-2.12 1.1-1.78a6.9 6.9 0 0 1-.63-1.58L2.75 13.5v-3l2.05-.42c.15-.55.36-1.08.63-1.58l-1.1-1.78 2.12-2.12 1.78 1.1c.5-.28 1.02-.5 1.56-.65z"/>
+                                <circle cx="12" cy="12" r="2.85"/>
+                            </svg>
+                        </button>
                         <div class="scan-combo">
-                            <button id="btn-scan-options" class="reader-main-button btn btn-primary scan-options-toggle" type="button" aria-expanded="false" aria-controls="scan-options-panel" aria-label="Scan options">🔧</button>
-                            <button id="btn-scan" class="reader-main-button btn btn-primary reader-scan" disabled>Scan &amp; Translate</button>
+                            <button id="btn-scan" class="reader-main-button btn btn-primary reader-scan" disabled>Scan</button>
+                            <button id="btn-translate-panel" class="reader-main-button btn btn-primary reader-translate" disabled>Translate</button>
                         </div>
                         <button id="btn-debug-toggle" class="reader-main-button reader-control-button" type="button" aria-expanded="false" aria-controls="reader-debug-panel">Details</button>
                     </div>
@@ -78,26 +72,18 @@
                         <div id="panel-cache-summary" class="panel-cache-summary">
                             <div class="cache-pill cache-pill-miss">OCR ✕</div>
                             <div class="cache-pill cache-pill-miss">Translation ✕</div>
-                            <div class="cache-pill cache-pill-miss">Learning ✕</div>
+                            <div class="cache-pill cache-pill-miss">Rabbithole ✕</div>
                         </div>
                         <div class="cache-actions">
                             <button class="cache-action" type="button" data-cache-kind="ocr">Clear OCR</button>
                             <button class="cache-action" type="button" data-cache-kind="translation">Clear translation</button>
-                            <button class="cache-action" type="button" data-cache-kind="learning">Clear learning</button>
+                            <button class="cache-action" type="button" data-cache-kind="rabbithole">Clear Rabbithole</button>
                             <button id="btn-clear-panel-cache" class="cache-action cache-action-danger" type="button">Clear panel caches</button>
                         </div>
                     </section>
-                    <label title="Reuse cached OCR and translation results when they match these settings.">
-                        <span>Use cache</span>
-                        <input id="scan-use-cache" type="checkbox" checked>
-                    </label>
-                    <label title="Ignore derived OCR/translation cache and recompute automatically.">
-                        <span>Fresh auto scan</span>
-                        <input id="scan-fresh" type="checkbox">
-                    </label>
-                    <label title="Choose which OCR engine reads the panel. No hidden fallback is used.">
-                        <span>OCR engine</span>
-                        <select id="scan-ocr-engine"><option value="mangaocr">MangaOCR</option></select>
+                    <label title="The reader uses the MangaOCR pipeline for OCR.">
+                        <span>OCR pipeline</span>
+                        <select id="scan-ocr-engine" disabled><option value="mangaocr">MangaOCR</option></select>
                     </label>
                     <label title="Controls how much extra OCR work is attempted.">
                         <span>OCR quality</span>
@@ -123,13 +109,9 @@
                         <span>Translation engine</span>
                         <select id="scan-translation-engine"><option value="ollama">Ollama</option></select>
                     </label>
-                    <label title="Choose an installed Ollama model or type a custom model below.">
+                    <label id="scan-ollama-model-field" title="Choose an installed Ollama model.">
                         <span>Ollama model</span>
                         <select id="scan-translation-model"><option value="">Auto</option></select>
-                    </label>
-                    <label title="Optional custom Ollama model name. This must be installed in Ollama.">
-                        <span>Custom model</span>
-                        <input id="scan-custom-model" type="text" placeholder="e.g. llama3.1:8b">
                     </label>
                     <label title="Translation target language code.">
                         <span>Target language</span>
@@ -146,10 +128,6 @@
                     <label title="Higher values make translations more varied but less stable.">
                         <span>Temperature</span>
                         <input id="scan-temperature" type="number" min="0" max="1" step="0.05" value="0.1">
-                    </label>
-                    <label title="Clear manual box/orientation edits on this scan.">
-                        <span>Reset manual edits</span>
-                        <input id="scan-reset-edits" type="checkbox">
                     </label>
                 </aside>
 
@@ -176,11 +154,17 @@
                 </div>
 
                 <aside id="reader-debug-panel" class="reader-debug-panel hidden" aria-live="polite">
+                    <div id="reader-debug-resize" class="reader-debug-resize" aria-hidden="true"></div>
                     <div class="reader-debug-header">
                         <h2>Details</h2>
                         <button id="btn-debug-close" class="reader-debug-close" type="button" aria-label="Close debug panel">×</button>
                     </div>
-                    <div id="reader-debug-content" class="reader-debug-content">Select a panel...</div>
+                    <div class="reader-debug-tabs" role="tablist" aria-label="Detail views">
+                        <button id="btn-debug-tab-rabbithole" class="reader-debug-tab active" type="button" data-debug-tab="rabbithole" aria-selected="true">Rabbithole</button>
+                        <button id="btn-debug-tab-diagnose" class="reader-debug-tab" type="button" data-debug-tab="diagnose" aria-selected="false">Diagnose</button>
+                    </div>
+                    <div id="reader-rabbithole-content" class="reader-debug-content">Select a panel...</div>
+                    <div id="reader-diagnose-content" class="reader-debug-content hidden">Select a panel...</div>
                 </aside>
             </div>
 
@@ -190,15 +174,15 @@
             </div>
         </section>
 
-        <!-- Learning Page -->
-        <section id="page-learning" class="page">
-            <h1>Lernmodus</h1>
-            <div class="learning-layout">
-                <div class="learning-panel-area">
-                    <img id="learning-panel-img" src="" alt="Manga Panel" loading="lazy" decoding="async">
-                    <div id="learning-overlay" class="learning-overlay"></div>
+        <!-- Rabbithole Page -->
+        <section id="page-rabbithole" class="page">
+            <h1>Rabbithole</h1>
+            <div class="rabbithole-layout">
+                <div class="rabbithole-panel-area">
+                    <img id="rabbithole-panel-img" src="" alt="Manga Panel" loading="lazy" decoding="async">
+                    <div id="rabbithole-overlay" class="rabbithole-overlay"></div>
                 </div>
-                <div class="learning-sidebar">
+                <div class="rabbithole-sidebar">
                     <div class="progress-card">
                         <h3>Fortschritt</h3>
                         <div class="progress-bar">
@@ -225,7 +209,7 @@
 
     <script src="js/api.js"></script>
     <script src="js/scanner.js"></script>
-    <script src="js/learning.js"></script>
+    <script src="js/rabbithole.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>
