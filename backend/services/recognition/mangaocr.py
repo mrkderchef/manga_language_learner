@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 from config import PANEL_DATA_DIR, ocr_panel_slug
-from services.vision.bubble_allocator import candidate_box_from_region, estimate_allocation_space
+from services.vision.bubble_allocator import candidate_box_from_region, estimate_allocation_space, reconcile_overlapping_bubble_spaces
 from services.rabbithole import nlp as rabbithole_service
 from services.translation import engine as translation_engine
 from services.detection.region_detector import detect_text_regions
@@ -413,6 +413,10 @@ def _estimate_bubble_geometry(gray_img: np.ndarray, region: dict) -> dict:
 	return estimate_allocation_space(gray_img, region).debug
 
 
+def _estimate_bubble_allocation(gray_img: np.ndarray, region: dict):
+	return estimate_allocation_space(gray_img, region)
+
+
 def _preprocess_crop_variants(crop: Image.Image, upscale: int = 3) -> list[tuple[str, Image.Image]]:
 	"""
 	Prepare several text crop variants for manga-ocr.
@@ -725,7 +729,9 @@ def extract_and_translate(image_path: str, target_lang: str = "en", options: dic
 		debug_slug = f"{panel_debug_dir}/{scan_slug}_{_safe_debug_component(region_id)}_{geom_slug}"
 		text, ocr_meta = _ocr_crop(mocr, crop, region, debug_slug, options)
 		ocr_meta["crop_box"] = [int(x1), int(y1), int(x2), int(y2)]
-		ocr_meta["vision"] = _estimate_bubble_geometry(gray_img, region)
+		allocation = _estimate_bubble_allocation(gray_img, region)
+		ocr_meta["vision"] = allocation.debug
+		ocr_meta["_allocation_space"] = allocation
 
 		if text:
 			region["ocr_meta"] = ocr_meta
@@ -740,6 +746,7 @@ def extract_and_translate(image_path: str, target_lang: str = "en", options: dic
 			)
 
 	recognized_entries = _suppress_nested_regions(recognized_entries)
+	reconcile_overlapping_bubble_spaces(recognized_entries, im_w, im_h)
 	recognized_texts = [entry["text"] for entry in recognized_entries]
 	valid_regions = [entry["region"] for entry in recognized_entries]
 

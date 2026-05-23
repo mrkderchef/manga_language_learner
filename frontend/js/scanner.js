@@ -2127,6 +2127,48 @@ const Scanner = (() => {
         return svg;
     }
 
+    function createBubbleShape(ann, scaleX, scaleY, className) {
+        const vision = getVisionDebug(ann);
+        const bubblePoints = scalePolygonPoints(vision.bubble_points, scaleX, scaleY);
+        if (bubblePoints) {
+            const bubble = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+            bubble.setAttribute('class', className);
+            bubble.setAttribute('points', bubblePoints);
+            return bubble;
+        }
+
+        const bubbleBox = normalizeRectBox(vision.bubble_box);
+        if (!bubbleBox) return null;
+
+        const [x, y, width, height] = bubbleBox;
+        const bubbleRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        bubbleRect.setAttribute('class', className);
+        bubbleRect.setAttribute('x', String(x * scaleX));
+        bubbleRect.setAttribute('y', String(y * scaleY));
+        bubbleRect.setAttribute('width', String(width * scaleX));
+        bubbleRect.setAttribute('height', String(height * scaleY));
+        bubbleRect.setAttribute('rx', '10');
+        bubbleRect.setAttribute('ry', '10');
+        return bubbleRect;
+    }
+
+    function createHoverBubbleOverlay(annotations, scaleX, scaleY, displayW, displayH) {
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('class', 'ocr-hover-bubble-overlay');
+        svg.setAttribute('viewBox', `0 0 ${Math.max(1, displayW)} ${Math.max(1, displayH)}`);
+        svg.setAttribute('preserveAspectRatio', 'none');
+
+        annotations.forEach((ann, index) => {
+            const regionId = String(ann.region_id ?? ann.id ?? index);
+            const bubble = createBubbleShape(ann, scaleX, scaleY, 'ocr-hover-bubble');
+            if (!bubble) return;
+            bubble.dataset.regionId = regionId;
+            svg.appendChild(bubble);
+        });
+
+        return svg;
+    }
+
     function renderOverlays(annotations, imgNatW, imgNatH) {
         const overlay = document.getElementById('ocr-overlay');
         const previouslyOpenRegions = captureOpenTooltipRegions();
@@ -2147,6 +2189,7 @@ const Scanner = (() => {
         if (activeVisionOverlay !== 'none') {
             frag.appendChild(createDetectorOverlay(withBbox, scaleX, scaleY, displayW, displayH));
         }
+        frag.appendChild(createHoverBubbleOverlay(withBbox, scaleX, scaleY, displayW, displayH));
 
         withBbox.forEach((ann, index) => {
             if (!ann.bbox || ann.bbox.length < 4) return;
@@ -2229,15 +2272,12 @@ const Scanner = (() => {
             });
             tooltip.addEventListener('click', (e) => e.stopPropagation());
             tooltip.addEventListener('pointerdown', (e) => e.stopPropagation());
-            box.addEventListener('pointerenter', () => prepareActiveHoverbox(box, tooltip, regionId));
-            box.addEventListener('pointerleave', (e) => {
-                const next = e.relatedTarget;
-                if (next && tooltip.contains(next)) return;
+            box.addEventListener('pointerenter', () => setActiveHoverBubble(regionId));
+            box.addEventListener('pointerleave', () => {
                 if (pinnedRegionIds.has(regionId)) return;
-                scheduleHoverClose(regionId);
+                setActiveHoverBubble(null, regionId);
             });
-            box.addEventListener('focusin', () => prepareActiveHoverbox(box, tooltip, regionId));
-            tooltip.addEventListener('pointerenter', () => prepareActiveHoverbox(box, tooltip, regionId));
+            tooltip.addEventListener('pointerenter', () => setActiveHoverBubble(regionId));
             tooltip.addEventListener('pointerleave', (e) => {
                 const next = e.relatedTarget;
                 if (next && box.contains(next)) return;
@@ -2274,17 +2314,6 @@ const Scanner = (() => {
         });
     }
 
-    function prepareActiveHoverbox(box, tooltip, regionId) {
-        cancelHoverClose(regionId);
-        const key = String(regionId);
-        if (!pinnedRegionIds.has(key) && hoverSuppressedRegionIds.has(key)) return;
-        const wasOpen = box.classList.contains('tooltip-open');
-        box.classList.add('tooltip-open');
-        if (wasOpen) return;
-        tooltip.style.visibility = 'hidden';
-        scheduleTooltipPosition(box, tooltip, { keepHorizontal: wasOpen });
-    }
-
     function scheduleHoverClose(regionId, delayMs = 140) {
         cancelHoverClose(regionId);
         const key = String(regionId);
@@ -2315,6 +2344,7 @@ const Scanner = (() => {
             pinnedRegionIds.add(nextRegionId);
             hoverSuppressedRegionIds.delete(nextRegionId);
             cancelHoverClose(nextRegionId);
+            setActiveHoverBubble(nextRegionId);
         }
         const overlay = document.getElementById('ocr-overlay');
         overlay?.classList.toggle('has-pinned-tooltip', pinnedRegionIds.size > 0);
@@ -2350,9 +2380,23 @@ const Scanner = (() => {
         const key = String(regionId);
         tooltipHorizontalByRegion.delete(key);
         tooltipPositionByRegion.delete(key);
+        setActiveHoverBubble(null, key);
         document
             .querySelector(`#ocr-overlay .ocr-box[data-region-id="${CSS.escape(key)}"]`)
             ?.classList.remove('tooltip-open');
+    }
+
+    function setActiveHoverBubble(regionId, closingRegionId = null) {
+        const activeKey = regionId == null ? null : String(regionId);
+        const closingKey = closingRegionId == null ? null : String(closingRegionId);
+        document.querySelectorAll('#ocr-overlay .ocr-hover-bubble').forEach(bubble => {
+            const currentRegionId = String(bubble.dataset.regionId);
+            if (activeKey != null) {
+                bubble.classList.toggle('active', currentRegionId === activeKey);
+            } else if (closingKey == null || currentRegionId === closingKey) {
+                bubble.classList.remove('active');
+            }
+        });
     }
 
     function clearHoverSuppressedRegion(regionId) {

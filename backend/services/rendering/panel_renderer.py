@@ -35,7 +35,7 @@ from services.vision.bubble_allocator import (
 logger = logging.getLogger(__name__)
 
 RENDERED_URL_PREFIX = "/rendered-panels"
-RENDER_METHOD = "opencv-pillow-v4"
+RENDER_METHOD = "opencv-pillow-v5"
 
 
 @dataclass
@@ -43,6 +43,7 @@ class LayoutSpace:
 	ann: dict[str, Any]
 	text: str
 	min_rect: tuple[int, int, int, int]
+	preferred_rect: tuple[int, int, int, int]
 	max_rect: tuple[int, int, int, int]
 	mask: np.ndarray
 	mask_origin: tuple[int, int]
@@ -64,6 +65,7 @@ class TextPlacement:
 	stroke: tuple[int, int, int, int]
 	score: float
 	overflow: bool
+	word_breaks: int = 0
 	alpha_rect: tuple[int, int, int, int] | None = None
 	alpha_mask: np.ndarray | None = None
 
@@ -88,8 +90,9 @@ def render_translated_panel(panel_path: Path, scan_result: dict[str, Any]) -> di
 	render_dir = panel_rendered_dir(panel_path)
 	render_dir.mkdir(parents=True, exist_ok=True)
 	output_path = render_dir / "current.png"
+	metadata_path = render_dir / "current.json"
 	
-	if output_path.exists():
+	if output_path.exists() and _render_metadata_matches(metadata_path, cache_name):
 		panel_id = ocr_panel_slug(panel_path)
 		return {
 			"translated_image_url": f"/data/panels/{panel_id}/rendered/current.png",
@@ -120,6 +123,7 @@ def render_translated_panel(panel_path: Path, scan_result: dict[str, Any]) -> di
 			_paint_translation(rendered, placement, image_w, image_h)
 
 		rendered.convert("RGB").save(output_path, quality=92, optimize=True)
+		metadata_path.write_text(json.dumps({"cache_name": cache_name}, sort_keys=True), encoding="utf-8")
 		panel_id = ocr_panel_slug(panel_path)
 		return {
 			"translated_image_url": f"/data/panels/{panel_id}/rendered/current.png",
@@ -158,6 +162,14 @@ def _render_cache_name(panel_path: Path, annotations: list[dict[str, Any]]) -> s
 	raw = json.dumps(render_payload, ensure_ascii=False, sort_keys=True)
 	digest = hashlib.md5(raw.encode("utf-8")).hexdigest()
 	return f"{panel_path.stem}_{digest}.png"
+
+
+def _render_metadata_matches(metadata_path: Path, cache_name: str) -> bool:
+	try:
+		data = json.loads(metadata_path.read_text(encoding="utf-8"))
+	except Exception:
+		return False
+	return data.get("cache_name") == cache_name
 
 
 def _build_text_mask(shape: tuple[int, int], annotations: list[dict[str, Any]]) -> np.ndarray:
@@ -291,12 +303,14 @@ def _build_layout_space(
 		origin = (max_rect[0], max_rect[1])
 
 	centroid = _mask_centroid(mask, origin) or _rect_center(max_rect)
-	anchor = _rect_center(preferred_placement or bbox)
+	preferred_rect = _preferred_text_rect(preferred_placement, min_rect, max_rect, image_w, image_h)
+	anchor = _rect_center(preferred_rect)
 	initial_size = _layout_initial_font_size(ann, bbox)
 	return LayoutSpace(
 		ann=ann,
 		text=text,
 		min_rect=min_rect,
+		preferred_rect=preferred_rect,
 		max_rect=max_rect,
 		mask=mask,
 		mask_origin=origin,
@@ -318,18 +332,21 @@ def _generate_text_candidates(
 	max_h = max(1, max_y2 - max_y1)
 	min_w = min(max_w, max(1, space.min_rect[2] - space.min_rect[0]))
 	min_h = min(max_h, max(1, space.min_rect[3] - space.min_rect[1]))
+	preferred_w = min(max_w, max(min_w, space.preferred_rect[2] - space.preferred_rect[0]))
+	preferred_h = min(max_h, max(min_h, space.preferred_rect[3] - space.preferred_rect[1]))
+	preferred_area = max(1, _rect_area(space.preferred_rect))
 	candidates: list[TextPlacement] = []
 
-	width_ratios = [0.96, 0.84, 0.72, 0.60]
-	height_ratios = [0.92, 0.78, 0.64]
+	width_scales = [1.00, 1.12, 1.28, 1.48, 1.72, 1.00, 0.88]
+	height_scales = [1.00, 1.12, 1.28, 1.48, 1.00, 0.88]
 	centers = _candidate_centers(space)
 	angle = _render_angle(space.ann)
 
-	for width_ratio in width_ratios:
-		for height_ratio in height_ratios:
-			fit_w = max(min_w, int(max_w * width_ratio))
-			fit_h = max(min_h, int(max_h * height_ratio))
-			font, lines, spacing, stroke_width, overflow = _fit_text(
+	for width_scale in width_scales:
+		for height_scale in height_scales:
+			fit_w = min(max_w, max(min_w, int(preferred_w * width_scale)))
+			fit_h = min(max_h, max(min_h, int(preferred_h * height_scale)))
+			font, lines, spacing, stroke_width, overflow, word_breaks = _fit_text(
 				space.text,
 				fit_w,
 				fit_h,
@@ -345,21 +362,30 @@ def _generate_text_candidates(
 				rect = _rect_around_center(cx, cy, rect_w, rect_h, space.max_rect)
 				coverage = _mask_coverage(space, rect)
 				min_overlap = _rect_overlap(rect, space.min_rect) / max(1, _rect_area(space.min_rect))
+				preferred_overlap = _rect_overlap(rect, space.preferred_rect) / preferred_area
 				dist = _normalized_distance(_rect_center(rect), space.anchor, max_w, max_h)
 				font_size = int(getattr(font, "size", 10))
 				size_loss = max(0, space.initial_size - font_size) / max(1, space.initial_size)
+				expansion = max(0.0, (_rect_area(rect) / preferred_area) - 1.0)
+				center_escape = _normalized_distance(_rect_center(rect), _rect_center(space.min_rect), max_w, max_h)
 				outside_penalty = (1.0 - coverage) * 3600.0
-				anchor_penalty = dist * 420.0
-				min_penalty = max(0.0, 0.28 - min_overlap) * 1300.0
+				anchor_penalty = dist * 1250.0 + center_escape * 420.0
+				min_penalty = max(0.0, 0.55 - min_overlap) * 1900.0
+				preferred_penalty = max(0.0, 0.82 - preferred_overlap) * 2200.0
 				overflow_penalty = 850.0 if overflow else 0.0
-				size_penalty = size_loss * 260.0
+				size_penalty = size_loss * 520.0
+				break_penalty = word_breaks * 700.0
+				expansion_penalty = expansion * 260.0
 				area_penalty = _rect_area(rect) / max(1, image_w * image_h) * 35.0
 				score = (
 					outside_penalty
 					+ anchor_penalty
 					+ min_penalty
+					+ preferred_penalty
 					+ overflow_penalty
 					+ size_penalty
+					+ break_penalty
+					+ expansion_penalty
 					+ area_penalty
 				)
 				fill, stroke = _text_colors_for_region(image, rect)
@@ -375,6 +401,7 @@ def _generate_text_candidates(
 					stroke=stroke,
 					score=score,
 					overflow=overflow,
+					word_breaks=word_breaks,
 				))
 
 	return candidates
@@ -386,16 +413,19 @@ def _candidate_centers(space: LayoutSpace) -> list[tuple[float, float]]:
 	max_h = max_y2 - max_y1
 	bases = [
 		space.anchor,
-		space.centroid,
 		_rect_center(space.min_rect),
+		_rect_center(space.preferred_rect),
+		space.centroid,
 		_rect_center(space.max_rect),
 	]
 	offsets = [
 		(0.0, 0.0),
+		(-0.06, 0.0),
+		(0.06, 0.0),
+		(0.0, -0.06),
+		(0.0, 0.06),
 		(-0.12, 0.0),
 		(0.12, 0.0),
-		(0.0, -0.12),
-		(0.0, 0.12),
 		(-0.20, -0.08),
 		(0.20, -0.08),
 		(-0.20, 0.08),
@@ -456,7 +486,7 @@ def _fit_text(
 	box_h: int,
 	initial_size: int,
 	font_path: str | None,
-) -> tuple[ImageFont.ImageFont, list[str], int, int, bool]:
+) -> tuple[ImageFont.ImageFont, list[str], int, int, bool, int]:
 	max_width = max(1, int(box_w * 0.88))
 	max_height = max(1, int(box_h * 0.86))
 	min_size = 9
@@ -464,12 +494,13 @@ def _fit_text(
 	measure = Image.new("RGB", (1, 1))
 	draw = ImageDraw.Draw(measure)
 
-	last: tuple[ImageFont.ImageFont, list[str], int, int] | None = None
+	last: tuple[ImageFont.ImageFont, list[str], int, int, int] | None = None
+	best_fit: tuple[ImageFont.ImageFont, list[str], int, int, int] | None = None
 	for size in range(start, min_size - 1, -1):
 		font = _load_font(font_path, size)
 		spacing = max(1, int(size * 0.12))
 		stroke_width = max(1, int(size * 0.08))
-		lines = _wrap_text(text, font, max_width)
+		lines, word_breaks = _wrap_text(text, font, max_width)
 		text_bbox = draw.multiline_textbbox(
 			(0, 0),
 			"\n".join(lines),
@@ -479,22 +510,31 @@ def _fit_text(
 		)
 		text_w = text_bbox[2] - text_bbox[0]
 		text_h = text_bbox[3] - text_bbox[1]
-		last = (font, lines, spacing, stroke_width)
+		last = (font, lines, spacing, stroke_width, word_breaks)
 		if text_w <= max_width and text_h <= max_height:
-			return font, lines, spacing, stroke_width, False
+			if best_fit is None or word_breaks < best_fit[4]:
+				best_fit = last
+			if word_breaks == 0:
+				return font, lines, spacing, stroke_width, False, word_breaks
+
+	if best_fit is not None:
+		font, lines, spacing, stroke_width, word_breaks = best_fit
+		return font, lines, spacing, stroke_width, False, word_breaks
 
 	assert last is not None
-	return (*last, True)
+	font, lines, spacing, stroke_width, word_breaks = last
+	return font, lines, spacing, stroke_width, True, word_breaks
 
 
-def _wrap_text(text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+def _wrap_text(text: str, font: ImageFont.ImageFont, max_width: int) -> tuple[list[str], int]:
 	text = " ".join(text.replace("\n", " ").split())
 	if not text:
-		return [""]
+		return [""], 0
 
 	words = text.split(" ")
 	lines: list[str] = []
 	current = ""
+	word_breaks = 0
 	for word in words:
 		candidate = f"{current} {word}".strip()
 		if _text_width(font, candidate) <= max_width or not current:
@@ -507,12 +547,13 @@ def _wrap_text(text: str, font: ImageFont.ImageFont, max_width: int) -> list[str
 			current = word
 		else:
 			chunks = _break_long_word(word, font, max_width)
+			word_breaks += max(0, len(chunks) - 1)
 			lines.extend(chunks[:-1])
 			current = chunks[-1]
 
 	if current:
 		lines.append(current)
-	return lines or [text]
+	return lines or [text], word_breaks
 
 
 def _break_long_word(word: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
@@ -660,6 +701,35 @@ def _rect_center(rect: tuple[int, int, int, int]) -> tuple[float, float]:
 
 def _rect_contains(outer: tuple[int, int, int, int], inner: tuple[int, int, int, int]) -> bool:
 	return shared_rect_contains(outer, inner)
+
+
+def _preferred_text_rect(
+	preferred: tuple[int, int, int, int] | None,
+	min_rect: tuple[int, int, int, int],
+	max_rect: tuple[int, int, int, int],
+	image_w: int,
+	image_h: int,
+) -> tuple[int, int, int, int]:
+	if preferred is None:
+		return min_rect
+
+	x1 = max(max_rect[0], preferred[0])
+	y1 = max(max_rect[1], preferred[1])
+	x2 = min(max_rect[2], preferred[2])
+	y2 = min(max_rect[3], preferred[3])
+	if x2 <= x1 or y2 <= y1:
+		return min_rect
+
+	rect = _union_rect((x1, y1, x2, y2), min_rect, image_w, image_h)
+	if _rect_contains(max_rect, rect):
+		return rect
+
+	return (
+		max(max_rect[0], rect[0]),
+		max(max_rect[1], rect[1]),
+		min(max_rect[2], rect[2]),
+		min(max_rect[3], rect[3]),
+	)
 
 
 def _union_rect(
