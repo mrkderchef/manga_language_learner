@@ -4,17 +4,21 @@
     --z-slider: 2;
     --z-rabbithole: 3;
     max-width: none;
-    min-height: calc(100vh - 73px);
+    height: 100%;
+    min-height: 0;
     padding: 1rem 1.25rem 1.5rem;
     background: #11131a;
+    overflow: hidden;
 }
 
 .reader-shell {
     position: relative;
-    min-height: calc(100vh - 105px);
+    height: 100%;
+    min-height: 0;
     display: grid;
     grid-template-rows: auto 1fr;
     gap: 0.85rem;
+    overflow: visible;
 }
 
 .reader-topbar {
@@ -306,12 +310,13 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    overflow: visible;
 }
 
 .panel-display {
     width: 100%;
-    height: calc(100vh - 198px);
-    min-height: calc(100vh - 198px);
+    height: 100%;
+    min-height: 0;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -329,7 +334,7 @@
     line-height: 0;
     max-width: 100%;
     width: fit-content;
-    height: calc(100vh - 220px);
+    height: 100%;
     max-height: 100%;
     --translation-reveal: 0%;
 }
@@ -1279,6 +1284,16 @@
     font-weight: 900;
 }
 
+.rabbithole-feature-section {
+    display: grid;
+    gap: 0.35rem;
+    margin-top: 0.55rem;
+}
+
+.rabbithole-feature-section:first-of-type {
+    margin-top: 0;
+}
+
 .rabbithole-dictionary {
     display: grid;
     gap: 0.45rem;
@@ -1633,7 +1648,7 @@ body.reader-fullscreen-open {
     .panel-display,
     .panel-img-wrapper,
     .panel-display img {
-        height: calc(100vh - 260px);
-        max-height: calc(100vh - 260px);
+        height: 100%;
+        max-height: 100%;
     }
 }

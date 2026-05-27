@@ -40,6 +40,13 @@ def _env_int(name: str, default: int) -> int:
 		return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+	value = os.getenv(name)
+	if value is None or value.strip() == "":
+		return default
+	return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Paths:
 	base_dir: Path = PROJECT_ROOT
@@ -58,6 +65,7 @@ class Services:
 	ollama_text_model: str = _env("OLLAMA_TEXT_MODEL", "hf.co/sugoitoolkit/Sugoi-14B-Ultra-GGUF:Q4_K_M")
 	kanjiapi_base_url: str = _env("KANJIAPI_BASE_URL", "https://kanjiapi.dev/v1").rstrip("/")
 	render_font_path: str = _env("RENDER_FONT_PATH", "")
+	rabbithole_ginza_enabled: bool = _env_bool("RABBITHOLE_GINZA_ENABLED", False)
 
 
 @dataclass(frozen=True)
@@ -207,6 +215,7 @@ OLLAMA_BASE_URL = SERVICES.ollama_base_url
 OLLAMA_TEXT_MODEL = SERVICES.ollama_text_model
 KANJIAPI_BASE_URL = SERVICES.kanjiapi_base_url
 RENDER_FONT_PATH = SERVICES.render_font_path
+RABBITHOLE_GINZA_ENABLED = SERVICES.rabbithole_ginza_enabled
 
 API_HOST = API.host
 API_PORT = API.port

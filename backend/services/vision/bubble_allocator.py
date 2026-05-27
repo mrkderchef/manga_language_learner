@@ -831,8 +831,7 @@ def _vision_text_rect(entry: dict[str, Any], image_w: int, image_h: int) -> tupl
 def _rects_should_reconcile(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
     overlap = rect_overlap(a, b)
     if overlap:
-        smaller = max(1, min(rect_area(a), rect_area(b)))
-        return overlap / smaller >= 0.04
+        return True
     gap_x, gap_y = _rect_gap(a, b)
     min_side = max(1, min(a[2] - a[0], a[3] - a[1], b[2] - b[0], b[3] - b[1]))
     return gap_x <= max(10, int(min_side * 0.16)) and gap_y <= max(10, int(min_side * 0.16))
@@ -945,6 +944,22 @@ def _trim_mask_to_rect(mask: np.ndarray, origin: tuple[int, int]) -> tuple[np.nd
     return mask[y1:y2, x1:x2], rect
 
 
+def _erase_rect_from_mask(
+    mask: np.ndarray,
+    origin: tuple[int, int],
+    rect: tuple[int, int, int, int],
+) -> np.ndarray:
+    local_x1 = max(0, min(mask.shape[1], int(rect[0] - origin[0])))
+    local_y1 = max(0, min(mask.shape[0], int(rect[1] - origin[1])))
+    local_x2 = max(local_x1, min(mask.shape[1], int(rect[2] - origin[0])))
+    local_y2 = max(local_y1, min(mask.shape[0], int(rect[3] - origin[1])))
+    if local_x2 <= local_x1 or local_y2 <= local_y1:
+        return mask
+    carved = mask.copy()
+    carved[local_y1:local_y2, local_x1:local_x2] = 0
+    return carved
+
+
 def reconcile_overlapping_bubble_spaces(
     entries: list[dict[str, Any]],
     image_w: int,
@@ -1004,6 +1019,10 @@ def reconcile_overlapping_bubble_spaces(
                 ]
                 text_pad = 0
                 split_mask = _protect_text_geometry(split_mask, (union_rect[0], union_rect[1]), text_box, text_pad)
+                for other_item in items:
+                    if other_item["index"] == item["index"]:
+                        continue
+                    split_mask = _erase_rect_from_mask(split_mask, (union_rect[0], union_rect[1]), other_item["text_rect"])
                 trimmed = _trim_mask_to_rect(split_mask, (union_rect[0], union_rect[1]))
                 if trimmed is None:
                     continue
@@ -1020,6 +1039,38 @@ def reconcile_overlapping_bubble_spaces(
                     "split_detail": split_detail,
                 })
             used_pairs.add(pair_key)
+
+    for item in items:
+        vision = item["vision"]
+        bubble_rect = _debug_bubble_rect(vision, image_w, image_h)
+        if bubble_rect is None:
+            continue
+        mask = _debug_bubble_mask(vision, bubble_rect)
+        origin = (bubble_rect[0], bubble_rect[1])
+        for other_item in items:
+            if other_item["index"] == item["index"]:
+                continue
+            mask = _erase_rect_from_mask(mask, origin, other_item["text_rect"])
+        text_rect = item["text_rect"]
+        text_box = [
+            text_rect[0],
+            text_rect[1],
+            max(1, text_rect[2] - text_rect[0]),
+            max(1, text_rect[3] - text_rect[1]),
+        ]
+        mask = _protect_text_geometry(mask, origin, text_box, 0)
+        trimmed = _trim_mask_to_rect(mask, origin)
+        if trimmed is None:
+            continue
+        local_mask, rect = trimmed
+        box = box_xyxy_to_xywh(rect)
+        if not box:
+            continue
+        vision.update({
+            "bubble_box": box,
+            "bubble_points": _mask_to_points(local_mask, (rect[0], rect[1])),
+            "text_bbox_exclusion_applied": True,
+        })
 
 
 def estimate_allocation_space(gray_img: np.ndarray, region: dict[str, Any]) -> AllocationSpace:

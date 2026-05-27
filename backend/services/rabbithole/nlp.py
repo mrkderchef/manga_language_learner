@@ -11,7 +11,7 @@ from typing import Any
 
 import requests
 
-from config import BASE_DIR, KANJIAPI_BASE_URL
+from config import BASE_DIR, KANJIAPI_BASE_URL, RABBITHOLE_GINZA_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ DIGIT_RE = re.compile(r"[0-9\uFF10-\uFF19]")
 _tokenizer = None
 _kakasi = None
 
-RABBITHOLE_VERSION = "rabbithole-v4"
+RABBITHOLE_VERSION = "rabbithole-v6"
 KANJI_LOOKUP_VERSION = "kanji-lookup-v2"
 WORD_LOOKUP_VERSION = "word-lookup-v8"
 LOCAL_EXTENDED_DICTIONARY_VERSION = "local-extended-dictionary-v1"
@@ -65,6 +65,8 @@ FUNCTION_GLOSSARY = {
 }
 
 LEXICAL_GLOSSARY = {
+    "夢": "dream",
+    "果て": "the end",
     "さん": "honorific",
     "ちゃん": "affectionate suffix",
     "くん": "familiar honorific",
@@ -956,6 +958,10 @@ def _is_symbol_token(token: dict[str, Any]) -> bool:
     return all(not KANJI_RE.match(ch) and not KANA_RE.match(ch) and not ch.isalnum() for ch in surface)
 
 
+def _is_displayable_breakdown_token(token: dict[str, Any]) -> bool:
+    return not _is_symbol_token(token)
+
+
 def _fallback_gloss(token: dict[str, Any], prefer_reading: bool = False) -> str:
     if prefer_reading:
         reading_romanji = str(token.get("reading_romanji") or "").strip()
@@ -1161,13 +1167,56 @@ def _primary_meaning(token: dict[str, Any], kind: str, word_meanings: list[str],
     return _fallback_gloss(token, prefer_reading=bool(kanji_details)), []
 
 
+def _grammar_detail_for_token(token: dict[str, Any]) -> dict[str, Any]:
+    surface = str(token.get("surface") or "")
+    lemma = str(token.get("lemma") or surface)
+    reading_hiragana = str(token.get("reading_hiragana") or "")
+    key_candidates = _dedupe_strings([surface, lemma, reading_hiragana])
+    detail = next((GRAMMAR_DETAILS.get(candidate) for candidate in key_candidates if GRAMMAR_DETAILS.get(candidate)), None)
+    if not detail:
+        return {}
+    return {
+        "label": detail.get("label"),
+        "notes": detail.get("glosses", []),
+        "tags": detail.get("tags", []),
+    }
+
+
+def _unit_feature_groups(unit: dict[str, Any]) -> dict[str, Any]:
+    dictionary_entries = unit.get("dictionary_entries", [])
+    return {
+        "reading": {
+            "hiragana": unit.get("reading_hiragana", ""),
+            "romaji": unit.get("reading_romanji", ""),
+        },
+        "meaning": {
+            "glossary": unit.get("primary_meaning", ""),
+            "alternate_glossary": unit.get("alternate_meanings", []),
+        },
+        "grammar": {
+            "segment_type": unit.get("kind", ""),
+            "part_of_speech": unit.get("part_of_speech_labels", []),
+            "analysis_tags": unit.get("pos", []),
+            "function": unit.get("grammar_detail", {}),
+        },
+        "kanji": unit.get("kanji_details", []) if isinstance(unit.get("kanji_details"), list) else unit.get("kanji_details", {}),
+        "dictionary": {
+            "entries": dictionary_entries,
+            "source": unit.get("dictionary_source", ""),
+            "sources": unit.get("dictionary_sources", []),
+            "candidate_count": unit.get("dictionary_candidate_count", 0),
+        },
+        "translation_context": {},
+    }
+
+
 def _kanji_unit(unit_id: str, character: str, start: int, end: int, kanji_lookup: dict[str, Any]) -> dict[str, Any]:
     meanings = _kanji_meanings(kanji_lookup)
     word_lookup = lookup_word(character)
     remote_entries = list(word_lookup.get("entries") or [])
     merged_entries = _merge_dictionary_entries(remote_entries, [])
     dictionary_source, dictionary_sources = _dictionary_source_summary(word_lookup, merged_entries)
-    return {
+    unit = {
         "id": unit_id,
         "kind": "kanji",
         "text": character,
@@ -1200,10 +1249,12 @@ def _kanji_unit(unit_id: str, character: str, start: int, end: int, kanji_lookup
         },
         "children": [],
     }
+    unit["feature_groups"] = _unit_feature_groups(unit)
+    return unit
 
 
 def _whole_unit(text: str, reading_hiragana: str, reading_romanji: str, glossary: str, token_count: int, kanji_count: int) -> dict[str, Any]:
-    return {
+    unit = {
         "id": "whole_000",
         "kind": "whole",
         "text": text,
@@ -1221,19 +1272,66 @@ def _whole_unit(text: str, reading_hiragana: str, reading_romanji: str, glossary
             "kanji_count": kanji_count,
         },
     }
+    unit["feature_groups"] = _unit_feature_groups(unit)
+    return unit
 
 
 def _segment_from_unit(unit: dict[str, Any], segment_id: str) -> dict[str, Any]:
     return {
         "segment_id": segment_id,
         "unit_id": unit["id"],
+        "kind": unit.get("kind", ""),
         "text": unit.get("text", ""),
         "hiragana": unit.get("reading_hiragana", ""),
         "romanji": unit.get("reading_romanji", ""),
         "gloss": unit.get("primary_meaning", ""),
         "start": unit.get("start", 0),
         "end": unit.get("end", 0),
+        "children": unit.get("children", []),
+        "feature_groups": unit.get("feature_groups", {}),
     }
+
+
+def _ginza_enrichment(text: str) -> dict[str, Any]:
+    if not RABBITHOLE_GINZA_ENABLED:
+        return {"enabled": False, "available": False}
+    try:
+        import spacy  # type: ignore
+
+        nlp = spacy.load("ja_ginza")
+        doc = nlp(text)
+        return {
+            "enabled": True,
+            "available": True,
+            "tokens": [
+                {
+                    "text": token.text,
+                    "lemma": token.lemma_,
+                    "pos": token.pos_,
+                    "tag": token.tag_,
+                    "dependency": token.dep_,
+                    "head": token.head.text,
+                    "start": token.idx,
+                    "end": token.idx + len(token.text),
+                }
+                for token in doc
+            ],
+            "entities": [
+                {
+                    "text": ent.text,
+                    "label": ent.label_,
+                    "start": ent.start_char,
+                    "end": ent.end_char,
+                }
+                for ent in doc.ents
+            ],
+        }
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "available": False,
+            "error": str(exc),
+        }
 
 
 def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1259,6 +1357,8 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
 
             for token_index, token in enumerate(tokens):
                 surface = str(token.get("surface") or "")
+                if not _is_displayable_breakdown_token(token):
+                    continue
                 lemma = str(token.get("lemma") or surface)
                 reading_hiragana = str(token.get("reading_hiragana") or "")
                 kind = _unit_kind(token)
@@ -1312,7 +1412,7 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
                 dictionary_entries = _merge_dictionary_entries(remote_entries, local_entries)
                 dictionary_source, dictionary_sources = _dictionary_source_summary(word_lookup or {}, dictionary_entries)
                 unit_id = f"{layer_id}_{token_index:03d}"
-                units_by_id[unit_id] = {
+                unit = {
                     "id": unit_id,
                     "kind": kind,
                     "text": surface,
@@ -1329,9 +1429,17 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
                     "dictionary_source": dictionary_source,
                     "dictionary_sources": dictionary_sources,
                     "dictionary_candidate_count": (word_lookup or {}).get("candidate_count", 0),
+                    "grammar_detail": _grammar_detail_for_token(token),
+                    "kanji_details": [
+                        units_by_id[child_id].get("kanji_details", {})
+                        for child_id in child_ids
+                        if child_id in units_by_id
+                    ],
                     "children": child_ids,
                 }
-                layer_segments.append(_segment_from_unit(units_by_id[unit_id], f"{layer_id}_seg_{token_index:03d}"))
+                unit["feature_groups"] = _unit_feature_groups(unit)
+                units_by_id[unit_id] = unit
+                layer_segments.append(_segment_from_unit(unit, f"{layer_id}_seg_{token_index:03d}"))
 
             meaningful = [
                 segment
@@ -1342,7 +1450,7 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
                 "segments": layer_segments,
                 "glossary": " ".join(segment["gloss"] for segment in meaningful).strip(),
                 "summary": {
-                    "token_count": len(tokens),
+                    "token_count": len(layer_segments),
                     "kanji_count": kanji_count,
                 },
             }
@@ -1367,6 +1475,18 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
             "summary": whole_unit["summary"],
         }
 
+        region_kanji_details = [
+            unit.get("kanji_details", {})
+            for unit in units_by_id.values()
+            if unit.get("kind") == "kanji" and unit.get("kanji_details")
+        ]
+        seen_kanji = set()
+        region_kanji_details = [
+            detail
+            for detail in region_kanji_details
+            if not (detail.get("kanji") in seen_kanji or seen_kanji.add(detail.get("kanji")))
+        ]
+
         global_lookup_hits += region_lookup_hits
         global_lookup_misses += region_lookup_misses
         by_region[region_id] = {
@@ -1374,6 +1494,12 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
             "reading_romanji": word_tokenized.get("reading_romanji", ""),
             "glossary": whole_glossary,
             "segments": breakdowns["words"]["segments"],
+            "lexical_segments": breakdowns["words"]["segments"],
+            "morpheme_segments": breakdowns["morphemes"]["segments"],
+            "kanji_details": region_kanji_details,
+            "enrichment": {
+                "ginza": _ginza_enrichment(text),
+            },
             "breakdowns": breakdowns,
             "units_by_id": units_by_id,
             "summary": {

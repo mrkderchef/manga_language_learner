@@ -109,11 +109,10 @@ def render_translated_panel(panel_path: Path, scan_result: dict[str, Any]) -> di
 		}
 
 	try:
-		text_mask = _build_text_mask(bgr.shape[:2], annotations)
-		cleaned = _clean_text_regions(bgr, text_mask)
+		gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+		cleaned = _clean_annotation_regions(bgr, gray, annotations)
 		rendered_rgb = cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB)
 		rendered = Image.fromarray(rendered_rgb).convert("RGBA")
-		gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
 		font_path = _select_font_path(warnings)
 		image_h, image_w = bgr.shape[:2]
@@ -204,6 +203,92 @@ def _clean_text_regions(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
 		cleaned = bgr.copy()
 		cleaned[mask > 0] = np.array([255, 255, 255], dtype=np.uint8)
 		return cleaned
+
+
+def _annotation_text_mask(shape: tuple[int, int], ann: dict[str, Any]) -> np.ndarray:
+	return _build_text_mask(shape, [ann])
+
+
+def _allocation_global_mask(
+	allocation_mask: np.ndarray,
+	origin: tuple[int, int],
+	shape: tuple[int, int],
+) -> np.ndarray:
+	h, w = shape
+	mask = np.zeros((h, w), dtype=np.uint8)
+	ox, oy = origin
+	x1 = max(0, ox)
+	y1 = max(0, oy)
+	x2 = min(w, ox + allocation_mask.shape[1])
+	y2 = min(h, oy + allocation_mask.shape[0])
+	if x2 <= x1 or y2 <= y1:
+		return mask
+	lx1 = x1 - ox
+	ly1 = y1 - oy
+	lx2 = lx1 + (x2 - x1)
+	ly2 = ly1 + (y2 - y1)
+	mask[y1:y2, x1:x2] = allocation_mask[ly1:ly2, lx1:lx2]
+	return mask
+
+
+def _bubble_fill_color_and_flatness(bgr: np.ndarray, gray: np.ndarray, bubble_mask: np.ndarray, text_mask: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
+	sample_mask = cv2.bitwise_and(bubble_mask, cv2.bitwise_not(text_mask))
+	sample_mask = cv2.erode(sample_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
+	values = bgr[sample_mask > 0]
+	gray_values = gray[sample_mask > 0]
+	if len(values) < 40:
+		values = bgr[bubble_mask > 0]
+		gray_values = gray[bubble_mask > 0]
+	if len(values) == 0:
+		return np.array([255, 255, 255], dtype=np.uint8), {"std": 999.0, "dark_ratio": 1.0, "sample_count": 0.0}
+
+	color = np.median(values, axis=0).astype(np.uint8)
+	std = float(np.std(gray_values))
+	dark_ratio = float(np.mean(gray_values < 190))
+	return color, {
+		"std": round(std, 3),
+		"dark_ratio": round(dark_ratio, 3),
+		"sample_count": float(len(values)),
+	}
+
+
+def _is_flat_bubble_background(metrics: dict[str, float], color: np.ndarray) -> bool:
+	brightness = float(np.mean(color))
+	return (
+		metrics.get("sample_count", 0.0) >= 40
+		and brightness >= 205
+		and metrics.get("std", 999.0) <= 18.0
+		and metrics.get("dark_ratio", 1.0) <= 0.035
+	)
+
+
+def _clean_annotation_regions(bgr: np.ndarray, gray: np.ndarray, annotations: list[dict[str, Any]]) -> np.ndarray:
+	cleaned = bgr.copy()
+	image_h, image_w = bgr.shape[:2]
+	for ann in annotations:
+		text_mask = _annotation_text_mask((image_h, image_w), ann)
+		allocation = allocation_space_from_annotation(gray, ann, image_w, image_h)
+		bubble_mask = None
+		if allocation.mask is not None and allocation.mask_origin is not None:
+			bubble_mask = _allocation_global_mask(allocation.mask, allocation.mask_origin, (image_h, image_w))
+
+		if bubble_mask is not None and cv2.countNonZero(bubble_mask) > 0:
+			color, metrics = _bubble_fill_color_and_flatness(bgr, gray, bubble_mask, text_mask)
+			vision = (ann.get("ocr_debug") or {}).setdefault("render_cleaning", {})
+			vision.update({
+				"background_std": metrics["std"],
+				"background_dark_ratio": metrics["dark_ratio"],
+				"background_sample_count": metrics["sample_count"],
+				"background_color_bgr": [int(value) for value in color.tolist()],
+			})
+			if _is_flat_bubble_background(metrics, color):
+				cleaned[bubble_mask > 0] = color
+				vision["mode"] = "paint_bubble_median"
+				continue
+			vision["mode"] = "inpaint_text_bbox_nonflat"
+
+		cleaned = _clean_text_regions(cleaned, text_mask)
+	return cleaned
 
 
 def _place_translations(
