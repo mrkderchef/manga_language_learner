@@ -96,30 +96,6 @@ const Scanner = (() => {
             .filter(Boolean);
     }
 
-    function hasTooltipCollision(entries) {
-        for (let i = 0; i < entries.length; i += 1) {
-            for (let j = i + 1; j < entries.length; j += 1) {
-                if (rectsOverlap(entries[i].rect, entries[j].rect)) return true;
-            }
-        }
-        return false;
-    }
-
-    function getCollidingTooltipEntries(entries) {
-        const colliding = new Set();
-        for (let i = 0; i < entries.length; i += 1) {
-            if (rectsOverlap(entries[i].rect, entries[i].boxRect)) {
-                colliding.add(entries[i]);
-            }
-            for (let j = i + 1; j < entries.length; j += 1) {
-                if (!rectsOverlap(entries[i].rect, entries[j].rect)) continue;
-                colliding.add(entries[i]);
-                colliding.add(entries[j]);
-            }
-        }
-        return Array.from(colliding);
-    }
-
     let editMode = false;
     let addBoxMode = false;
     let draftBox = null;
@@ -1255,68 +1231,20 @@ const Scanner = (() => {
         return rabbit.units_by_id?.[activeRabbitholeSelection.unitId] || null;
     }
 
-    function setActiveRabbitholeUnit(regionId, unitId, options = {}) {
+    function setActiveRabbitholeUnit(regionId, unitId) {
         const nextRegion = String(regionId);
-        const shouldResolveKanji = options.resolveKanji !== false;
-        const nextUnit = shouldResolveKanji ? resolveRabbitholeSelectionUnit(nextRegion, String(unitId)) : String(unitId);
-        activeRabbitholeSelection = { regionId: nextRegion, unitId: nextUnit };
+        activeRabbitholeSelection = { regionId: nextRegion, unitId: String(unitId) };
         if (latestScan) {
             renderDebugPanel(latestScan);
-            rerenderLatestOverlays();
+            refreshOpenRabbitholeTooltips();
         }
-    }
-
-    function resolveRabbitholeSelectionUnit(regionId, unitId) {
-        const ann = (latestScan?.annotations || []).find(candidate => getAnnotationRegionId(candidate) === regionId);
-        const rabbit = getRabbitholeData(ann);
-        const unit = rabbit?.units_by_id?.[unitId];
-        if (!rabbit || !unit || unit.kind !== 'kanji') return unitId;
-
-        const exactBreakUnit = getBreakdownSegments(ann, activeRabbitholeLayer)
-            .map(segment => getUnitForSegment(rabbit, segment))
-            .find(candidate =>
-                candidate
-                && candidate.kind !== 'kanji'
-                && candidate.text === unit.text
-                && candidate.start === unit.start
-                && candidate.end === unit.end
-        );
-        return exactBreakUnit?.id || unitId;
-    }
-
-    function isSameUnitSpan(a, b) {
-        if (!a || !b) return false;
-        return String(a.text || '') === String(b.text || '')
-            && Number(a.start) === Number(b.start)
-            && Number(a.end) === Number(b.end);
     }
 
     function isRabbitholeItemActive(ann, targetUnitId) {
         if (!targetUnitId) return false;
         const regionId = getAnnotationRegionId(ann);
         if (activeRabbitholeSelection.regionId !== regionId) return false;
-        if (activeRabbitholeSelection.unitId === targetUnitId) return true;
-
-        const rabbit = getRabbitholeData(ann);
-        const selectedUnit = rabbit?.units_by_id?.[activeRabbitholeSelection.unitId];
-        const targetUnit = rabbit?.units_by_id?.[targetUnitId];
-        if (!selectedUnit || !targetUnit) return false;
-        if (isSameUnitSpan(selectedUnit, targetUnit)) return true;
-
-        const selectedChildren = new Set(Array.isArray(selectedUnit.children) ? selectedUnit.children.map(String) : []);
-        const targetChildren = new Set(Array.isArray(targetUnit.children) ? targetUnit.children.map(String) : []);
-        if (selectedChildren.has(String(targetUnit.id)) || targetChildren.has(String(selectedUnit.id))) return true;
-
-        if (selectedUnit.kind === 'kanji' || targetUnit.kind === 'kanji') {
-            const sameText = String(selectedUnit.text || '') === String(targetUnit.text || '');
-            const selectedWithinTarget = Number(selectedUnit.start) >= Number(targetUnit.start)
-                && Number(selectedUnit.end) <= Number(targetUnit.end);
-            const targetWithinSelected = Number(targetUnit.start) >= Number(selectedUnit.start)
-                && Number(targetUnit.end) <= Number(selectedUnit.end);
-            if (sameText && (selectedWithinTarget || targetWithinSelected)) return true;
-        }
-
-        return false;
+        return activeRabbitholeSelection.unitId === targetUnitId;
     }
 
     function createRabbitholeTextRow(label, value, compact = false, className = '') {
@@ -1341,7 +1269,7 @@ const Scanner = (() => {
         activeRabbitholeLayer = target.id;
         if (latestScan) {
             renderDebugPanel(latestScan);
-            rerenderLatestOverlays();
+            refreshOpenRabbitholeTooltips();
         }
     }
 
@@ -1476,104 +1404,42 @@ const Scanner = (() => {
         return isMeaningfulRabbitholeUnit(unit);
     }
 
-    function extractKanjiCharacters(text) {
-        const kanji = [];
-        Array.from(text || '').forEach((char, index) => {
-            if (/[\u3400-\u9fff]/.test(char)) {
-                kanji.push({ char, start: index, end: index + char.length });
-            }
-        });
-        return kanji;
-    }
-
-    function findExactBreakUnitForKanji(ann, char, start, end) {
-        const rabbit = getRabbitholeData(ann);
-        return getBreakdownSegments(ann, activeRabbitholeLayer)
-            .map(segment => getUnitForSegment(rabbit, segment))
-            .find(unit =>
-                unit
-                && unit.kind !== 'kanji'
-                && unit.text === char
-                && Number(unit.start) === start
-                && Number(unit.end) === end
-            ) || null;
-    }
-
-    function findContainingBreakUnitForKanji(ann, char, start, end) {
-        const rabbit = getRabbitholeData(ann);
-        return getBreakdownSegments(ann, activeRabbitholeLayer)
-            .map(segment => getUnitForSegment(rabbit, segment))
-            .find(unit => {
-                if (!unit || unit.kind === 'kanji') return false;
-                const unitStart = Number(unit.start);
-                const unitEnd = Number(unit.end);
-                const relativeStart = start - unitStart;
-                return unitStart <= start
-                    && unitEnd >= end
-                    && String(unit.text || '').slice(relativeStart, relativeStart + char.length) === char;
-            }) || null;
-    }
-
     function buildKanjiItems(ann) {
         const rabbit = getRabbitholeData(ann);
         const units = rabbit?.units_by_id || {};
-        const kanjiSpans = extractKanjiCharacters(ann.text || '');
+        const kanjiSpans = getBreakdownSegments(ann, activeRabbitholeLayer)
+            .map(segment => getUnitForSegment(rabbit, segment))
+            .filter(unit => unit && unit.kind !== 'kanji')
+            .flatMap(unit => (unit.children || [])
+                .map(childId => units[childId])
+                .filter(child => child?.kind === 'kanji')
+                .map(child => ({
+                    char: child.text,
+                    start: Number(child.start),
+                    end: Number(child.end),
+                    container: unit,
+                    child,
+                })));
         const seen = new Set();
 
         return kanjiSpans
-            .filter(({ char, start, end }) => {
+            .filter(({ char, start, end, child }) => {
                 const key = `${char}:${start}:${end}`;
-                if (seen.has(key)) return false;
+                if (!child?.id || seen.has(key)) return false;
                 seen.add(key);
                 return true;
             })
-            .map(({ char, start, end }) => {
-                const exactBreakUnit = findExactBreakUnitForKanji(ann, char, start, end);
-                if (exactBreakUnit) {
-                    return {
-                        unitId: exactBreakUnit.id,
-                        text: char,
-                        className: 'rabbithole-kanji',
-                    };
-                }
-
-                const container = findContainingBreakUnitForKanji(ann, char, start, end);
-                if (container) {
-                    const child = (container.children || [])
-                        .map(childId => units[childId])
-                        .find(unit =>
-                            unit?.kind === 'kanji'
-                            && unit.text === char
-                            && Number(unit.start) === start
-                            && Number(unit.end) === end
-                        );
-                    const index = start - Number(container.start);
-                    const containerText = String(container.text || '');
-                    return {
-                        unitId: child?.id || '',
-                        text: char,
-                        prefix: index > 0 ? containerText.slice(0, index) : '',
-                        suffix: index >= 0 ? containerText.slice(index + char.length) : '',
-                        className: 'rabbithole-kanji',
-                    };
-                }
-
-                const kanjiUnit = Object.values(units).find(unit =>
-                    unit.kind === 'kanji'
-                    && unit.text === char
-                    && Number(unit.start) === start
-                    && Number(unit.end) === end
-                );
-                if (kanjiUnit) {
-                    return {
-                        unitId: kanjiUnit.id,
-                        text: char,
-                        className: 'rabbithole-kanji',
-                    };
-                }
-                return { unitId: '', text: char, context: '', className: 'rabbithole-kanji' };
-            })
-            .filter(item => item.unitId);
+            .map(({ char, start, container, child }) => {
+                const index = start - Number(container.start);
+                const containerText = String(container.text || '');
+                return {
+                    unitId: child.id,
+                    text: char,
+                    prefix: index > 0 ? containerText.slice(0, index) : '',
+                    suffix: index >= 0 ? containerText.slice(index + char.length) : '',
+                    className: 'rabbithole-kanji',
+                };
+            });
     }
 
     function getRabbitholeBreakdown(ann, layerId = activeRabbitholeLayer) {
@@ -1741,6 +1607,28 @@ const Scanner = (() => {
         };
     }
 
+    function getUnitInformation(unit) {
+        const features = getUnitFeatureGroups(unit);
+        if (unit?.kind === 'kanji') {
+            return {
+                ...features.kanji,
+                meanings: features.kanji?.meanings || unit.alternate_meanings || [],
+                primary_meaning: unit.primary_meaning,
+            };
+        }
+        return {
+            text: unit?.text,
+            hiragana: features.reading?.hiragana,
+            romaji: features.reading?.romaji,
+            meaning: features.meaning?.glossary,
+            alternate_meaning: features.meaning?.alternate_glossary,
+            unit_type: unit?.unit_label || getRabbitholeUnitKindLabel(unit),
+            part_of_speech: features.grammar?.part_of_speech,
+            grammar_notes: features.grammar?.function,
+            analysis_tags: features.grammar?.analysis_tags,
+        };
+    }
+
     function createRabbitholeFeatureSection(title, data) {
         if (isEmptyDebugValue(data)) return null;
         const section = document.createElement('section');
@@ -1750,38 +1638,26 @@ const Scanner = (() => {
         return section;
     }
 
-    function createKanjiFeatureBlock(ann, rabbit, unit) {
-        if (unit.kind === 'kanji') {
-            return createRabbitholeFeatureSection('Kanji', unit.kanji_details);
-        }
-
+    function createNestedUnitsBlock(ann, rabbit, unit) {
         if (!Array.isArray(unit.children) || !unit.children.length) return null;
         const block = document.createElement('section');
         block.className = 'rabbithole-feature-section rabbithole-children';
-        block.appendChild(createDebugBlockTitle('Kanji'));
+        block.appendChild(createDebugBlockTitle('Nested units'));
         unit.children.forEach(childId => {
             const child = rabbit.units_by_id?.[childId];
             if (!child) return;
             const chip = document.createElement('button');
             chip.type = 'button';
             chip.className = 'rabbithole-child';
-            chip.textContent = `${child.text} · ${child.primary_meaning || child.kind}`;
+            chip.textContent = `${child.text} · ${child.unit_label || getRabbitholeUnitKindLabel(child)}`;
             chip.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                setActiveRabbitholeUnit(getAnnotationRegionId(ann), child.id, { resolveKanji: false });
+                setActiveRabbitholeUnit(getAnnotationRegionId(ann), child.id);
             });
             block.appendChild(chip);
         });
         return block.children.length > 1 ? block : null;
-    }
-
-    function createTranslationContextBlock(ann) {
-        const translated = String(ann?.translated || '').trim();
-        if (!translated) return null;
-        return createRabbitholeFeatureSection('Translation Context', {
-            english: translated,
-        });
     }
 
     function createRabbitholeUnitInspector(ann, compact = false) {
@@ -1797,17 +1673,15 @@ const Scanner = (() => {
         title.textContent = `${unit.text} · ${getRabbitholeUnitKindLabel(unit)}`;
         inspector.appendChild(title);
 
-        const features = getUnitFeatureGroups(unit);
-        [
-            createRabbitholeFeatureSection('Reading', features.reading),
-            createRabbitholeFeatureSection('Meaning', features.meaning),
-            createRabbitholeFeatureSection('Grammar', features.grammar),
-            createKanjiFeatureBlock(ann, rabbit, unit),
-            createTranslationContextBlock(ann),
-        ].filter(Boolean).forEach(section => inspector.appendChild(section));
+        const infoTitle = unit.kind === 'kanji' ? 'Kanji information' : 'Segment information';
+        const infoBlock = createRabbitholeFeatureSection(infoTitle, getUnitInformation(unit));
+        if (infoBlock) inspector.appendChild(infoBlock);
 
         const dictionaryBlock = createDictionaryEntriesBlock(unit);
         if (dictionaryBlock) inspector.appendChild(dictionaryBlock);
+
+        const nestedBlock = createNestedUnitsBlock(ann, rabbit, unit);
+        if (nestedBlock) inspector.appendChild(nestedBlock);
 
         return inspector;
     }
@@ -1903,6 +1777,26 @@ const Scanner = (() => {
         if (inspector) entry.appendChild(inspector);
 
         return entry;
+    }
+
+    function refreshOpenRabbitholeTooltips() {
+        if (!latestScan) return;
+        const annotations = latestScan.annotations || [];
+        const annotationByRegion = new Map(
+            annotations.map((ann, index) => [getAnnotationRegionId(ann, index), { ann, index }])
+        );
+        document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open').forEach(box => {
+            const regionId = String(box.dataset.regionId || '');
+            const item = annotationByRegion.get(regionId);
+            if (!item || isUncomputedAnnotation(item.ann)) return;
+            const tooltip = box.querySelector('.ocr-tooltip');
+            if (!tooltip) return;
+            const currentCard = Array.from(tooltip.children)
+                .find(child => child.classList?.contains('rabbithole-card'));
+            if (!currentCard) return;
+            currentCard.replaceWith(createRabbitholeCard(item.ann, item.index, true));
+            scheduleTooltipCollisionResolution(box, tooltip);
+        });
     }
 
     function openReaderFullscreen() {
@@ -2376,15 +2270,8 @@ const Scanner = (() => {
                     tooltip.style.visibility = '';
                 }
             });
-            const openEntries = collectOpenTooltipEntries(boundsRect);
-            const collidingEntries = getCollidingTooltipEntries(openEntries);
-            if (collidingEntries.length) {
-                collidingEntries.forEach(entry => {
-                    entry.tooltip.style.visibility = 'hidden';
-                    positionTooltipWithinImage(entry.box, entry.tooltip, { keepHorizontal: true });
-                });
-            }
-            positionPinnedTooltips();
+            collectOpenTooltipEntries(boundsRect)
+                .forEach(entry => repositionTooltipIfNeeded(entry.box, entry.tooltip));
         });
     }
 
@@ -2430,9 +2317,6 @@ const Scanner = (() => {
                 box.classList.add('tooltip-open');
             }
         });
-        if (pinnedRegionIds.size) {
-            requestAnimationFrame(positionPinnedTooltips);
-        }
     }
 
     function dismissHoverboxRegion(regionId) {
@@ -2486,33 +2370,55 @@ const Scanner = (() => {
         requestAnimationFrame(() => positionTooltipWithinImage(box, tooltip, options));
     }
 
-    function positionPinnedTooltips() {
+    function scheduleTooltipCollisionResolution(box, tooltip, options = {}) {
+        requestAnimationFrame(() => repositionTooltipIfNeeded(box, tooltip, options));
+    }
+
+    function rememberTooltipPosition(box, tooltip, boundsRect) {
+        const regionId = String(box.dataset.regionId || '');
+        if (!regionId) return;
+        const rect = elementRectWithinBounds(tooltip, boundsRect);
+        if (!rect) return;
+        tooltipHorizontalByRegion.set(regionId, rect.left);
+        tooltipPositionByRegion.set(regionId, { left: rect.left, top: rect.top });
+    }
+
+    function getOtherOpenTooltipRects(boundsRect, sourceTooltip) {
+        return Array.from(document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open .ocr-tooltip'))
+            .filter(tooltip => tooltip !== sourceTooltip && tooltip.isConnected)
+            .map(tooltip => elementRectWithinBounds(tooltip, boundsRect))
+            .filter(Boolean);
+    }
+
+    function tooltipNeedsReposition(box, tooltip, boundsRect, margin = 16) {
+        const rect = elementRectWithinBounds(tooltip, boundsRect);
+        if (!rect) return false;
+        if (
+            rect.left < margin ||
+            rect.top < margin ||
+            rect.right > boundsRect.width - margin ||
+            rect.bottom > boundsRect.height - margin
+        ) {
+            return true;
+        }
+        const boxRect = elementRectWithinBounds(box, boundsRect);
+        if (boxRect && rectsOverlap(rect, boxRect)) return true;
+        return getOtherOpenTooltipRects(boundsRect, tooltip)
+            .some(otherRect => rectsOverlap(rect, otherRect));
+    }
+
+    function repositionTooltipIfNeeded(box, tooltip, options = {}) {
         const overlay = document.getElementById('ocr-overlay');
         const bounds = document.querySelector('.reader-shell') || overlay;
-        if (!overlay || !bounds) return;
-        const entries = Array.from(document.querySelectorAll('#ocr-overlay .ocr-box.pinned .ocr-tooltip'))
-            .map(tooltip => ({ tooltip, box: tooltip.closest('.ocr-box') }))
-            .filter(entry => entry.box && entry.tooltip.isConnected);
-        if (entries.length < 2) return;
+        if (!overlay || !bounds || !box?.isConnected || !tooltip?.isConnected) return;
+        if (getComputedStyle(tooltip).display === 'none') return;
         const boundsRect = bounds.getBoundingClientRect();
-        const measuredEntries = entries
-            .map(entry => {
-                const rect = elementRectWithinBounds(entry.tooltip, boundsRect);
-                const boxRect = elementRectWithinBounds(entry.box, boundsRect);
-                if (!rect || !boxRect) return null;
-                return {
-                    ...entry,
-                    rect,
-                    boxRect,
-                };
-            })
-            .filter(Boolean);
-        const collidingEntries = getCollidingTooltipEntries(measuredEntries);
-        if (!collidingEntries.length) return;
-        collidingEntries.forEach(entry => {
-            entry.tooltip.style.visibility = 'hidden';
-            positionTooltipWithinImage(entry.box, entry.tooltip, { keepHorizontal: true });
-        });
+        if (!boundsRect.width || !boundsRect.height) return;
+        if (tooltipNeedsReposition(box, tooltip, boundsRect)) {
+            positionTooltipWithinImage(box, tooltip, { keepHorizontal: true, ...options });
+            return;
+        }
+        rememberTooltipPosition(box, tooltip, boundsRect);
     }
 
     function rectsOverlap(a, b) {
@@ -2686,75 +2592,6 @@ const Scanner = (() => {
             tooltipPositionByRegion.set(regionId, { left: bestCandidate.left, top: bestCandidate.top });
         }
         tooltip.style.visibility = '';
-    }
-
-    function realignPinnedTooltips(entries, bounds, overlay) {
-        const boundsRect = bounds.getBoundingClientRect();
-        if (!boundsRect.width || !boundsRect.height) return;
-        const margin = 16;
-        const gap = 12;
-        const ordered = entries
-            .map((entry, index) => {
-                const boxRect = entry.box.getBoundingClientRect();
-                return { ...entry, boxRect, order: index };
-            })
-            .sort((a, b) => a.boxRect.top - b.boxRect.top || a.boxRect.left - b.boxRect.left || a.order - b.order);
-        const placed = [];
-        ordered.forEach(item => {
-            const chosen = pickTooltipCandidate(item.box, item.tooltip, boundsRect, margin, gap, placed);
-            if (!chosen) return;
-            applyTooltipPosition(item.box, item.tooltip, overlay, boundsRect, chosen.left, chosen.top);
-            placed.push({ left: chosen.left, top: chosen.top, right: chosen.left + chosen.width, bottom: chosen.top + chosen.height });
-        });
-    }
-
-    function pickTooltipCandidate(box, tooltip, boundsRect, margin, gap, placedRects) {
-        const previousVisibility = tooltip.style.visibility;
-        tooltip.style.visibility = 'hidden';
-        tooltip.style.removeProperty('left');
-        tooltip.style.removeProperty('top');
-        tooltip.style.removeProperty('right');
-        tooltip.style.removeProperty('bottom');
-        tooltip.style.removeProperty('transform');
-        tooltip.style.setProperty('--tooltip-max-width', `${Math.max(1, boundsRect.width - margin * 2)}px`);
-        tooltip.style.setProperty('--tooltip-max-height', `${Math.max(1, boundsRect.height - margin * 2)}px`);
-        const boxRect = box.getBoundingClientRect();
-        const tooltipRect = tooltip.getBoundingClientRect();
-        const boxLeft = boxRect.left - boundsRect.left;
-        const boxTop = boxRect.top - boundsRect.top;
-        const boxWidth = boxRect.width;
-        const boxHeight = boxRect.height;
-        const tooltipWidth = tooltipRect.width;
-        const tooltipHeight = tooltipRect.height;
-        const preferredLeft = boxLeft + (boxWidth - tooltipWidth) / 2;
-        const preferredTop = boxTop + boxHeight + gap;
-        const candidates = [
-            { left: preferredLeft, top: boxTop - tooltipHeight - gap, rank: 0 },
-            { left: preferredLeft, top: boxTop + boxHeight + gap, rank: 1 },
-            { left: boxLeft - tooltipWidth - gap, top: boxTop + (boxHeight - tooltipHeight) * 0.5, rank: 2 },
-            { left: boxLeft + boxWidth + gap, top: boxTop + (boxHeight - tooltipHeight) * 0.5, rank: 3 },
-            { left: boxLeft - tooltipWidth - gap, top: boxTop - tooltipHeight - gap, rank: 4 },
-            { left: boxLeft + boxWidth + gap, top: boxTop - tooltipHeight - gap, rank: 5 },
-            { left: boxLeft - tooltipWidth - gap, top: boxTop + boxHeight + gap, rank: 6 },
-            { left: boxLeft + boxWidth + gap, top: boxTop + boxHeight + gap, rank: 7 },
-            { left: preferredLeft - tooltipWidth * 0.5, top: preferredTop, rank: 8 },
-            { left: preferredLeft + tooltipWidth * 0.5, top: preferredTop, rank: 9 },
-        ].map(candidate => {
-            const clamped = clampTooltipCandidate(candidate.left, candidate.top, tooltipWidth, tooltipHeight, boundsRect, margin);
-            const rect = { left: clamped.left, top: clamped.top, right: clamped.left + tooltipWidth, bottom: clamped.top + tooltipHeight };
-            const overlap = placedRects.reduce((sum, obstacle) => sum + overlapArea(rect, obstacle), 0);
-            const horizontalDrift = Math.abs((clamped.left + tooltipWidth * 0.5) - (boxLeft + boxWidth * 0.5));
-            const verticalDrift = Math.abs(clamped.top - preferredTop);
-            return { ...clamped, width: tooltipWidth, height: tooltipHeight, overlap, horizontalDrift, verticalDrift, rank: candidate.rank };
-        });
-        candidates.sort((a, b) => {
-            if (a.overlap !== b.overlap) return a.overlap - b.overlap;
-            if (a.horizontalDrift !== b.horizontalDrift) return a.horizontalDrift - b.horizontalDrift;
-            if (a.verticalDrift !== b.verticalDrift) return a.verticalDrift - b.verticalDrift;
-            return a.rank - b.rank;
-        });
-        tooltip.style.visibility = previousVisibility;
-        return candidates[0] || null;
     }
 
     function applyTooltipPosition(box, tooltip, overlay, boundsRect, left, top) {

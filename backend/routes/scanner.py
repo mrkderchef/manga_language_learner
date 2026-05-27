@@ -618,7 +618,6 @@ def _translation_options_key(options: dict, annotations: list[dict]) -> str:
 def _rabbithole_options_key(annotations: list[dict]) -> str:
     return _json_hash({
         "text_hash": _texts_hash(annotations),
-        "rabbithole_version": rabbithole_service.RABBITHOLE_VERSION,
     })
 
 
