@@ -1,5 +1,5 @@
 """
-Manga OCR pipeline: comic-text-detector (detection) + manga-ocr (recognition) + translation.
+Manga OCR pipeline: comic-text-detector (detection) + manga-ocr (recognition).
 
 This replaces the LLM-based OCR approach with a proper deep-learning OCR model
 (kha-white/manga-ocr-base) that is specifically trained on Japanese manga text.
@@ -18,7 +18,6 @@ from PIL import Image
 from config import PANEL_DATA_DIR, ocr_panel_slug
 from services.vision.bubble_allocator import candidate_box_from_region, estimate_allocation_space, reconcile_overlapping_bubble_spaces
 from services.rabbithole import nlp as rabbithole_service
-from services.translation import engine as translation_engine
 from services.detection.region_detector import detect_text_regions
 
 logger = logging.getLogger(__name__)
@@ -46,38 +45,8 @@ def _get_mocr():
 	return _mocr
 
 
-def _translate_texts(texts: list[str], options: dict | None = None) -> dict:
-	"""Translate a batch of Japanese texts through the explicit translation engine."""
-	options = options or {}
-	engine = options.get("translation_engine", "ollama")
-	model = options.get("translation_model") if engine == "ollama" else None
-	try:
-		return translation_engine.translate_batch(
-			texts,
-			target_lang=options.get("target_lang", "en"),
-			engine=engine,
-			model=model,
-			style=options.get("translation_style", "natural"),
-			temperature=float(options.get("temperature", 0.1)),
-		)
-	except Exception as exc:
-		logger.warning("Translation unavailable: %s", exc)
-		return {
-			"success": False,
-			"translations": [""] * len(texts),
-			"translation_engine_requested": engine,
-			"translation_engine_used": None,
-			"translation_model": model,
-			"translation_target_lang": options.get("target_lang", "en"),
-			"translation_style": options.get("translation_style", "natural"),
-			"translation_prompt_version": translation_engine.PROMPT_VERSION,
-			"fallback_used": False,
-			"translation_error": str(exc),
-		}
-
-
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
-OCR_DEBUG_URL_PREFIX = "/ocr-debug"
+OCR_DEBUG_URL_PREFIX = "/api/media/ocr-debug"
 
 
 def _safe_debug_component(value: str) -> str:
@@ -148,8 +117,12 @@ def _score_candidate(candidate: dict, candidates: list[dict], expected_orientati
 	elif len(same_text):
 		variant_consensus = -8
 
-	semantic = rabbithole_service.token_plausibility(text)
-	semantic_plausibility = semantic["score"]
+	if str(options.get("semantic_rerank", "close")) == "off":
+		semantic = {"score": 0, "enabled": False}
+		semantic_plausibility = 0
+	else:
+		semantic = rabbithole_service.token_plausibility(text)
+		semantic_plausibility = semantic["score"]
 
 	penalties = {}
 	if jp_ratio < 0.55:
@@ -409,15 +382,20 @@ def _bgr_to_pil_rgb(bgr: np.ndarray) -> Image.Image:
 	return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
 
-def _estimate_bubble_geometry(gray_img: np.ndarray, region: dict) -> dict:
-	return estimate_allocation_space(gray_img, region).debug
+def _bubble_options(options: dict | None = None) -> dict:
+	options = options or {}
+	return options.get("bubble") if isinstance(options.get("bubble"), dict) else options
 
 
-def _estimate_bubble_allocation(gray_img: np.ndarray, region: dict):
-	return estimate_allocation_space(gray_img, region)
+def _estimate_bubble_geometry(gray_img: np.ndarray, region: dict, options: dict | None = None) -> dict:
+	return estimate_allocation_space(gray_img, region, _bubble_options(options)).debug
 
 
-def _preprocess_crop_variants(crop: Image.Image, upscale: int = 3) -> list[tuple[str, Image.Image]]:
+def _estimate_bubble_allocation(gray_img: np.ndarray, region: dict, options: dict | None = None):
+	return estimate_allocation_space(gray_img, region, _bubble_options(options))
+
+
+def _preprocess_crop_variants(crop: Image.Image, options: dict | None = None) -> list[tuple[str, Image.Image]]:
 	"""
 	Prepare several text crop variants for manga-ocr.
 
@@ -425,6 +403,14 @@ def _preprocess_crop_variants(crop: Image.Image, upscale: int = 3) -> list[tuple
 	Different pages react differently to preprocessing, so the OCR scorer gets
 	raw, contrast-enhanced, and thresholded versions to compare.
 	"""
+	options = options or {}
+	upscale = max(1, min(5, int(options.get("crop_upscale", 3) or 3)))
+	preprocessing_set = str(options.get("preprocessing_set", "standard"))
+	quality_mode = str(options.get("ocr_quality_mode", "balanced"))
+	if quality_mode == "fast":
+		preprocessing_set = "fast"
+	elif quality_mode == "deep":
+		preprocessing_set = "deep"
 	bgr = _upscale_crop(crop, upscale)
 	gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
@@ -444,11 +430,12 @@ def _preprocess_crop_variants(crop: Image.Image, upscale: int = 3) -> list[tuple
 		9,
 	)
 
-	return [
-		("raw_upscaled", _bgr_to_pil_rgb(bgr)),
-		("contrast", Image.fromarray(cv2.cvtColor(denoised, cv2.COLOR_GRAY2RGB))),
-		("threshold", Image.fromarray(cv2.cvtColor(thresholded, cv2.COLOR_GRAY2RGB))),
-	]
+	variants = [("raw_upscaled", _bgr_to_pil_rgb(bgr))]
+	if preprocessing_set != "fast":
+		variants.append(("contrast", Image.fromarray(cv2.cvtColor(denoised, cv2.COLOR_GRAY2RGB))))
+	if preprocessing_set in {"standard", "deep"}:
+		variants.append(("threshold", Image.fromarray(cv2.cvtColor(thresholded, cv2.COLOR_GRAY2RGB))))
+	return variants
 
 
 def _save_debug_preview(image: Image.Image, name: str) -> str:
@@ -470,10 +457,11 @@ def _ocr_crop(mocr, crop: Image.Image, region: dict, debug_slug: str | None = No
 	if forced_orientation in {"vertical", "horizontal"}:
 		vertical = forced_orientation == "vertical"
 	expected_orientation = "vertical" if vertical else "horizontal"
-	base_variants = _preprocess_crop_variants(crop)
+	base_variants = _preprocess_crop_variants(crop, options)
 	variants: list[tuple[str, Image.Image]] = list(base_variants)
 
-	if vertical:
+	rotated_enabled = bool(options.get("enable_rotated_variants", True)) and str(options.get("ocr_quality_mode", "balanced")) != "fast"
+	if vertical and rotated_enabled:
 		# Try both directions: detector orientation and scan quirks can disagree.
 		for variant_name, variant_img in base_variants:
 			variants.append((f"{variant_name}_rot90_ccw", variant_img.rotate(90, expand=True)))
@@ -653,12 +641,12 @@ def _sort_regions_reading_order(regions: list[dict]) -> list[dict]:
 	return ordered
 
 
-def extract_and_translate(image_path: str, target_lang: str = "en", options: dict | None = None, regions_override: list[dict] | None = None) -> dict:
+def extract_ocr(image_path: str, options: dict | None = None, regions_override: list[dict] | None = None) -> dict:
 	"""
-	Full pipeline: detect text regions → OCR each region → translate.
+	OCR pipeline: detect text regions, crop each region, and recognize Japanese text.
 
-	Returns the same response format as gemini_service/ollama_service so it's
-	a drop-in replacement in the scanner route.
+	Translation and Rabbithole analysis are intentionally handled by separate
+	scanner stages.
 	"""
 	img = cv2.imread(image_path)
 	if img is None:
@@ -671,7 +659,7 @@ def extract_and_translate(image_path: str, target_lang: str = "en", options: dic
 
 	# Step 1: Detect text regions with comic-text-detector, unless the caller
 	# provides panel-state regions with manual overrides already applied.
-	regions = _sort_regions_reading_order(regions_override or detect_text_regions(image_path))
+	regions = _sort_regions_reading_order(regions_override or detect_text_regions(image_path, options=options))
 	logger.info(f"manga-ocr pipeline: {len(regions)} text regions detected")
 
 	if not regions:
@@ -707,8 +695,10 @@ def extract_and_translate(image_path: str, target_lang: str = "en", options: dic
 	for region_index, region in enumerate(regions, start=1):
 		x, y, w, h = region["x"], region["y"], region["width"], region["height"]
 
-		# Add small padding for better OCR
-		pad = max(4, int(min(w, h) * 0.05))
+		# Add configurable padding for better OCR without changing the detected box.
+		pad_ratio = float(options.get("crop_padding_ratio", 0.05) or 0.05)
+		pad_min = int(options.get("crop_padding_min", 4) or 4)
+		pad = max(pad_min, int(min(w, h) * pad_ratio))
 		x1 = max(0, x - pad)
 		y1 = max(0, y - pad)
 		x2 = min(im_w, x + w + pad)
@@ -729,7 +719,7 @@ def extract_and_translate(image_path: str, target_lang: str = "en", options: dic
 		debug_slug = f"{panel_debug_dir}/{scan_slug}_{_safe_debug_component(region_id)}_{geom_slug}"
 		text, ocr_meta = _ocr_crop(mocr, crop, region, debug_slug, options)
 		ocr_meta["crop_box"] = [int(x1), int(y1), int(x2), int(y2)]
-		allocation = _estimate_bubble_allocation(gray_img, region)
+		allocation = _estimate_bubble_allocation(gray_img, region, options)
 		ocr_meta["vision"] = allocation.debug
 		ocr_meta["_allocation_space"] = allocation
 
@@ -746,21 +736,16 @@ def extract_and_translate(image_path: str, target_lang: str = "en", options: dic
 			)
 
 	recognized_entries = _suppress_nested_regions(recognized_entries)
-	reconcile_overlapping_bubble_spaces(recognized_entries, im_w, im_h)
+	if bool(_bubble_options(options).get("overlap_reconciliation", True)):
+		reconcile_overlapping_bubble_spaces(recognized_entries, im_w, im_h)
 	recognized_texts = [entry["text"] for entry in recognized_entries]
 	valid_regions = [entry["region"] for entry in recognized_entries]
 
 	logger.info(f"manga-ocr recognized text in {len(recognized_texts)}/{len(regions)} regions")
 
-	# Step 3: Translate all texts
-	translation_options = dict(options)
-	translation_options.setdefault("target_lang", target_lang)
-	translation_result = _translate_texts(recognized_texts, translation_options)
-	translations = translation_result.get("translations", [])
-
-	# Step 4: Build response
+	# Step 3: Build OCR-only response
 	annotations = []
-	for idx, (text, translation, region) in enumerate(zip(recognized_texts, translations, valid_regions), start=1):
+	for idx, (text, region) in enumerate(zip(recognized_texts, valid_regions), start=1):
 		rx, ry = int(region["x"]), int(region["y"])
 		rw, rh = int(region["width"]), int(region["height"])
 		bbox = [
@@ -773,7 +758,6 @@ def extract_and_translate(image_path: str, target_lang: str = "en", options: dic
 		annotations.append({
 			"id": f"ann_{idx:04d}",
 			"text": text,
-			"translated": translation,
 			"confidence": float(ocr_meta.get("confidence", 0.0)),
 			"bbox": bbox,
 			"char_count": len(text),
@@ -820,13 +804,6 @@ def extract_and_translate(image_path: str, target_lang: str = "en", options: dic
 		"ocr_engine_used": "mangaocr",
 		"fallback_used": False,
 		"fallback_reason": None,
-		"translation_engine_requested": translation_result.get("translation_engine_requested"),
-		"translation_engine_used": translation_result.get("translation_engine_used"),
-		"translation_model": translation_result.get("translation_model"),
-		"translation_target_lang": translation_result.get("translation_target_lang"),
-		"translation_style": translation_result.get("translation_style"),
-		"translation_prompt_version": translation_result.get("translation_prompt_version"),
-		"translation_error": translation_result.get("translation_error"),
 		"image_width": im_w,
 		"image_height": im_h,
 	}
@@ -840,4 +817,4 @@ def is_available() -> bool:
 	except ImportError:
 		return False
 
-__all__ = ['extract_and_translate', 'is_available']
+__all__ = ['extract_ocr', 'is_available']

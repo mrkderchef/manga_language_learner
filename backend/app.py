@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +18,7 @@ from config import (
     PANEL_DATA_DIR,
 )
 from services.bootstrap import ensure_runtime_assets
+from services.storage.image_service import ImageService
 from routes.scanner import router as scanner_router
 from routes.rabbithole import router as rabbithole_router
 
@@ -44,17 +45,16 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Serve panel images as static files
-app.mount("/panels", StaticFiles(directory=str(PANELS_DIR)), name="panels")
-app.mount("/ocr-debug", StaticFiles(directory=str(PANEL_DATA_DIR)), name="ocr-debug")
-# Serve per-panel data directories (new panel-centric structure)
-app.mount("/data/panels", StaticFiles(directory=str(PANEL_DATA_DIR)), name="data-panels")
 
 # Routes
 app.include_router(scanner_router)
@@ -72,16 +72,60 @@ async def _startup() -> None:
     logger.info("Startup assets ready: %s", status)
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_media_response(path: Path, root: Path, allowed_suffixes: set[str], cache_seconds: int = 86400):
+    if path.suffix.lower() not in allowed_suffixes:
+        raise HTTPException(status_code=404, detail="Unsupported media type")
+    if not _is_relative_to(path, root) or not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Media not found")
+    return FileResponse(
+        str(path),
+        headers={"Cache-Control": f"public, max-age={cache_seconds}"},
+    )
+
+
+@app.get("/api/media/panel/{filename}")
+async def get_panel_media(filename: str):
+    panel_path = ImageService.get_panel_by_filename(filename)
+    if not panel_path:
+        raise HTTPException(status_code=404, detail="Panel not found")
+    root = UPLOADS_DIR if _is_relative_to(panel_path, UPLOADS_DIR) else PANELS_DIR
+    return _safe_media_response(panel_path, root, {".jpg", ".jpeg", ".png"})
+
+
+@app.get("/api/media/rendered/{panel_id}/current.png")
+async def get_rendered_panel(panel_id: str):
+    if not ImageService._SAFE_NAME_RE.match(panel_id):
+        raise HTTPException(status_code=404, detail="Media not found")
+    rendered = PANEL_DATA_DIR / panel_id / "rendered" / "current.png"
+    return _safe_media_response(rendered, PANEL_DATA_DIR, {".png"}, cache_seconds=0)
+
+
+@app.get("/api/media/ocr-debug/{debug_path:path}")
+async def get_ocr_debug_media(debug_path: str):
+    if ".." in Path(debug_path).parts:
+        raise HTTPException(status_code=404, detail="Media not found")
+    path = PANEL_DATA_DIR / debug_path
+    parts = path.parts
+    if "ocr" not in parts or "debug" not in parts:
+        raise HTTPException(status_code=404, detail="Media not found")
+    return _safe_media_response(path, PANEL_DATA_DIR, {".png"}, cache_seconds=0)
+
+
 @app.get("/api/thumb/{filename}")
 async def get_thumbnail(filename: str, size: int = 160):
     """Serve a cached thumbnail of a panel image."""
-    size = min(size, 400)  # Cap max size
-    # Find original
-    panel_path = PANELS_DIR / filename
-    if not panel_path.exists():
-        panel_path = UPLOADS_DIR / filename
-    if not panel_path.exists():
-        return Response(status_code=404)
+    size = max(32, min(size, 400))
+    panel_path = ImageService.get_panel_by_filename(filename)
+    if not panel_path:
+        raise HTTPException(status_code=404, detail="Panel not found")
 
     thumb_name = f"{panel_path.stem}_{size}{panel_path.suffix}"
     thumb_path = THUMB_CACHE_DIR / thumb_name

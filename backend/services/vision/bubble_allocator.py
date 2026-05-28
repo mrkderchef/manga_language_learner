@@ -1073,7 +1073,8 @@ def reconcile_overlapping_bubble_spaces(
         })
 
 
-def estimate_allocation_space(gray_img: np.ndarray, region: dict[str, Any]) -> AllocationSpace:
+def estimate_allocation_space(gray_img: np.ndarray, region: dict[str, Any], options: dict[str, Any] | None = None) -> AllocationSpace:
+    options = options or {}
     x = int(region.get("x", 0))
     y = int(region.get("y", 0))
     width = max(1, int(region.get("width", 1)))
@@ -1088,6 +1089,9 @@ def estimate_allocation_space(gray_img: np.ndarray, region: dict[str, Any]) -> A
     else:
         search_pad_x = max(24, int(width * 1.35), int(height * 0.9))
         search_pad_y = max(24, int(height * 1.15), int(width * 0.65))
+    search_scale = max(0.4, min(2.5, float(options.get("search_scale", 1.0) or 1.0)))
+    search_pad_x = int(search_pad_x * search_scale)
+    search_pad_y = int(search_pad_y * search_scale)
     sx1 = max(0, x - search_pad_x)
     sy1 = max(0, y - search_pad_y)
     sx2 = min(image_w, x + width + search_pad_x)
@@ -1104,18 +1108,21 @@ def estimate_allocation_space(gray_img: np.ndarray, region: dict[str, Any]) -> A
     if roi.size == 0:
         return AllocationSpace(debug=debug)
 
-    wand_space = _try_magic_wand_allocation(
-        gray_img,
-        region,
-        debug,
-        candidate_box,
-        sx1,
-        sy1,
-        sx2,
-        sy2,
-    )
-    if wand_space is not None:
-        return wand_space
+    if bool(options.get("wand_enabled", True)):
+        wand_space = _try_magic_wand_allocation(
+            gray_img,
+            region,
+            debug,
+            candidate_box,
+            sx1,
+            sy1,
+            sx2,
+            sy2,
+        )
+        if wand_space is not None:
+            return wand_space
+    else:
+        debug["wand_rejected"] = "disabled_by_settings"
     if debug.get("wand_rejected") in {
         "likely_background_leak",
         "overgrown_from_seed",

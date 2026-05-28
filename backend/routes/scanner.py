@@ -1,5 +1,5 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from services.storage.image_service import ImageService
 import services.recognition.mangaocr as manga_ocr_service
 import services.rabbithole.nlp as rabbithole_service
@@ -281,9 +281,10 @@ def _region_id(region: dict) -> str:
     return "region_" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
 
 
-def _detect_regions_with_ids(panel_path: Path) -> list[dict]:
+def _detect_regions_with_ids(panel_path: Path, options: dict | None = None) -> list[dict]:
     regions = []
-    for region in detect_text_regions(str(panel_path)):
+    options = options or {}
+    for region in detect_text_regions(str(panel_path), options=options):
         copy = dict(region)
         copy["region_id"] = _region_id(copy)
         regions.append(copy)
@@ -552,12 +553,25 @@ def _json_hash(payload: dict | list | str) -> str:
 
 def _ocr_settings_key(options: dict) -> str:
     relevant = {
+        "confidence_threshold": options.get("confidence_threshold", 0.4),
+        "nms_threshold": options.get("nms_threshold", 0.35),
+        "mask_threshold": options.get("mask_threshold", 0.3),
+        "box_threshold": options.get("box_threshold", 0.6),
+        "max_regions": options.get("max_regions"),
         "ocr_quality_mode": options.get("ocr_quality_mode", "balanced"),
         "semantic_rerank": options.get("semantic_rerank", "close"),
         "vertical_preference": options.get("vertical_preference", "normal"),
         "rotation_win_margin": options.get("rotation_win_margin", 15),
         "preprocessing_set": options.get("preprocessing_set", "standard"),
-        "detection_sensitivity": options.get("detection_sensitivity", "normal"),
+        "crop_upscale": options.get("crop_upscale", 3),
+        "crop_padding_ratio": options.get("crop_padding_ratio", 0.05),
+        "crop_padding_min": options.get("crop_padding_min", 4),
+        "enable_rotated_variants": options.get("enable_rotated_variants", True),
+        "bubble": {
+            "search_scale": (options.get("bubble") or {}).get("search_scale", 1.0) if isinstance(options.get("bubble"), dict) else 1.0,
+            "wand_enabled": (options.get("bubble") or {}).get("wand_enabled", True) if isinstance(options.get("bubble"), dict) else True,
+            "overlap_reconciliation": (options.get("bubble") or {}).get("overlap_reconciliation", True) if isinstance(options.get("bubble"), dict) else True,
+        },
     }
     return _json_hash(relevant)
 
@@ -683,8 +697,7 @@ def _panel_cache_status(state: dict, panel_path: Path) -> dict:
 
 def _clear_panel_cache_buckets(state: dict, kinds: list[str] | None = None) -> list[str]:
     requested = kinds or list(PANEL_CACHE_BUCKETS)
-    if "ocr" in requested:
-        requested = list(dict.fromkeys([*requested, "rabbithole", "translation"]))
+    full_panel_reset = kinds is None
     cleared = []
     cache = state.setdefault("cache", {})
     for kind in requested:
@@ -693,18 +706,27 @@ def _clear_panel_cache_buckets(state: dict, kinds: list[str] | None = None) -> l
             cleared.append(kind)
             if kind == "ocr":
                 state["annotations"] = {}
-                state["boxes"] = []
-                state["auto_boxes"] = []
                 state["detection"] = []
-                state["overrides"] = {}
                 state.pop("ocr_settings_key", None)
+                for box in state.get("boxes", []) + state.get("auto_boxes", []):
+                    box["computed"] = False
         elif kind in {"rabbithole", "translation"}:
             cleared.append(kind)
+    if full_panel_reset:
+        state["boxes"] = []
+        state["auto_boxes"] = []
+        state["overrides"] = {}
     return cleared
 
 
 def _delete_panel_ocr_tree(panel_path: Path) -> None:
 	shutil.rmtree(ocr_panel_dir(panel_path), ignore_errors=True)
+
+
+def _delete_panel_ocr_artifacts(panel_path: Path) -> None:
+    ocr_root = ocr_panel_dir(panel_path)
+    for child in ("debug", "cache"):
+        shutil.rmtree(ocr_root / child, ignore_errors=True)
 
 
 def _clear_cached_results(state: dict, kinds: list[str]) -> None:
@@ -732,7 +754,7 @@ def _prepare_panel_regions(panel_path: Path, options: dict, state: dict, trace: 
     boxes = manual_boxes
     detected_count = None
     if not manual_boxes:
-        detected = _detect_regions_with_ids(panel_path)
+        detected = _detect_regions_with_ids(panel_path, options)
         state["detection"] = detected
         boxes = [_normalize_box(region, source="detected", computed=False) for region in detected]
         state["auto_boxes"] = boxes
@@ -1060,46 +1082,6 @@ def _attach_cached_rabbithole(panel_path: Path, result: dict) -> dict:
     return result
 
 
-def _run_scan_translate(panel_path: Path, options: dict | None = None) -> dict:
-    """Run OCR first, then Rabbithole, translation, and render as separate cacheable stages."""
-    options = options or {}
-    scan_id = _new_scan_id()
-    trace: list[dict] = []
-    state = _load_state(panel_path)
-    _trace(trace, scan_id, "scan", "start", "Scan started", panel=panel_path.name)
-
-    ocr_result = _run_ocr_stage(panel_path, options, state, trace, scan_id)
-    if not ocr_result or not ocr_result.get("success"):
-        ocr_result["scan_trace"] = trace
-        ocr_result["panel_cache"] = _panel_cache_status(state, panel_path)
-        _save_state(panel_path, state)
-        return ocr_result
-
-    rabbithole_result, rabbithole_key, should_cache_rabbithole = _run_rabbithole_stage(ocr_result, panel_path, options, trace, scan_id)
-    if rabbithole_key and should_cache_rabbithole and rabbithole_result.get("success"):
-        _save_persisted_stage(panel_path, "rabbithole", rabbithole_key, rabbithole_result)
-
-    translation_result, translation_key, should_cache_translation = _run_translation_stage(
-        ocr_result,
-        options,
-        {"panel_path": panel_path},
-        trace,
-        scan_id,
-    )
-    if translation_key and should_cache_translation and not translation_result.get("translation_error"):
-        _save_persisted_stage(panel_path, "translation", translation_key, translation_result)
-
-    enriched = _merge_rabbithole_result(ocr_result, rabbithole_result)
-    enriched = _merge_translation_result(enriched, translation_result, options)
-    render_result = _run_render_stage(panel_path, enriched, trace, scan_id)
-    enriched.update(render_result)
-    _trace(trace, scan_id, "scan", "done", "Scan completed", annotations=len(enriched.get("annotations", []) or []))
-    enriched["scan_trace"] = trace
-    enriched["panel_cache"] = _panel_cache_status(state, panel_path)
-    _save_state(panel_path, state)
-    return enriched
-
-
 def _run_rabbithole_existing(panel_path: Path, options: dict | None = None) -> dict:
     """Build or reuse Rabbithole analysis for the current OCR state."""
     options = options or {}
@@ -1205,32 +1187,93 @@ def _run_translate_existing(panel_path: Path, options: dict | None = None) -> di
     return enriched
 
 
-class TranslateRequest(BaseModel):
-    text: str
-    engine: str = "ollama"
-    model: str | None = None
-    target_lang: str = "en"
-    style: str = "natural"
-    temperature: float = 0.1
-
-
 class ScanOptions(BaseModel):
     use_cache: bool = True
     cache_only: bool = False
     fresh: bool = False
-    ocr_engine: str = "mangaocr"
+    detection: dict = Field(default_factory=dict)
+    ocr: dict = Field(default_factory=dict)
+    bubble: dict = Field(default_factory=dict)
+    render: dict = Field(default_factory=dict)
+    translation: dict = Field(default_factory=dict)
     ocr_quality_mode: str = "balanced"
     semantic_rerank: str = "close"
     vertical_preference: str = "normal"
     rotation_win_margin: int = 15
     preprocessing_set: str = "standard"
-    detection_sensitivity: str = "normal"
+    confidence_threshold: float = 0.4
+    nms_threshold: float = 0.35
+    mask_threshold: float = 0.3
+    box_threshold: float = 0.6
+    max_regions: int | None = None
+    crop_upscale: int = 3
+    crop_padding_ratio: float = 0.05
+    crop_padding_min: int = 4
+    enable_rotated_variants: bool = True
     translation_engine: str = "ollama"
     translation_model: str | None = None
     target_lang: str = "en"
     translation_style: str = "natural"
     temperature: float = 0.1
     reset_manual_edits: bool = False
+
+
+def _flatten_scan_options(options: dict | None) -> dict:
+    """Accept the new grouped settings payload while keeping old flat callers working."""
+    raw = dict(options or {})
+    grouped = {
+        "detection": raw.pop("detection", {}) or {},
+        "ocr": raw.pop("ocr", {}) or {},
+        "bubble": raw.pop("bubble", {}) or {},
+        "render": raw.pop("render", {}) or {},
+        "translation": raw.pop("translation", {}) or {},
+    }
+    aliases = {
+        "detection": {
+            "confidence_threshold": "confidence_threshold",
+            "nms_threshold": "nms_threshold",
+            "mask_threshold": "mask_threshold",
+            "box_threshold": "box_threshold",
+            "max_regions": "max_regions",
+        },
+        "ocr": {
+            "quality_mode": "ocr_quality_mode",
+            "semantic_rerank": "semantic_rerank",
+            "vertical_preference": "vertical_preference",
+            "rotation_win_margin": "rotation_win_margin",
+            "preprocessing_set": "preprocessing_set",
+            "crop_upscale": "crop_upscale",
+            "crop_padding_ratio": "crop_padding_ratio",
+            "crop_padding_min": "crop_padding_min",
+            "enable_rotated_variants": "enable_rotated_variants",
+        },
+        "translation": {
+            "engine": "translation_engine",
+            "model": "translation_model",
+            "target_lang": "target_lang",
+            "style": "translation_style",
+            "temperature": "temperature",
+        },
+        "bubble": {
+            "search_scale": "search_scale",
+            "wand_enabled": "wand_enabled",
+            "overlap_reconciliation": "overlap_reconciliation",
+        },
+    }
+    for group_name, group_aliases in aliases.items():
+        group = grouped[group_name]
+        if not isinstance(group, dict):
+            continue
+        for source, target in group_aliases.items():
+            if source in group and group[source] is not None:
+                raw[target] = group[source]
+    raw.update({name: value for name, value in grouped.items() if isinstance(value, dict)})
+    raw["ocr_engine"] = "mangaocr"
+    return raw
+
+
+def _scan_options_dict(options: ScanOptions | None) -> dict:
+    return _flatten_scan_options(options.model_dump() if options else {})
 
 
 class RegionOverrideRequest(BaseModel):
@@ -1267,9 +1310,15 @@ async def list_panels():
 @router.post("/upload")
 async def upload_panel(file: UploadFile = File(...)):
     try:
+        if file.content_type not in {"image/jpeg", "image/png"}:
+            raise HTTPException(status_code=400, detail="Only JPEG and PNG uploads are supported")
         content = await file.read()
         result = ImageService.save_uploaded_panel(content, file.filename)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Upload failed"))
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Upload failed: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -1284,30 +1333,10 @@ async def scan_panel(filename: str, options: ScanOptions | None = None):
 
     try:
         # Run blocking OCR in thread pool to avoid blocking the event loop
-        opts = options.model_dump() if options else {}
+        opts = _scan_options_dict(options)
         result = await asyncio.get_event_loop().run_in_executor(None, _run_ocr, panel_path, opts)
     except Exception as e:
         logger.error(f"OCR failed for {filename}: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"OCR processing error: {e}")
-
-    if result and result.get("success"):
-        return result
-    raise HTTPException(status_code=503, detail=(result or {}).get("error", "OCR engine unavailable"))
-
-
-@router.post("/{filename}/scan-translate")
-async def scan_and_translate(filename: str, options: ScanOptions | None = None):
-    """OCR + Rabbithole + translation in one step with explicit engines."""
-    panel_path = ImageService.get_panel_by_filename(filename)
-    if not panel_path:
-        raise HTTPException(status_code=404, detail="Panel not found")
-
-    try:
-        # Run blocking OCR in thread pool to avoid blocking the event loop
-        opts = options.model_dump() if options else {}
-        result = await asyncio.get_event_loop().run_in_executor(None, _run_scan_translate, panel_path, opts)
-    except Exception as e:
-        logger.error(f"OCR+translate failed for {filename}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"OCR processing error: {e}")
 
     if result and result.get("success"):
@@ -1323,7 +1352,7 @@ async def build_rabbithole(filename: str, options: ScanOptions | None = None):
         raise HTTPException(status_code=404, detail="Panel not found")
 
     try:
-        opts = options.model_dump() if options else {}
+        opts = _scan_options_dict(options)
         result = await asyncio.get_event_loop().run_in_executor(None, _run_rabbithole_existing, panel_path, opts)
     except Exception as e:
         logger.error(f"Rabbithole failed for {filename}: {e}\n{traceback.format_exc()}")
@@ -1342,7 +1371,7 @@ async def translate_panel(filename: str, options: ScanOptions | None = None):
         raise HTTPException(status_code=404, detail="Panel not found")
 
     try:
-        opts = options.model_dump() if options else {}
+        opts = _scan_options_dict(options)
         result = await asyncio.get_event_loop().run_in_executor(None, _run_translate_existing, panel_path, opts)
     except Exception as e:
         logger.error(f"Translate failed for {filename}: {e}\n{traceback.format_exc()}")
@@ -1351,24 +1380,6 @@ async def translate_panel(filename: str, options: ScanOptions | None = None):
     if result and result.get("success"):
         return result
     raise HTTPException(status_code=409, detail=(result or {}).get("error", "Run Scan before Translate"))
-
-
-@router.post("/translate")
-async def translate_text(req: TranslateRequest):
-    if not req.text.strip():
-        raise HTTPException(status_code=400, detail="No text provided")
-
-    try:
-        return translation_engine.translate_text(
-            req.text,
-            engine=req.engine,
-            model=req.model if req.engine == "ollama" else None,
-            target_lang=req.target_lang,
-            style=req.style,
-            temperature=req.temperature,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
 
 
 @router.get("/{filename}/cache-status")
@@ -1388,11 +1399,16 @@ async def delete_cache(filename: str, kind: str | None = None):
     state = _load_state(panel_path)
     kinds = [kind] if kind else None
     cleared = _clear_panel_cache_buckets(state, kinds)
-    if kind is None or kind == "ocr":
+    if kind is None:
         _delete_panel_ocr_tree(panel_path)
         _delete_stage_artifacts(panel_path, "rabbithole")
         _delete_stage_artifacts(panel_path, "translation")
         _delete_rendered_output(panel_path)
+        legacy = LEGACY_OCR_CACHE_DIR / f"{_cache_key(panel_path)}.json"
+        if legacy.exists():
+            legacy.unlink()
+    elif kind == "ocr":
+        _delete_panel_ocr_artifacts(panel_path)
         legacy = LEGACY_OCR_CACHE_DIR / f"{_cache_key(panel_path)}.json"
         if legacy.exists():
             legacy.unlink()
@@ -1403,12 +1419,7 @@ async def delete_cache(filename: str, kind: str | None = None):
         _delete_rendered_output(panel_path)
     _save_state(panel_path, state)
     status = _panel_cache_status(state, panel_path)
-    return {"success": True, "cleared": cleared, "overrides_preserved": kind not in {None, "ocr"}, **status}
-
-
-@router.get("/ocr-engines")
-async def ocr_engines():
-    return {"engines": _ocr_engine_status()}
+    return {"success": True, "cleared": cleared, "overrides_preserved": kind is not None, **status}
 
 
 @router.get("/translation-engines")
@@ -1512,7 +1523,7 @@ async def recompute_region(filename: str, region_id: str, options: ScanOptions |
     panel_path = ImageService.get_panel_by_filename(filename)
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
-    opts = options.model_dump() if options else {}
+    opts = _scan_options_dict(options)
     result = await asyncio.get_event_loop().run_in_executor(None, _run_ocr, panel_path, opts)
     if result and result.get("success"):
         annotation = next((a for a in result.get("annotations", []) if a.get("region_id") == region_id), None)

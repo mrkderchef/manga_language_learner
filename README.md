@@ -8,15 +8,15 @@ Learn Japanese playfully through manga panels. Upload a manga panel, detect Japa
 - **Text Detection:** Detect text regions per panel and process them as isolated OCR crops.
 - **Deep Inspection:** View OCR results, translations, reading data (furigana/romanji), and debug crop-previews per region.
 - **Rendering:** Automatically render translated dialogue back into panels (saved as `current.png`).
-- **Rabbithole Mode:** Explore vocabulary, Kanji details, glosses, and reading lookups directly from scanned text.
-- **Granular Caching:** Clear caches at the panel level without destroying global NLP lookup data.
+- **Reader Rabbithole:** Explore vocabulary, Kanji details, glosses, and reading lookups from the Reader side panel or click-open popups.
+- **Granular Caching:** Clear OCR, translation, Rabbithole, or full panel data without destroying global NLP lookup data.
 
 ## Architecture & Data Flow
 
 ```text
 manga_language_learner/
 |-- backend/                  Python FastAPI Backend
-|   |-- app.py                FastAPI app, static files, thumbnail cache
+|   |-- app.py                FastAPI app, validated media routes, thumbnail cache
 |   |-- config.py             Central configuration, env loading, path resolutions
 |   |-- data/                 Runtime data storage (gitignored)
 |   |   |-- lookup_cache/     Global NLP and Kanji caches
@@ -24,10 +24,10 @@ manga_language_learner/
 |   |   `-- thumbs/           Generated image thumbnails
 |   |-- routes/               HTTP endpoints (scanner, rabbithole)
 |   `-- services/
-|       |-- text_region_detector.py  ONNX-based text region boundary detection
-|       |-- manga_ocr_service.py     Crop preprocessing and MangaOCR execution
-|       |-- translation_engine.py    Ollama/Gemini translation backends
-|       `-- rabbithole/                NLP tokenization, glossing, and dictionary lookups
+|       |-- detection/         ONNX-based text region boundary detection
+|       |-- recognition/       MangaOCR crop preprocessing and OCR execution
+|       |-- translation/       Ollama/Gemini translation backends
+|       `-- rabbithole/        NLP tokenization, glossing, and dictionary lookups
 |-- frontend/                 Vanilla HTML/CSS/JS frontend
 |-- panels/                   Manga images (synthetic tests & uploads)
 `-- .env.example              Configuration template
@@ -49,11 +49,9 @@ backend/data/
 |   |   |-- rendered/
 |   |   |   `-- current.png       Target language rendered panel
 |   |   |-- rabbithole/
-|   |   |   |-- cache/
-|   |   |   `-- latest.json       Panel-specific Rabbithole analysis
+|   |   |   `-- cache/            Panel-specific Rabbithole analysis
 |   |   |-- translations/
-|   |   |   |-- cache/
-|   |   |   `-- latest.json       Panel-specific translation snapshots
+|   |   |   `-- cache/            Panel-specific translation snapshots
 |   |   `-- metadata.json         Source tracking, timestamps, edit history
 |   `-- ...
 `-- thumbs/                       Panel thumbnails
@@ -66,9 +64,29 @@ backend/data/
 | Text Detection Engine | active | Detects text regions, orientation, and reading order |
 | MangaOCR | active | Primary Japanese manga OCR (HuggingFace-based, runs locally) |
 | Preprocessing | active | Crop upscaling, contrast scaling, denoising, adaptive thresholding |
+| Reader Rabbithole | active | Builds dictionary, reading, kanji, and segmentation data from OCR text |
 | Sugoi Translation Model | active/default | Primary translation model: provides smooth, fluent dialogue translation |
 | Ollama Text (llama3.1) | active | Fallback translation model |
 | Gemini | optional | Highly capable remote translation fallback |
+
+## Reader Flow
+
+The app is centered on `Home -> Reader`.
+
+1. Upload or select a panel.
+2. Click **Scan** to run OCR only.
+3. The Reader automatically starts Rabbithole analysis after OCR, but translation remains a separate action.
+4. Click OCR boxes to open multiple independent Rabbithole popups. Click the same box or the popup close button to close only that popup.
+5. Click **Translate** after OCR to render the translated panel.
+
+The settings panel exposes real detector, OCR, bubble-allocation, and translation controls, including detection thresholds, preprocessing breadth, vertical-text preference, crop scaling, bubble search scale, wand allocation, and translation options. Settings are persisted locally in the browser and can be reset to defaults.
+
+Cache actions are intentionally split:
+
+- **Clear OCR:** deletes backend OCR annotations/cache only. The current Reader view stays visible until reload or the next edit.
+- **Clear translation:** clears translation cache and rendered output.
+- **Clear Rabbithole:** clears Reader-integrated Rabbithole cache.
+- **Clear Panel Data:** removes OCR state, manual boxes, Rabbithole data, translation outputs, rendered output, and panel metadata.
 
 ## Setup & Installation
 
@@ -146,17 +164,29 @@ RENDER_FONT_PATH=optional/path/to/font.ttf
 GET    /api/scanner/panels
 POST   /api/scanner/upload
 POST   /api/scanner/{filename}/ocr
-POST   /api/scanner/{filename}/scan-translate
-POST   /api/scanner/translate
-GET    /api/scanner/{filename}/cache-status
 POST   /api/scanner/{filename}/rabbithole
+POST   /api/scanner/{filename}/translate
+GET    /api/scanner/{filename}/cache-status
+GET    /api/scanner/{filename}/regions
 DELETE /api/scanner/{filename}/cache?kind=ocr|translation|rabbithole
+POST   /api/scanner/{filename}/regions
+POST   /api/scanner/{filename}/regions/{region_id}/override
+POST   /api/scanner/{filename}/regions/{region_id}/recompute
+DELETE /api/scanner/{filename}/regions/{region_id}
+GET    /api/scanner/translation-engines
+GET    /api/scanner/ollama/models
 
-# Rabbithole & Vocabulary
-GET    /api/rabbithole/panels
-GET    /api/rabbithole/{filename}/vocab
-POST   /api/rabbithole/{filename}/answer
-GET    /api/rabbithole/progress
+# Validated Media
+GET    /api/media/panel/{filename}
+GET    /api/thumb/{filename}?size=160
+GET    /api/media/rendered/{panel_id}/current.png
+GET    /api/media/ocr-debug/{debug_path}
+
+# Rabbithole Lookup
+GET    /api/rabbithole/lookup?text=...
+GET    /api/rabbithole/kanji/{character}
+GET    /api/rabbithole/word?text=...
+GET    /api/rabbithole/reading/{reading}
 ```
 
 ## Tech Stack
@@ -167,6 +197,14 @@ GET    /api/rabbithole/progress
 - **Geometry Processing:** Shapely, pyclipper
 - **Translation:** Ollama (default), Gemini (optional)
 - **Frontend:** Vanilla HTML/CSS/JS with modular components
+
+## Tests
+
+```bash
+python -m unittest discover -s tests
+```
+
+The current automated tests mock the heavy OCR/Rabbithole/translation services and verify the regular stage contract, removed legacy endpoints, media path validation, and upload rejection behavior.
 
 ## Dictionary Sources
 

@@ -69,24 +69,12 @@ const API = (() => {
                 body: formData,
             }).then(r => r.json()).then(data => {
                 invalidateCache('/api/scanner/panels');
-                invalidateCache('/api/rabbithole/panels');
                 return data;
             });
         },
 
         scanPanel(filename, options = {}) {
             return request(`/api/scanner/${filename}/ocr`, {
-                method: 'POST',
-                body: JSON.stringify(options),
-            }).then(data => {
-                invalidateCache(`/api/scanner/${filename}/cache-status`);
-                invalidateCache(`/api/scanner/${filename}/regions`);
-                return data;
-            });
-        },
-
-        scanAndTranslate(filename, options = {}) {
-            return request(`/api/scanner/${filename}/scan-translate`, {
                 method: 'POST',
                 body: JSON.stringify(options),
             }).then(data => {
@@ -130,13 +118,6 @@ const API = (() => {
             });
         },
 
-        translateText(text, options = {}) {
-            return request('/api/scanner/translate', {
-                method: 'POST',
-                body: JSON.stringify({ text, ...options }),
-            });
-        },
-
         getCacheStatus(filename) {
             return request(`/api/scanner/${filename}/cache-status`);
         },
@@ -152,10 +133,6 @@ const API = (() => {
                 invalidateCache(`/api/scanner/${filename}/regions`);
                 return data;
             });
-        },
-
-        getOcrEngines() {
-            return request('/api/scanner/ocr-engines');
         },
 
         getTranslationEngines() {
@@ -209,26 +186,6 @@ const API = (() => {
             });
         },
 
-        // === Rabbithole Endpoints ===
-        getRabbitholePanels() {
-            return request('/api/rabbithole/panels');
-        },
-
-        getPanelVocab(filename) {
-            return request(`/api/rabbithole/${filename}/vocab`);
-        },
-
-        submitAnswer(filename, word, knew) {
-            return request(`/api/rabbithole/${filename}/answer`, {
-                method: 'POST',
-                body: JSON.stringify({ word, knew }),
-            });
-        },
-
-        getProgress() {
-            return request('/api/rabbithole/progress');
-        },
-
         lookupText(text) {
             return request(`/api/rabbithole/lookup?text=${encodeURIComponent(text)}`);
         },
@@ -250,7 +207,7 @@ const API = (() => {
             if (pathOrFilename.startsWith('/')) {
                 return `${BASE_URL}${pathOrFilename}`;
             }
-            return `${BASE_URL}/panels/${pathOrFilename}`;
+            return `${BASE_URL}/api/media/panel/${pathOrFilename}`;
         },
 
         /** Thumbnail URL — small cached version for grid views */

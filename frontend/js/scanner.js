@@ -26,46 +26,11 @@ const Scanner = (() => {
     let latestScan = null;
     let _panelsLoaded = false;
     let controlsHideTimer = null;
-    let pinnedRegionIds = new Set();
-    let hoverSuppressedRegionIds = new Set();
-    const hoverCloseTimers = new Map();
-    const tooltipHorizontalByRegion = new Map();
-    const tooltipPositionByRegion = new Map();
-
-    function clearAllHoverCloseTimers() {
-        hoverCloseTimers.forEach(timerId => window.clearTimeout(timerId));
-        hoverCloseTimers.clear();
-    }
-
-    function captureOpenTooltipRegions() {
-        const openRegions = new Set();
-        const bounds = document.querySelector('.reader-shell') || document.getElementById('ocr-overlay');
-        const boundsRect = bounds?.getBoundingClientRect();
-        document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open').forEach(box => {
-            const regionId = String(box.dataset.regionId || '');
-            if (!regionId) return;
-            openRegions.add(regionId);
-            const tooltip = box.querySelector('.ocr-tooltip');
-            if (!tooltip || !boundsRect) return;
-            const rect = tooltip.getBoundingClientRect();
-            if (!rect.width || !rect.height) return;
-            const left = rect.left - boundsRect.left;
-            const top = rect.top - boundsRect.top;
-            tooltipHorizontalByRegion.set(regionId, left);
-            tooltipPositionByRegion.set(regionId, { left, top });
-        });
-        return openRegions;
-    }
-
-    function restoreTooltipPosition(box, tooltip, overlay, boundsRect) {
-        const regionId = String(box.dataset.regionId || '');
-        if (!regionId) return false;
-        const stored = tooltipPositionByRegion.get(regionId);
-        if (!stored || !Number.isFinite(stored.left) || !Number.isFinite(stored.top)) return false;
-        applyTooltipPosition(box, tooltip, overlay, boundsRect, stored.left, stored.top);
-        tooltipHorizontalByRegion.set(regionId, stored.left);
-        return true;
-    }
+    const MAX_OPEN_POPUPS = 6;
+    let openPopupRegionIds = new Set();
+    let popupOpenOrder = [];
+    const popupPositionsByRegion = new Map();
+    const rabbitholeCardStates = new Map();
 
     function elementRectWithinBounds(element, boundsRect) {
         const rect = element.getBoundingClientRect();
@@ -78,24 +43,6 @@ const Scanner = (() => {
         };
     }
 
-    function collectOpenTooltipEntries(boundsRect) {
-        return Array.from(document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open .ocr-tooltip'))
-            .map(tooltip => {
-                const box = tooltip.closest('.ocr-box');
-                if (!box || !tooltip.isConnected) return null;
-                const rect = elementRectWithinBounds(tooltip, boundsRect);
-                const boxRect = elementRectWithinBounds(box, boundsRect);
-                if (!rect || !boxRect) return null;
-                return {
-                    box,
-                    tooltip,
-                    rect,
-                    boxRect,
-                };
-            })
-            .filter(Boolean);
-    }
-
     let editMode = false;
     let addBoxMode = false;
     let draftBox = null;
@@ -103,14 +50,12 @@ const Scanner = (() => {
     let latestCacheStatus = null;
     let lastScannedOcrFingerprint = null;
     let activeDebugTab = 'rabbithole';
-    let activeRabbitholeSelection = { regionId: null, unitId: null };
-    let activeRabbitholeLayer = 'words';
     let activeVisionOverlay = 'none';
     const DEBUG_PANEL_DEFAULT_WIDTH = 620;
     const DEBUG_PANEL_MIN_WIDTH = 280;
     const DEBUG_PANEL_MAX_SCALE = 2;
-
     function init() {
+        ScannerSettings.restore();
         bindEvents();
         initializeDebugPanelWidth();
         loadEngineControls().catch(err => {
@@ -142,6 +87,7 @@ const Scanner = (() => {
         document.querySelectorAll('[data-cache-kind]').forEach(btn => {
             btn.addEventListener('click', () => handleCacheClear(btn.dataset.cacheKind));
         });
+        document.getElementById('btn-reset-scan-settings')?.addEventListener('click', resetScanSettings);
         // Home Ollama controls removed
         document.getElementById('translation-slider').addEventListener('input', (e) => {
             setTranslationReveal(Number(e.target.value));
@@ -156,8 +102,31 @@ const Scanner = (() => {
             const next = Number(slider.value) >= 50 ? 0 : 100;
             setTranslationReveal(next);
         });
-        ['scan-ocr-engine', 'scan-ocr-quality', 'scan-vertical-preference', 'scan-rotation-margin'].forEach(id => {
-            document.getElementById(id)?.addEventListener('change', markScanSettingsChanged);
+        [
+            'scan-detection-confidence',
+            'scan-detection-nms',
+            'scan-detection-mask',
+            'scan-detection-box',
+            'scan-detection-max-regions',
+            'scan-ocr-quality',
+            'scan-preprocessing-set',
+            'scan-vertical-preference',
+            'scan-rotation-margin',
+            'scan-crop-upscale',
+            'scan-crop-padding-ratio',
+            'scan-semantic-rerank',
+            'scan-rotated-variants',
+            'scan-bubble-search-scale',
+            'scan-bubble-wand',
+            'scan-bubble-overlap',
+            'scan-target-lang',
+            'scan-translation-style',
+            'scan-temperature',
+        ].forEach(id => {
+            document.getElementById(id)?.addEventListener('change', () => {
+                ScannerSettings.persist();
+                markScanSettingsChanged();
+            });
         });
         document.getElementById('scanner-panel-img').addEventListener('load', rerenderLatestOverlays);
         window.addEventListener('resize', rerenderLatestOverlays);
@@ -203,6 +172,7 @@ const Scanner = (() => {
             ]);
             fillSelect('scan-translation-engine', translation.engines || [], 'ollama');
             fillOllamaModelSelect('scan-translation-model', ollama);
+            ScannerSettings.restore();
             updateTranslationModelVisibility();
             engineControlsLoaded = true;
         } catch (err) {
@@ -260,6 +230,7 @@ const Scanner = (() => {
 
     async function handleTranslationSettingsChanged() {
         updateTranslationModelVisibility();
+        ScannerSettings.persist();
         await syncTranslatedPanelForCurrentSelection();
     }
 
@@ -276,37 +247,17 @@ const Scanner = (() => {
     }
 
     function getScanOptions() {
-        const translationEngine = document.getElementById('scan-translation-engine').value;
-        const translationModel = translationEngine === 'ollama'
-            ? document.getElementById('scan-translation-model').value || null
-            : null;
-        return {
-            ocr_engine: 'mangaocr',
-            ocr_quality_mode: document.getElementById('scan-ocr-quality').value,
-            semantic_rerank: 'close',
-            vertical_preference: document.getElementById('scan-vertical-preference').value,
-            rotation_win_margin: Number(document.getElementById('scan-rotation-margin').value) || 15,
-            preprocessing_set: 'standard',
-            detection_sensitivity: 'normal',
-            translation_engine: translationEngine,
-            translation_model: translationModel,
-            target_lang: document.getElementById('scan-target-lang').value || 'en',
-            translation_style: document.getElementById('scan-translation-style').value,
-            temperature: Number(document.getElementById('scan-temperature').value) || 0.1,
-            reset_manual_edits: false,
-        };
+        return ScannerSettings.getOptions();
+    }
+
+    function resetScanSettings() {
+        ScannerSettings.reset();
+        updateTranslationModelVisibility();
+        markScanSettingsChanged();
     }
 
     function getOcrFingerprint() {
-        const options = getScanOptions();
-        return JSON.stringify({
-            ocr_quality_mode: options.ocr_quality_mode,
-            semantic_rerank: options.semantic_rerank,
-            vertical_preference: options.vertical_preference,
-            rotation_win_margin: options.rotation_win_margin,
-            preprocessing_set: options.preprocessing_set,
-            detection_sensitivity: options.detection_sensitivity,
-        });
+        return ScannerSettings.getOcrFingerprint();
     }
 
     function setTranslateEnabled(enabled) {
@@ -362,15 +313,29 @@ const Scanner = (() => {
         if (!selectedPanel) return;
         try {
             await API.deletePanelCache(selectedPanel.filename, kind);
-            latestScan = null;
-            lastScannedOcrFingerprint = null;
-            setTranslateEnabled(false);
-            document.getElementById('ocr-overlay').innerHTML = '';
-            resetTranslationView();
-            const editNote = (!kind || kind === 'ocr') ? ' Box edits were cleared.' : ' Box edits were preserved.';
-            setDebugStatus(`${kind ? kind.toUpperCase() : 'Panel'} cache cleared.${editNote}`);
-            if (!kind || kind === 'ocr') {
+            if (kind === 'ocr') {
+                setDebugStatus('OCR cache cleared. Current Reader view stays available until reload or the next edit.');
+                await refreshCacheStatus();
+                return;
+            }
+            if (!kind) {
+                latestScan = null;
+                lastScannedOcrFingerprint = null;
+                openPopupRegionIds = new Set();
+                popupOpenOrder = [];
+                popupPositionsByRegion.clear();
+                setTranslateEnabled(false);
+                document.getElementById('ocr-overlay').innerHTML = '';
+                document.getElementById('ocr-popup-layer').innerHTML = '';
+                resetTranslationView();
+                setDebugStatus('Panel data cleared.');
                 await loadPanelBoxes(selectedPanel.filename);
+            } else {
+                if (kind === 'translation') {
+                    resetTranslationView();
+                    latestScan?.annotations?.forEach(ann => delete ann.translated);
+                }
+                setDebugStatus(`${kind.toUpperCase()} cache cleared. Box edits were preserved.`);
             }
             await refreshCacheStatus();
         } catch (err) {
@@ -494,12 +459,11 @@ const Scanner = (() => {
         resetTranslationView();
         setDebugStatus('Ready to scan.');
         ocrText = '';
-        clearAllHoverCloseTimers();
-        tooltipHorizontalByRegion.clear();
-        tooltipPositionByRegion.clear();
-        pinnedRegionIds = new Set();
-        hoverSuppressedRegionIds = new Set();
-        activeRabbitholeSelection = { regionId: null, unitId: null };
+        openPopupRegionIds = new Set();
+        popupOpenOrder = [];
+        popupPositionsByRegion.clear();
+        rabbitholeCardStates.clear();
+        document.getElementById('ocr-popup-layer').innerHTML = '';
         document.getElementById('btn-add-box').disabled = !editMode;
         refreshCacheStatus();
         await loadPanelBoxes(panel.filename);
@@ -704,12 +668,13 @@ const Scanner = (() => {
         try {
             const ocrResult = await API.scanPanel(selectedPanel.filename, getScanOptions());
             resetTranslationView();
-            activeRabbitholeSelection = { regionId: null, unitId: null };
+            rabbitholeCardStates.clear();
             latestScan = ocrResult;
             lastScannedOcrFingerprint = getOcrFingerprint();
             ocrText = ocrResult.text || '';
             renderDebugPanel(ocrResult);
             renderOverlays(ocrResult.annotations || [], ocrResult.image_width, ocrResult.image_height);
+            setTranslateEnabled(hasComputedText(ocrResult.annotations || []) && !(ocrResult.annotations || []).some(isUncomputedAnnotation));
             try {
                 const rabbitholeResult = await API.buildRabbithole(selectedPanel.filename, getScanOptions());
                 latestScan = rabbitholeResult;
@@ -1224,27 +1189,44 @@ const Scanner = (() => {
         return ann?.rabbithole || null;
     }
 
-    function getSelectedRabbitholeUnit(ann, fallback = 0) {
-        const rabbit = getRabbitholeData(ann);
-        const regionId = getAnnotationRegionId(ann, fallback);
-        if (!rabbit || activeRabbitholeSelection.regionId !== regionId) return null;
-        return rabbit.units_by_id?.[activeRabbitholeSelection.unitId] || null;
+    function getRabbitholeCardState(instanceKey) {
+        const key = String(instanceKey || 'side:default');
+        if (!rabbitholeCardStates.has(key)) {
+            rabbitholeCardStates.set(key, {
+                selection: { regionId: null, unitId: null },
+                layer: 'words',
+            });
+        }
+        return rabbitholeCardStates.get(key);
     }
 
-    function setActiveRabbitholeUnit(regionId, unitId) {
+    function getCardLayer(instanceKey) {
+        return getRabbitholeCardState(instanceKey).layer || 'words';
+    }
+
+    function getSelectedRabbitholeUnit(ann, fallback = 0, instanceKey = 'side:default') {
+        const rabbit = getRabbitholeData(ann);
+        const regionId = getAnnotationRegionId(ann, fallback);
+        const selection = getRabbitholeCardState(instanceKey).selection;
+        if (!rabbit || selection.regionId !== regionId) return null;
+        return rabbit.units_by_id?.[selection.unitId] || null;
+    }
+
+    function setActiveRabbitholeUnit(regionId, unitId, instanceKey = 'side:default') {
         const nextRegion = String(regionId);
-        activeRabbitholeSelection = { regionId: nextRegion, unitId: String(unitId) };
+        getRabbitholeCardState(instanceKey).selection = { regionId: nextRegion, unitId: String(unitId) };
         if (latestScan) {
             renderDebugPanel(latestScan);
-            refreshOpenRabbitholeTooltips();
+            renderOpenPopups();
         }
     }
 
-    function isRabbitholeItemActive(ann, targetUnitId) {
+    function isRabbitholeItemActive(ann, targetUnitId, instanceKey = 'side:default') {
         if (!targetUnitId) return false;
         const regionId = getAnnotationRegionId(ann);
-        if (activeRabbitholeSelection.regionId !== regionId) return false;
-        return activeRabbitholeSelection.unitId === targetUnitId;
+        const selection = getRabbitholeCardState(instanceKey).selection;
+        if (selection.regionId !== regionId) return false;
+        return selection.unitId === targetUnitId;
     }
 
     function createRabbitholeTextRow(label, value, compact = false, className = '') {
@@ -1263,34 +1245,35 @@ const Scanner = (() => {
         return row;
     }
 
-    function setActiveRabbitholeLayer(layerId) {
+    function setActiveRabbitholeLayer(layerId, instanceKey = 'side:default') {
         const target = RABBITHOLE_LAYER_DEFS.find(layer => layer.id === layerId && !layer.upcoming);
-        if (!target || activeRabbitholeLayer === target.id) return;
-        activeRabbitholeLayer = target.id;
+        if (!target || getCardLayer(instanceKey) === target.id) return;
+        getRabbitholeCardState(instanceKey).layer = target.id;
         if (latestScan) {
             renderDebugPanel(latestScan);
-            refreshOpenRabbitholeTooltips();
+            renderOpenPopups();
         }
     }
 
-    function createRabbitholeLayerTabs(compact = false) {
+    function createRabbitholeLayerTabs(compact = false, instanceKey = 'side:default') {
         const tabs = document.createElement('div');
         tabs.className = `rabbithole-layer-tabs${compact ? ' compact' : ''}`;
+        const activeLayer = getCardLayer(instanceKey);
 
         RABBITHOLE_LAYER_DEFS.forEach(layer => {
             const button = document.createElement('button');
             button.type = 'button';
-            button.className = `rabbithole-layer-tab${activeRabbitholeLayer === layer.id ? ' active' : ''}${layer.upcoming ? ' upcoming' : ''}`;
+            button.className = `rabbithole-layer-tab${activeLayer === layer.id ? ' active' : ''}${layer.upcoming ? ' upcoming' : ''}`;
             button.textContent = layer.label;
             button.disabled = Boolean(layer.upcoming);
-            button.setAttribute('aria-pressed', String(activeRabbitholeLayer === layer.id));
+            button.setAttribute('aria-pressed', String(activeLayer === layer.id));
             if (layer.upcoming) {
                 button.title = `${layer.label} is planned for the next rabbithole phase.`;
             } else {
                 button.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    setActiveRabbitholeLayer(layer.id);
+                    setActiveRabbitholeLayer(layer.id, instanceKey);
                 });
             }
             tabs.appendChild(button);
@@ -1299,7 +1282,7 @@ const Scanner = (() => {
         return tabs;
     }
 
-    function createRabbitholeUnitRow(label, ann, items, compact = false, fallback = '', className = '') {
+    function createRabbitholeUnitRow(label, ann, items, compact = false, fallback = '', className = '', instanceKey = 'side:default') {
         const row = document.createElement('div');
         row.className = `rabbithole-row${compact ? ' compact' : ''}`;
 
@@ -1328,12 +1311,12 @@ const Scanner = (() => {
                 button.textContent = text;
             }
             button.setAttribute('data-text', text);
-            button.classList.toggle('active', Boolean(targetUnitId) && isRabbitholeItemActive(ann, targetUnitId));
+            button.classList.toggle('active', Boolean(targetUnitId) && isRabbitholeItemActive(ann, targetUnitId, instanceKey));
             if (targetUnitId) {
                 button.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    setActiveRabbitholeUnit(regionId, targetUnitId);
+                    setActiveRabbitholeUnit(regionId, targetUnitId, instanceKey);
                 });
             } else {
                 button.disabled = true;
@@ -1404,10 +1387,10 @@ const Scanner = (() => {
         return isMeaningfulRabbitholeUnit(unit);
     }
 
-    function buildKanjiItems(ann) {
+    function buildKanjiItems(ann, instanceKey = 'side:default') {
         const rabbit = getRabbitholeData(ann);
         const units = rabbit?.units_by_id || {};
-        const kanjiSpans = getBreakdownSegments(ann, activeRabbitholeLayer)
+        const kanjiSpans = getBreakdownSegments(ann, getCardLayer(instanceKey))
             .map(segment => getUnitForSegment(rabbit, segment))
             .filter(unit => unit && unit.kind !== 'kanji')
             .flatMap(unit => (unit.children || [])
@@ -1442,14 +1425,14 @@ const Scanner = (() => {
             });
     }
 
-    function getRabbitholeBreakdown(ann, layerId = activeRabbitholeLayer) {
+    function getRabbitholeBreakdown(ann, layerId = 'words') {
         const rabbit = getRabbitholeData(ann);
         const breakdowns = rabbit?.breakdowns || {};
         if (breakdowns[layerId]) return breakdowns[layerId];
         return null;
     }
 
-    function getBreakdownSegments(ann, layerId = activeRabbitholeLayer) {
+    function getBreakdownSegments(ann, layerId = 'words') {
         return (getRabbitholeBreakdown(ann, layerId)?.segments || [])
             .filter(segment => isMeaningfulRabbitholeSegment(ann, segment));
     }
@@ -1461,16 +1444,17 @@ const Scanner = (() => {
         })));
     }
 
-    function buildRabbitholeItems(ann, layerId) {
+    function buildRabbitholeItems(ann, layerId, instanceKey = 'side:default') {
         const rabbit = getRabbitholeData(ann);
+        const activeLayer = getCardLayer(instanceKey);
         if (layerId === 'hiragana') {
-            return buildSegmentItems(ann, activeRabbitholeLayer, getSegmentHiragana);
+            return buildSegmentItems(ann, activeLayer, getSegmentHiragana);
         }
         if (layerId === 'romaji') {
-            return buildSegmentItems(ann, activeRabbitholeLayer, segment => segment.romanji || getUnitForSegment(rabbit, segment)?.reading_romanji || '');
+            return buildSegmentItems(ann, activeLayer, segment => segment.romanji || getUnitForSegment(rabbit, segment)?.reading_romanji || '');
         }
         if (layerId === 'glossary') {
-            return buildSegmentItems(ann, activeRabbitholeLayer, segment => segment.gloss || getUnitForSegment(rabbit, segment)?.primary_meaning || '');
+            return buildSegmentItems(ann, activeLayer, segment => segment.gloss || getUnitForSegment(rabbit, segment)?.primary_meaning || '');
         }
         if (layerId === 'words' || layerId === 'morphemes') return buildSegmentItems(ann, layerId);
         return [];
@@ -1498,20 +1482,20 @@ const Scanner = (() => {
         ];
     }
 
-    function createRabbitholeLayerRows(ann, compact = false) {
-        const layer = activeRabbitholeLayer;
+    function createRabbitholeLayerRows(ann, compact = false, instanceKey = 'side:default') {
+        const layer = getCardLayer(instanceKey);
         const rows = createRabbitholeBaseRows(ann, compact);
         const label = RABBITHOLE_LAYER_DEFS.find(item => item.id === layer)?.label || 'Breakdown';
 
-        rows.push(createRabbitholeUnitRow(label, ann, buildRabbitholeItems(ann, layer), compact, ann.text || ''));
-        rows.push(createRabbitholeUnitRow('Hiragana', ann, buildRabbitholeItems(ann, 'hiragana'), compact, getRabbitHiragana(getRabbitholeData(ann))));
+        rows.push(createRabbitholeUnitRow(label, ann, buildRabbitholeItems(ann, layer, instanceKey), compact, ann.text || '', '', instanceKey));
+        rows.push(createRabbitholeUnitRow('Hiragana', ann, buildRabbitholeItems(ann, 'hiragana', instanceKey), compact, getRabbitHiragana(getRabbitholeData(ann)), '', instanceKey));
 
-        const kanjiItems = buildKanjiItems(ann);
+        const kanjiItems = buildKanjiItems(ann, instanceKey);
         if (kanjiItems.length) {
-            rows.push(createRabbitholeUnitRow('Kanji', ann, kanjiItems, compact, 'No kanji units available.'));
+            rows.push(createRabbitholeUnitRow('Kanji', ann, kanjiItems, compact, 'No kanji units available.', '', instanceKey));
         }
 
-        rows.push(createRabbitholeUnitRow('Romaji', ann, buildRabbitholeItems(ann, 'romaji'), compact, getRabbitholeData(ann)?.reading_romanji || '', 'rabbithole-romanji-row'));
+        rows.push(createRabbitholeUnitRow('Romaji', ann, buildRabbitholeItems(ann, 'romaji', instanceKey), compact, getRabbitholeData(ann)?.reading_romanji || '', 'rabbithole-romanji-row', instanceKey));
         return rows;
     }
 
@@ -1638,7 +1622,7 @@ const Scanner = (() => {
         return section;
     }
 
-    function createNestedUnitsBlock(ann, rabbit, unit) {
+    function createNestedUnitsBlock(ann, rabbit, unit, instanceKey = 'side:default') {
         if (!Array.isArray(unit.children) || !unit.children.length) return null;
         const block = document.createElement('section');
         block.className = 'rabbithole-feature-section rabbithole-children';
@@ -1653,16 +1637,16 @@ const Scanner = (() => {
             chip.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                setActiveRabbitholeUnit(getAnnotationRegionId(ann), child.id);
+                setActiveRabbitholeUnit(getAnnotationRegionId(ann), child.id, instanceKey);
             });
             block.appendChild(chip);
         });
         return block.children.length > 1 ? block : null;
     }
 
-    function createRabbitholeUnitInspector(ann, compact = false) {
+    function createRabbitholeUnitInspector(ann, compact = false, instanceKey = 'side:default') {
         const rabbit = getRabbitholeData(ann);
-        const unit = getSelectedRabbitholeUnit(ann);
+        const unit = getSelectedRabbitholeUnit(ann, 0, instanceKey);
         if (!rabbit || !unit) return null;
 
         const inspector = document.createElement('div');
@@ -1680,7 +1664,7 @@ const Scanner = (() => {
         const dictionaryBlock = createDictionaryEntriesBlock(unit);
         if (dictionaryBlock) inspector.appendChild(dictionaryBlock);
 
-        const nestedBlock = createNestedUnitsBlock(ann, rabbit, unit);
+        const nestedBlock = createNestedUnitsBlock(ann, rabbit, unit, instanceKey);
         if (nestedBlock) inspector.appendChild(nestedBlock);
 
         return inspector;
@@ -1717,7 +1701,7 @@ const Scanner = (() => {
         return actions;
     }
 
-    function createRabbitholeCard(ann, index, compact = false) {
+    function createRabbitholeCard(ann, index, compact = false, instanceKey = `side:${getAnnotationRegionId(ann, index)}`) {
         const entry = document.createElement('section');
         entry.className = `rabbithole-card${compact ? ' compact' : ''}`;
         const rabbit = getRabbitholeData(ann);
@@ -1760,43 +1744,23 @@ const Scanner = (() => {
         closeBtn.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            dismissHoverboxRegion(regionId);
+            closePopupRegion(regionId);
         });
-        header.appendChild(closeBtn);
+        if (compact) header.appendChild(closeBtn);
 
         entry.appendChild(header);
 
-        entry.appendChild(createRabbitholeLayerTabs(compact));
+        entry.appendChild(createRabbitholeLayerTabs(compact, instanceKey));
 
         const grid = document.createElement('div');
         grid.className = 'rabbithole-table';
-        createRabbitholeLayerRows(ann, compact).forEach(row => grid.appendChild(row));
+        createRabbitholeLayerRows(ann, compact, instanceKey).forEach(row => grid.appendChild(row));
         entry.appendChild(grid);
 
-        const inspector = createRabbitholeUnitInspector(ann, compact);
+        const inspector = createRabbitholeUnitInspector(ann, compact, instanceKey);
         if (inspector) entry.appendChild(inspector);
 
         return entry;
-    }
-
-    function refreshOpenRabbitholeTooltips() {
-        if (!latestScan) return;
-        const annotations = latestScan.annotations || [];
-        const annotationByRegion = new Map(
-            annotations.map((ann, index) => [getAnnotationRegionId(ann, index), { ann, index }])
-        );
-        document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open').forEach(box => {
-            const regionId = String(box.dataset.regionId || '');
-            const item = annotationByRegion.get(regionId);
-            if (!item || isUncomputedAnnotation(item.ann)) return;
-            const tooltip = box.querySelector('.ocr-tooltip');
-            if (!tooltip) return;
-            const currentCard = Array.from(tooltip.children)
-                .find(child => child.classList?.contains('rabbithole-card'));
-            if (!currentCard) return;
-            currentCard.replaceWith(createRabbitholeCard(item.ann, item.index, true));
-            scheduleTooltipCollisionResolution(box, tooltip);
-        });
     }
 
     function openReaderFullscreen() {
@@ -2138,7 +2102,6 @@ const Scanner = (() => {
 
     function renderOverlays(annotations, imgNatW, imgNatH) {
         const overlay = document.getElementById('ocr-overlay');
-        const previouslyOpenRegions = captureOpenTooltipRegions();
         const panelImg = document.getElementById('scanner-panel-img');
         overlay.innerHTML = '';
 
@@ -2177,8 +2140,8 @@ const Scanner = (() => {
             const uncomputed = isUncomputedAnnotation(ann);
             const quality = uncomputed ? 'warn' : (ann.ocr_debug?.quality || qualityFromConfidence(ann.confidence));
             const regionId = String(ann.region_id ?? ann.id ?? index);
-            const isOpen = pinnedRegionIds.has(regionId) || previouslyOpenRegions.has(regionId);
-            box.className = `ocr-box ocr-quality-${quality}${uncomputed ? ' ocr-uncomputed' : ''}${pinnedRegionIds.has(regionId) ? ' pinned' : ''}${hoverSuppressedRegionIds.has(regionId) ? ' hover-suppressed' : ''}${isOpen ? ' tooltip-open' : ''}`;
+            const isOpen = openPopupRegionIds.has(regionId);
+            box.className = `ocr-box ocr-quality-${quality}${uncomputed ? ' ocr-uncomputed' : ''}${isOpen ? ' tooltip-open' : ''}`;
             box.style.cssText = `left:${left}px;top:${top}px;width:${width}px;height:${height}px`;
             box.title = uncomputed
                 ? 'Uncomputed OCR box'
@@ -2191,157 +2154,50 @@ const Scanner = (() => {
                 box.addEventListener('keydown', (e) => handleBoxKeydown(e, box, ann));
             }
 
-            const tooltip = document.createElement('div');
-            tooltip.className = 'ocr-tooltip';
-            const messageDiv = document.createElement('div');
-            messageDiv.className = 'ocr-tooltip-message';
-            messageDiv.textContent = UNCOMPUTED_TEXT;
-            const orientationBtn = document.createElement('button');
-            orientationBtn.className = 'ocr-orientation-toggle';
-            const orientation = ann.recognized_orientation || (ann.vertical ? 'vertical' : 'horizontal');
-            orientationBtn.textContent = `orientation: ${orientation} ${orientation === 'vertical' ? '↓' : '→'}`;
-            orientationBtn.hidden = !editMode;
-            orientationBtn.addEventListener('click', async (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                await handleOrientationToggle(ann);
-            });
-            const removeBtn = document.createElement('button');
-            removeBtn.className = 'ocr-remove-box';
-            removeBtn.textContent = 'Remove box';
-            removeBtn.hidden = !editMode;
-            removeBtn.addEventListener('click', async (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                await handleRemoveBox(ann);
-            });
-            const metaDiv = document.createElement('div');
-            metaDiv.className = 'ocr-tooltip-meta';
-            metaDiv.textContent = uncomputed
-                ? `UNCOMPUTED | ${orientation}`
-                : `${quality.toUpperCase()} | ${ann.ocr_variant || 'unknown'} | ${formatConfidence(ann.confidence)}`;
-            if (uncomputed) {
-                tooltip.appendChild(messageDiv);
-            } else {
-                tooltip.appendChild(createRabbitholeCard(ann, index, true));
-            }
-            tooltip.appendChild(orientationBtn);
-            tooltip.appendChild(removeBtn);
-            tooltip.appendChild(metaDiv);
-            box.appendChild(tooltip);
             box.addEventListener('click', (e) => {
                 if (editMode && e.target.classList.contains('ocr-resize-handle')) return;
                 if (e.target !== box) return;
-                if (e.target.closest('.ocr-tooltip')) return;
                 e.stopPropagation();
-                togglePinnedRegion(regionId);
-                scheduleTooltipPosition(box, tooltip);
+                togglePopupRegion(regionId);
             });
-            tooltip.addEventListener('click', (e) => e.stopPropagation());
-            tooltip.addEventListener('pointerdown', (e) => e.stopPropagation());
             box.addEventListener('pointerenter', () => setActiveHoverBubble(regionId));
             box.addEventListener('pointerleave', () => {
-                if (pinnedRegionIds.has(regionId)) return;
                 setActiveHoverBubble(null, regionId);
-            });
-            tooltip.addEventListener('pointerenter', () => setActiveHoverBubble(regionId));
-            tooltip.addEventListener('pointerleave', (e) => {
-                const next = e.relatedTarget;
-                if (next && box.contains(next)) return;
-                if (pinnedRegionIds.has(regionId)) return;
-                scheduleHoverClose(regionId);
             });
 
             frag.appendChild(box);
         });
 
         overlay.appendChild(frag);
-        requestAnimationFrame(() => {
-            const bounds = document.querySelector('.reader-shell') || overlay;
-            const boundsRect = bounds?.getBoundingClientRect();
-            if (!boundsRect) return;
-            document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open .ocr-tooltip').forEach(tooltip => {
-                const box = tooltip.closest('.ocr-box');
-                if (!box) return;
-                tooltip.style.visibility = 'hidden';
-                if (!restoreTooltipPosition(box, tooltip, overlay, boundsRect)) {
-                    positionTooltipWithinImage(box, tooltip, { keepHorizontal: true });
-                } else {
-                    tooltip.style.visibility = '';
-                }
-            });
-            collectOpenTooltipEntries(boundsRect)
-                .forEach(entry => repositionTooltipIfNeeded(entry.box, entry.tooltip));
-        });
+        requestAnimationFrame(renderOpenPopups);
     }
 
-    function scheduleHoverClose(regionId, delayMs = 140) {
-        cancelHoverClose(regionId);
+    function togglePopupRegion(regionId) {
         const key = String(regionId);
-        const timerId = window.setTimeout(() => {
-            hoverCloseTimers.delete(key);
-            if (pinnedRegionIds.has(key)) return;
-            closeHoverboxRegion(key);
-            clearHoverSuppressedRegion(key);
-        }, delayMs);
-        hoverCloseTimers.set(key, timerId);
-    }
-
-    function cancelHoverClose(regionId) {
-        const key = String(regionId);
-        const timerId = hoverCloseTimers.get(key);
-        if (timerId == null) return;
-        window.clearTimeout(timerId);
-        hoverCloseTimers.delete(key);
-    }
-
-    function togglePinnedRegion(regionId) {
-        const nextRegionId = String(regionId);
-        if (pinnedRegionIds.has(nextRegionId)) {
-            pinnedRegionIds.delete(nextRegionId);
-            hoverSuppressedRegionIds.add(nextRegionId);
-            scheduleHoverClose(nextRegionId, 0);
-        } else {
-            pinnedRegionIds.add(nextRegionId);
-            hoverSuppressedRegionIds.delete(nextRegionId);
-            cancelHoverClose(nextRegionId);
-            setActiveHoverBubble(nextRegionId);
+        if (openPopupRegionIds.has(key)) {
+            closePopupRegion(key);
+            return;
         }
-        const overlay = document.getElementById('ocr-overlay');
-        overlay?.classList.toggle('has-pinned-tooltip', pinnedRegionIds.size > 0);
-        document.querySelectorAll('#ocr-overlay .ocr-box').forEach(box => {
-            const currentRegionId = String(box.dataset.regionId);
-            box.classList.toggle('pinned', pinnedRegionIds.has(currentRegionId));
-            box.classList.toggle('hover-suppressed', hoverSuppressedRegionIds.has(currentRegionId));
-            if (pinnedRegionIds.has(currentRegionId)) {
-                box.classList.add('tooltip-open');
-            }
-        });
+        openPopupRegionIds.add(key);
+        popupOpenOrder = popupOpenOrder.filter(item => item !== key);
+        popupOpenOrder.push(key);
+        while (popupOpenOrder.length > MAX_OPEN_POPUPS) {
+            closePopupRegion(popupOpenOrder[0], { render: false });
+        }
+        setActiveHoverBubble(key);
+        renderOpenPopups();
     }
 
-    function dismissHoverboxRegion(regionId) {
-        const nextRegionId = String(regionId);
-        cancelHoverClose(nextRegionId);
-        pinnedRegionIds.delete(nextRegionId);
-        hoverSuppressedRegionIds.add(nextRegionId);
-        closeHoverboxRegion(nextRegionId);
-        const overlay = document.getElementById('ocr-overlay');
-        overlay?.classList.toggle('has-pinned-tooltip', pinnedRegionIds.size > 0);
-        document.querySelectorAll('#ocr-overlay .ocr-box').forEach(box => {
-            const currentRegionId = String(box.dataset.regionId);
-            box.classList.toggle('pinned', pinnedRegionIds.has(currentRegionId));
-            box.classList.toggle('hover-suppressed', hoverSuppressedRegionIds.has(currentRegionId));
-        });
-    }
-
-    function closeHoverboxRegion(regionId) {
+    function closePopupRegion(regionId, options = {}) {
         const key = String(regionId);
-        tooltipHorizontalByRegion.delete(key);
-        tooltipPositionByRegion.delete(key);
+        openPopupRegionIds.delete(key);
+        popupOpenOrder = popupOpenOrder.filter(item => item !== key);
+        popupPositionsByRegion.delete(key);
         setActiveHoverBubble(null, key);
         document
             .querySelector(`#ocr-overlay .ocr-box[data-region-id="${CSS.escape(key)}"]`)
             ?.classList.remove('tooltip-open');
+        if (options.render !== false) renderOpenPopups();
     }
 
     function setActiveHoverBubble(regionId, closingRegionId = null) {
@@ -2357,68 +2213,58 @@ const Scanner = (() => {
         });
     }
 
-    function clearHoverSuppressedRegion(regionId) {
-        const nextRegionId = String(regionId);
-        if (!hoverSuppressedRegionIds.has(nextRegionId)) return;
-        hoverSuppressedRegionIds.delete(nextRegionId);
-        document
-            .querySelector(`#ocr-overlay .ocr-box[data-region-id="${CSS.escape(nextRegionId)}"]`)
-            ?.classList.remove('hover-suppressed');
-    }
-
-    function scheduleTooltipPosition(box, tooltip, options = {}) {
-        requestAnimationFrame(() => positionTooltipWithinImage(box, tooltip, options));
-    }
-
-    function scheduleTooltipCollisionResolution(box, tooltip, options = {}) {
-        requestAnimationFrame(() => repositionTooltipIfNeeded(box, tooltip, options));
-    }
-
-    function rememberTooltipPosition(box, tooltip, boundsRect) {
-        const regionId = String(box.dataset.regionId || '');
-        if (!regionId) return;
-        const rect = elementRectWithinBounds(tooltip, boundsRect);
-        if (!rect) return;
-        tooltipHorizontalByRegion.set(regionId, rect.left);
-        tooltipPositionByRegion.set(regionId, { left: rect.left, top: rect.top });
-    }
-
-    function getOtherOpenTooltipRects(boundsRect, sourceTooltip) {
-        return Array.from(document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open .ocr-tooltip'))
-            .filter(tooltip => tooltip !== sourceTooltip && tooltip.isConnected)
-            .map(tooltip => elementRectWithinBounds(tooltip, boundsRect))
-            .filter(Boolean);
-    }
-
-    function tooltipNeedsReposition(box, tooltip, boundsRect, margin = 16) {
-        const rect = elementRectWithinBounds(tooltip, boundsRect);
-        if (!rect) return false;
-        if (
-            rect.left < margin ||
-            rect.top < margin ||
-            rect.right > boundsRect.width - margin ||
-            rect.bottom > boundsRect.height - margin
-        ) {
-            return true;
-        }
-        const boxRect = elementRectWithinBounds(box, boundsRect);
-        if (boxRect && rectsOverlap(rect, boxRect)) return true;
-        return getOtherOpenTooltipRects(boundsRect, tooltip)
-            .some(otherRect => rectsOverlap(rect, otherRect));
-    }
-
-    function repositionTooltipIfNeeded(box, tooltip, options = {}) {
+    function renderOpenPopups() {
+        const layer = document.getElementById('ocr-popup-layer');
+        const wrapper = document.getElementById('reader-panel-wrapper');
         const overlay = document.getElementById('ocr-overlay');
-        const bounds = document.querySelector('.reader-shell') || overlay;
-        if (!overlay || !bounds || !box?.isConnected || !tooltip?.isConnected) return;
-        if (getComputedStyle(tooltip).display === 'none') return;
-        const boundsRect = bounds.getBoundingClientRect();
-        if (!boundsRect.width || !boundsRect.height) return;
-        if (tooltipNeedsReposition(box, tooltip, boundsRect)) {
-            positionTooltipWithinImage(box, tooltip, { keepHorizontal: true, ...options });
-            return;
-        }
-        rememberTooltipPosition(box, tooltip, boundsRect);
+        if (!layer || !wrapper || !overlay || !latestScan) return;
+        layer.innerHTML = '';
+        const annotations = latestScan.annotations || [];
+        const byRegion = new Map(
+            annotations.map((ann, index) => [getAnnotationRegionId(ann, index), { ann, index }])
+        );
+        openPopupRegionIds = new Set([...openPopupRegionIds].filter(regionId => byRegion.has(regionId)));
+        popupOpenOrder = popupOpenOrder.filter(regionId => openPopupRegionIds.has(regionId));
+        document.querySelectorAll('#ocr-overlay .ocr-box').forEach(box => {
+            box.classList.toggle('tooltip-open', openPopupRegionIds.has(String(box.dataset.regionId || '')));
+        });
+        popupOpenOrder.forEach(regionId => {
+            const item = byRegion.get(regionId);
+            const box = document.querySelector(`#ocr-overlay .ocr-box[data-region-id="${CSS.escape(regionId)}"]`);
+            if (!item || !box) return;
+            const popup = document.createElement('div');
+            popup.className = 'ocr-popup';
+            popup.dataset.regionId = regionId;
+            popup.addEventListener('click', e => e.stopPropagation());
+            popup.addEventListener('pointerdown', e => e.stopPropagation());
+            if (isUncomputedAnnotation(item.ann)) {
+                const closeBtn = document.createElement('button');
+                closeBtn.type = 'button';
+                closeBtn.className = 'rabbithole-close';
+                closeBtn.setAttribute('aria-label', `Close Box ${item.ann.reading_order || item.index + 1} popup`);
+                closeBtn.textContent = '×';
+                closeBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closePopupRegion(regionId);
+                });
+                popup.appendChild(closeBtn);
+                const message = document.createElement('div');
+                message.className = 'ocr-tooltip-message';
+                message.textContent = UNCOMPUTED_TEXT;
+                popup.appendChild(message);
+            } else {
+                popup.appendChild(createRabbitholeCard(item.ann, item.index, true, `popup:${regionId}`));
+                if (!item.ann.rabbithole) {
+                    const message = document.createElement('div');
+                    message.className = 'ocr-tooltip-message';
+                    message.textContent = 'Rabbithole analysis loading...';
+                    popup.appendChild(message);
+                }
+            }
+            layer.appendChild(popup);
+            positionPopupNearBox(box, popup, wrapper);
+        });
     }
 
     function rectsOverlap(a, b) {
@@ -2445,169 +2291,56 @@ const Scanner = (() => {
         };
     }
 
-    function getTooltipObstacleRects(boundsRect, sourceBox, sourceTooltip) {
-        const obstacles = [];
-
-        if (sourceBox) {
-            const rect = elementRectWithinBounds(sourceBox, boundsRect);
-            if (rect) obstacles.push(rect);
-        }
-
-        document.querySelectorAll('#ocr-overlay .ocr-tooltip').forEach(tooltip => {
-            if (tooltip === sourceTooltip || !tooltip.isConnected) return;
-            if (getComputedStyle(tooltip).display === 'none') return;
-            const rect = tooltip.getBoundingClientRect();
-            if (!rect.width || !rect.height) return;
-            obstacles.push({
-                left: rect.left - boundsRect.left,
-                top: rect.top - boundsRect.top,
-                right: rect.right - boundsRect.left,
-                bottom: rect.bottom - boundsRect.top,
-            });
-        });
-
-        return obstacles;
-    }
-
-    function positionTooltipWithinImage(box, tooltip, options = {}) {
-        const overlay = document.getElementById('ocr-overlay');
-        const bounds = document.querySelector('.reader-shell') || overlay;
-        if (!overlay || !bounds || !box.isConnected || !tooltip.isConnected) return;
-        if (getComputedStyle(tooltip).display === 'none') return;
-
-        const boundsRect = bounds.getBoundingClientRect();
+    function positionPopupNearBox(box, popup, wrapper) {
+        const boundsRect = wrapper.getBoundingClientRect();
+        const boxRect = box.getBoundingClientRect();
         if (!boundsRect.width || !boundsRect.height) return;
-
-        const margin = 16;
-        const gap = 12;
-        tooltip.style.visibility = 'hidden';
-        tooltip.style.removeProperty('left');
-        tooltip.style.removeProperty('top');
-        tooltip.style.removeProperty('right');
-        tooltip.style.removeProperty('bottom');
-        tooltip.style.removeProperty('transform');
-        tooltip.style.setProperty('--tooltip-max-width', `${Math.max(1, boundsRect.width - margin * 2)}px`);
-        tooltip.style.setProperty('--tooltip-max-height', `${Math.max(1, boundsRect.height - margin * 2)}px`);
-
-        const boxRect = box.getBoundingClientRect();
-        const tooltipRect = tooltip.getBoundingClientRect();
-        const boxLeft = boxRect.left - boundsRect.left;
-        const boxTop = boxRect.top - boundsRect.top;
-        const boxWidth = boxRect.width;
-        const boxHeight = boxRect.height;
-        const tooltipWidth = tooltipRect.width;
-        const tooltipHeight = tooltipRect.height;
-        const preferredLeft = boxLeft + (boxWidth - tooltipWidth) / 2;
-        const spaceAbove = boxTop - margin - gap;
-        const spaceBelow = boundsRect.height - (boxTop + boxHeight) - margin - gap;
-        const preferAbove = tooltipHeight <= spaceAbove || spaceAbove >= spaceBelow;
-        const obstacles = getTooltipObstacleRects(boundsRect, box, tooltip);
-        const regionId = String(box.dataset.regionId || '');
-        const lockedLeft = tooltipHorizontalByRegion.get(regionId);
-        const keepHorizontal = Boolean(options.keepHorizontal && Number.isFinite(lockedLeft));
-        let bestCandidate = { left: margin, top: margin };
-
-        if (keepHorizontal) {
-            const maxLeft = Math.max(margin, boundsRect.width - tooltipWidth - margin);
-            const fixedLeft = clamp(Number(lockedLeft), margin, maxLeft);
-            const topSeeds = [
-                { top: preferAbove ? boxTop - tooltipHeight - gap : boxTop + boxHeight + gap, rank: 0 },
-                { top: preferAbove ? boxTop + boxHeight + gap : boxTop - tooltipHeight - gap, rank: 1 },
-                { top: boxTop - tooltipHeight - gap, rank: 2 },
-                { top: boxTop + boxHeight + gap, rank: 3 },
-                { top: boxTop, rank: 4 },
-                { top: boxTop + boxHeight - tooltipHeight, rank: 5 },
-            ];
-            const scoredByTop = topSeeds.map(seed => {
-                const position = clampTooltipCandidate(fixedLeft, seed.top, tooltipWidth, tooltipHeight, boundsRect, margin);
-                const rect = {
-                    left: fixedLeft,
-                    top: position.top,
-                    right: fixedLeft + tooltipWidth,
-                    bottom: position.top + tooltipHeight,
-                };
-                const overlap = obstacles.reduce((sum, obstacle) => sum + overlapArea(rect, obstacle), 0);
-                const verticalDistance = Math.abs(position.top - seed.top);
-                return {
-                    left: fixedLeft,
-                    top: position.top,
-                    overlap,
-                    verticalDistance,
-                    rank: seed.rank,
-                };
-            });
-            scoredByTop.sort((a, b) => {
-                if (a.overlap !== b.overlap) return a.overlap - b.overlap;
-                if (a.verticalDistance !== b.verticalDistance) return a.verticalDistance - b.verticalDistance;
-                return a.rank - b.rank;
-            });
-            bestCandidate = scoredByTop[0] || bestCandidate;
-        } else {
-            const candidateSeeds = [
-                { left: preferredLeft, top: preferAbove ? boxTop - tooltipHeight - gap : boxTop + boxHeight + gap, rank: 0 },
-                { left: preferredLeft, top: preferAbove ? boxTop + boxHeight + gap : boxTop - tooltipHeight - gap, rank: 1 },
-                { left: boxLeft - tooltipWidth - gap, top: boxTop, rank: 2 },
-                { left: boxLeft + boxWidth + gap, top: boxTop, rank: 3 },
-                { left: boxLeft - tooltipWidth - gap, top: boxTop + boxHeight - tooltipHeight, rank: 4 },
-                { left: boxLeft + boxWidth + gap, top: boxTop + boxHeight - tooltipHeight, rank: 5 },
-                { left: boxLeft, top: boxTop - tooltipHeight - gap, rank: 6 },
-                { left: boxLeft + boxWidth - tooltipWidth, top: boxTop - tooltipHeight - gap, rank: 7 },
-                { left: boxLeft, top: boxTop + boxHeight + gap, rank: 8 },
-                { left: boxLeft + boxWidth - tooltipWidth, top: boxTop + boxHeight + gap, rank: 9 },
-            ];
-            const scoredCandidates = candidateSeeds.map(seed => {
-                const position = clampTooltipCandidate(seed.left, seed.top, tooltipWidth, tooltipHeight, boundsRect, margin);
-                const rect = {
-                    left: position.left,
-                    top: position.top,
-                    right: position.left + tooltipWidth,
-                    bottom: position.top + tooltipHeight,
-                };
-                const overlap = obstacles.reduce((sum, obstacle) => sum + overlapArea(rect, obstacle), 0);
-                const distance = Math.abs(position.left - preferredLeft) + Math.abs(position.top - seed.top);
-                return {
-                    ...position,
-                    overlap,
-                    distance,
-                    rank: seed.rank,
-                };
-            });
-            scoredCandidates.sort((a, b) => {
-                if (a.overlap !== b.overlap) return a.overlap - b.overlap;
-                if (a.distance !== b.distance) return a.distance - b.distance;
-                return a.rank - b.rank;
-            });
-            bestCandidate = scoredCandidates[0] || bestCandidate;
-        }
-
-        const overlayRect = overlay.getBoundingClientRect();
-        const relativeBoxLeft = boxRect.left - overlayRect.left;
-        const relativeBoxTop = boxRect.top - overlayRect.top;
-        tooltip.style.left = `${Math.round(bestCandidate.left + boundsRect.left - overlayRect.left - relativeBoxLeft)}px`;
-        tooltip.style.top = `${Math.round(bestCandidate.top + boundsRect.top - overlayRect.top - relativeBoxTop)}px`;
-        tooltip.style.bottom = 'auto';
-        tooltip.style.transform = 'none';
-        if (regionId) {
-            tooltipHorizontalByRegion.set(regionId, bestCandidate.left);
-            tooltipPositionByRegion.set(regionId, { left: bestCandidate.left, top: bestCandidate.top });
-        }
-        tooltip.style.visibility = '';
-    }
-
-    function applyTooltipPosition(box, tooltip, overlay, boundsRect, left, top) {
-        const overlayRect = overlay.getBoundingClientRect();
-        const boxRect = box.getBoundingClientRect();
-        const relativeBoxLeft = boxRect.left - overlayRect.left;
-        const relativeBoxTop = boxRect.top - overlayRect.top;
-        tooltip.style.left = `${Math.round(left + boundsRect.left - overlayRect.left - relativeBoxLeft)}px`;
-        tooltip.style.top = `${Math.round(top + boundsRect.top - overlayRect.top - relativeBoxTop)}px`;
-        tooltip.style.bottom = 'auto';
-        tooltip.style.transform = 'none';
-        const regionId = String(box.dataset.regionId || '');
-        if (regionId) {
-            tooltipHorizontalByRegion.set(regionId, left);
-            tooltipPositionByRegion.set(regionId, { left, top });
-        }
+        const margin = 12;
+        const gap = 10;
+        popup.style.visibility = 'hidden';
+        popup.style.maxWidth = `${Math.max(260, boundsRect.width - margin * 2)}px`;
+        popup.style.maxHeight = `${Math.max(220, boundsRect.height - margin * 2)}px`;
+        const popupRect = popup.getBoundingClientRect();
+        const popupWidth = popupRect.width || 360;
+        const popupHeight = popupRect.height || 260;
+        const boxBounds = {
+            left: boxRect.left - boundsRect.left,
+            top: boxRect.top - boundsRect.top,
+            right: boxRect.right - boundsRect.left,
+            bottom: boxRect.bottom - boundsRect.top,
+        };
+        const seeds = [
+            { left: boxBounds.left + (boxBounds.right - boxBounds.left - popupWidth) / 2, top: boxBounds.top - popupHeight - gap, rank: 0 },
+            { left: boxBounds.left + (boxBounds.right - boxBounds.left - popupWidth) / 2, top: boxBounds.bottom + gap, rank: 1 },
+            { left: boxBounds.right + gap, top: boxBounds.top, rank: 2 },
+            { left: boxBounds.left - popupWidth - gap, top: boxBounds.top, rank: 3 },
+        ];
+        const obstacles = Array.from(document.querySelectorAll('#ocr-popup-layer .ocr-popup'))
+            .filter(item => item !== popup)
+            .map(item => elementRectWithinBounds(item, boundsRect))
+            .filter(Boolean);
+        const scored = seeds.map(seed => {
+            const position = clampTooltipCandidate(seed.left, seed.top, popupWidth, popupHeight, boundsRect, margin);
+            const rect = {
+                left: position.left,
+                top: position.top,
+                right: position.left + popupWidth,
+                bottom: position.top + popupHeight,
+            };
+            const overlap = obstacles.reduce((sum, obstacle) => sum + overlapArea(rect, obstacle), 0);
+            const drift = Math.abs(position.left - seed.left) + Math.abs(position.top - seed.top);
+            return { ...position, overlap, drift, rank: seed.rank };
+        });
+        scored.sort((a, b) => {
+            if (a.overlap !== b.overlap) return a.overlap - b.overlap;
+            if (a.drift !== b.drift) return a.drift - b.drift;
+            return a.rank - b.rank;
+        });
+        const best = scored[0] || { left: margin, top: margin };
+        popup.style.left = `${Math.round(best.left)}px`;
+        popup.style.top = `${Math.round(best.top)}px`;
+        popup.style.visibility = '';
+        popupPositionsByRegion.set(String(box.dataset.regionId || ''), { left: best.left, top: best.top });
     }
 
     function createResizeHandle() {
@@ -2621,7 +2354,6 @@ const Scanner = (() => {
 
     function startBoxDrag(e, box, ann) {
         if (!editMode || e.button !== 0) return;
-        if (e.target.closest('.ocr-tooltip')) return;
         e.preventDefault();
         e.stopPropagation();
         const geom = getOverlayGeometry();
@@ -2718,11 +2450,9 @@ const Scanner = (() => {
         if (!ok) return;
         try {
             const data = await API.deleteRegion(selectedPanel.filename, ann.region_id);
-            clearAllHoverCloseTimers();
-            tooltipHorizontalByRegion.clear();
-            tooltipPositionByRegion.clear();
-            pinnedRegionIds = new Set();
-            hoverSuppressedRegionIds = new Set();
+            closePopupRegion(ann.region_id, { render: false });
+            rabbitholeCardStates.delete(`popup:${ann.region_id}`);
+            rabbitholeCardStates.delete(`side:${ann.region_id}`);
             applyRegionPayload(data);
             resetTranslationView();
             setDebugStatus('Box removed.');

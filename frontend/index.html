@@ -6,7 +6,6 @@
     <title>Manga Language Learner</title>
     <link rel="stylesheet" href="css/main.css">
     <link rel="stylesheet" href="css/scanner.css">
-    <link rel="stylesheet" href="css/rabbithole.css">
 </head>
 <body>
     <nav id="navbar">
@@ -14,7 +13,6 @@
         <div class="nav-links">
             <a href="#" data-page="home" class="nav-link active">Home</a>
             <a href="#" data-page="scanner" class="nav-link">Reader</a>
-            <a href="#" data-page="rabbithole" class="nav-link">Rabbithole</a>
         </div>
     </nav>
 
@@ -29,11 +27,6 @@
                         <div class="mode-icon">🔍</div>
                         <h2>Reader</h2>
                         <p>Lies Manga-Panels im Original oder mit platzierter Übersetzung.</p>
-                    </div>
-                    <div class="mode-card" data-goto="rabbithole">
-                        <div class="mode-icon">📚</div>
-                        <h2>Rabbithole</h2>
-                        <p>Lerne spielerisch Vokabeln und Grammatik direkt aus Manga-Panels.</p>
                     </div>
                 </div>
                 <!-- Ollama Home panel removed -->
@@ -78,57 +71,122 @@
                             <button class="cache-action" type="button" data-cache-kind="ocr">Clear OCR</button>
                             <button class="cache-action" type="button" data-cache-kind="translation">Clear translation</button>
                             <button class="cache-action" type="button" data-cache-kind="rabbithole">Clear Rabbithole</button>
-                            <button id="btn-clear-panel-cache" class="cache-action cache-action-danger" type="button">Clear panel caches</button>
+                            <button id="btn-clear-panel-cache" class="cache-action cache-action-danger" type="button">Clear Panel Data</button>
                         </div>
                     </section>
-                    <label title="The reader uses the MangaOCR pipeline for OCR.">
-                        <span>OCR pipeline</span>
-                        <select id="scan-ocr-engine" disabled><option value="mangaocr">MangaOCR</option></select>
-                    </label>
-                    <label title="Controls how much extra OCR work is attempted.">
-                        <span>OCR quality</span>
-                        <select id="scan-ocr-quality">
-                            <option value="balanced">Balanced</option>
-                            <option value="fast">Fast</option>
-                            <option value="deep">Deep</option>
-                        </select>
-                    </label>
-                    <label title="How strongly vertical manga text is preferred over rotated OCR candidates.">
-                        <span>Vertical preference</span>
-                        <select id="scan-vertical-preference">
-                            <option value="normal">Normal</option>
-                            <option value="strong">Strong</option>
-                            <option value="off">Off</option>
-                        </select>
-                    </label>
-                    <label title="Rotated OCR must beat unrotated OCR by this many points to win.">
-                        <span>Rotation win margin</span>
-                        <input id="scan-rotation-margin" type="number" min="0" max="60" value="15">
-                    </label>
-                    <label title="Choose the translation engine. Ollama is the default.">
-                        <span>Translation engine</span>
-                        <select id="scan-translation-engine"><option value="ollama">Ollama</option></select>
-                    </label>
-                    <label id="scan-ollama-model-field" title="Choose an installed Ollama model.">
-                        <span>Ollama model</span>
-                        <select id="scan-translation-model"><option value="">Auto</option></select>
-                    </label>
-                    <label title="Translation target language code.">
-                        <span>Target language</span>
-                        <input id="scan-target-lang" type="text" value="en">
-                    </label>
-                    <label title="Natural is best for manga; literal is closer to Japanese; learner-friendly explains more plainly.">
-                        <span>Style</span>
-                        <select id="scan-translation-style">
-                            <option value="natural">Natural manga</option>
-                            <option value="literal">Literal</option>
-                            <option value="learner">Learner-friendly</option>
-                        </select>
-                    </label>
-                    <label title="Higher values make translations more varied but less stable.">
-                        <span>Temperature</span>
-                        <input id="scan-temperature" type="number" min="0" max="1" step="0.05" value="0.1">
-                    </label>
+                    <section class="scan-options-section">
+                        <div class="scan-options-title">Detection</div>
+                        <label title="Lower values detect more candidates.">
+                            <span>Confidence</span>
+                            <input id="scan-detection-confidence" type="number" min="0.05" max="0.95" step="0.05" value="0.4">
+                        </label>
+                        <label title="Higher values keep more overlapping detector boxes.">
+                            <span>NMS</span>
+                            <input id="scan-detection-nms" type="number" min="0.05" max="0.95" step="0.05" value="0.35">
+                        </label>
+                        <label title="DBNet line mask threshold.">
+                            <span>Mask</span>
+                            <input id="scan-detection-mask" type="number" min="0.05" max="0.95" step="0.05" value="0.3">
+                        </label>
+                        <label title="DBNet box score threshold.">
+                            <span>Box</span>
+                            <input id="scan-detection-box" type="number" min="0.05" max="0.95" step="0.05" value="0.6">
+                        </label>
+                        <label title="Cap detector output before OCR. Leave empty for no cap.">
+                            <span>Max regions</span>
+                            <input id="scan-detection-max-regions" type="number" min="1" max="200" placeholder="Auto">
+                        </label>
+                    </section>
+                    <section class="scan-options-section">
+                        <div class="scan-options-title">OCR</div>
+                        <label title="Controls preprocessing breadth before MangaOCR.">
+                            <span>Quality</span>
+                            <select id="scan-ocr-quality">
+                                <option value="balanced">Balanced</option>
+                                <option value="fast">Fast</option>
+                                <option value="deep">Deep</option>
+                            </select>
+                        </label>
+                        <label title="Choose the preprocessing variants sent into MangaOCR.">
+                            <span>Preprocessing</span>
+                            <select id="scan-preprocessing-set">
+                                <option value="standard">Standard</option>
+                                <option value="fast">Fast raw</option>
+                                <option value="deep">Deep variants</option>
+                            </select>
+                        </label>
+                        <label title="How strongly vertical manga text is preferred over rotated OCR candidates.">
+                            <span>Vertical preference</span>
+                            <select id="scan-vertical-preference">
+                                <option value="normal">Normal</option>
+                                <option value="strong">Strong</option>
+                                <option value="off">Off</option>
+                            </select>
+                        </label>
+                        <label title="Rotated OCR must beat unrotated OCR by this many points to win.">
+                            <span>Rotation margin</span>
+                            <input id="scan-rotation-margin" type="number" min="0" max="60" value="15">
+                        </label>
+                        <label title="Crop scale before MangaOCR.">
+                            <span>Crop upscale</span>
+                            <input id="scan-crop-upscale" type="number" min="1" max="5" value="3">
+                        </label>
+                        <label title="Extra crop padding as a fraction of text-box size.">
+                            <span>Crop padding</span>
+                            <input id="scan-crop-padding-ratio" type="number" min="0" max="0.25" step="0.01" value="0.05">
+                        </label>
+                        <label class="scan-checkbox" title="Use dictionary plausibility when ranking OCR candidates.">
+                            <span>Semantic rerank</span>
+                            <input id="scan-semantic-rerank" type="checkbox" checked>
+                        </label>
+                        <label class="scan-checkbox" title="Try rotated crop variants for vertical text.">
+                            <span>Rotated variants</span>
+                            <input id="scan-rotated-variants" type="checkbox" checked>
+                        </label>
+                    </section>
+                    <section class="scan-options-section">
+                        <div class="scan-options-title">Bubble Allocation</div>
+                        <label title="Scale the search area used for bubble/placement estimation.">
+                            <span>Search scale</span>
+                            <input id="scan-bubble-search-scale" type="number" min="0.4" max="2.5" step="0.1" value="1">
+                        </label>
+                        <label class="scan-checkbox" title="Use seeded connected-area allocation before compact fallback.">
+                            <span>Wand allocation</span>
+                            <input id="scan-bubble-wand" type="checkbox" checked>
+                        </label>
+                        <label class="scan-checkbox" title="Reconcile overlapping bubble placement spaces across regions.">
+                            <span>Overlap reconcile</span>
+                            <input id="scan-bubble-overlap" type="checkbox" checked>
+                        </label>
+                    </section>
+                    <section class="scan-options-section">
+                        <div class="scan-options-title">Translation</div>
+                        <label title="Choose the translation engine. Ollama is the default.">
+                            <span>Engine</span>
+                            <select id="scan-translation-engine"><option value="ollama">Ollama</option></select>
+                        </label>
+                        <label id="scan-ollama-model-field" title="Choose an installed Ollama model.">
+                            <span>Ollama model</span>
+                            <select id="scan-translation-model"><option value="">Auto</option></select>
+                        </label>
+                        <label title="Translation target language code.">
+                            <span>Target language</span>
+                            <input id="scan-target-lang" type="text" value="en">
+                        </label>
+                        <label title="Natural is best for manga; literal is closer to Japanese; learner-friendly explains more plainly.">
+                            <span>Style</span>
+                            <select id="scan-translation-style">
+                                <option value="natural">Natural manga</option>
+                                <option value="literal">Literal</option>
+                                <option value="learner">Learner-friendly</option>
+                            </select>
+                        </label>
+                        <label title="Higher values make translations more varied but less stable.">
+                            <span>Temperature</span>
+                            <input id="scan-temperature" type="number" min="0" max="1" step="0.05" value="0.1">
+                        </label>
+                    </section>
+                    <button id="btn-reset-scan-settings" class="cache-action" type="button">Reset defaults</button>
                 </aside>
 
                 <div class="reader-stage">
@@ -149,6 +207,7 @@
                                 </div>
                             </div>
                             <div id="ocr-overlay" class="ocr-overlay"></div>
+                            <div id="ocr-popup-layer" class="ocr-popup-layer"></div>
                         </div>
                     </div>
                 </div>
@@ -174,42 +233,11 @@
             </div>
         </section>
 
-        <!-- Rabbithole Page -->
-        <section id="page-rabbithole" class="page">
-            <h1>Rabbithole</h1>
-            <div class="rabbithole-layout">
-                <div class="rabbithole-panel-area">
-                    <img id="rabbithole-panel-img" src="" alt="Manga Panel" loading="lazy" decoding="async">
-                    <div id="rabbithole-overlay" class="rabbithole-overlay"></div>
-                </div>
-                <div class="rabbithole-sidebar">
-                    <div class="progress-card">
-                        <h3>Fortschritt</h3>
-                        <div class="progress-bar">
-                            <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
-                        </div>
-                        <p id="progress-text">0 / 0 Wörter</p>
-                    </div>
-                    <div class="vocab-card" id="vocab-card">
-                        <h3>Vokabel</h3>
-                        <div id="vocab-japanese" class="vocab-jp"></div>
-                        <div id="vocab-reading" class="vocab-reading"></div>
-                        <div id="vocab-meaning" class="vocab-meaning hidden"></div>
-                        <button id="btn-reveal" class="btn btn-primary">Bedeutung zeigen</button>
-                        <div class="vocab-actions hidden" id="vocab-actions">
-                            <button id="btn-knew" class="btn btn-success">Wusste ich ✓</button>
-                            <button id="btn-didnt-know" class="btn btn-danger">Wusste ich nicht ✗</button>
-                        </div>
-                    </div>
-                    <button id="btn-next-panel" class="btn btn-secondary">Nächstes Panel →</button>
-                </div>
-            </div>
-        </section>
     </main>
 
     <script src="js/api.js"></script>
+    <script src="js/scanner-settings.js"></script>
     <script src="js/scanner.js"></script>
-    <script src="js/rabbithole.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>

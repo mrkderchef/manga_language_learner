@@ -283,8 +283,7 @@ body {
 /* GPU-accelerated transitions */
 .mode-card,
 .panel-thumb,
-.ocr-box,
-.progress-fill {
+.ocr-box {
     will-change: transform;
 }
 

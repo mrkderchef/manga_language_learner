@@ -18,8 +18,7 @@ def run_ocr(panel_path: Path, options: Dict | None = None, regions: List[Dict] |
 		raise RuntimeError("MangaOCR is not installed")
 	ocr_only_options = dict(options)
 	ocr_only_options["ocr_engine"] = "mangaocr"
-	ocr_only_options["translation_engine"] = ocr_only_options.get("translation_engine", "none")
-	result = manga_ocr_service.extract_and_translate(
+	result = manga_ocr_service.extract_ocr(
 		str(panel_path),
 		options=ocr_only_options,
 		regions_override=regions,

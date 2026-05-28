@@ -34,7 +34,6 @@ from services.vision.bubble_allocator import (
 
 logger = logging.getLogger(__name__)
 
-RENDERED_URL_PREFIX = "/rendered-panels"
 RENDER_METHOD = "opencv-pillow-v5"
 
 
@@ -95,7 +94,7 @@ def render_translated_panel(panel_path: Path, scan_result: dict[str, Any]) -> di
 	if output_path.exists() and _render_metadata_matches(metadata_path, cache_name):
 		panel_id = ocr_panel_slug(panel_path)
 		return {
-			"translated_image_url": f"/data/panels/{panel_id}/rendered/current.png",
+			"translated_image_url": f"/api/media/rendered/{panel_id}/current.png",
 			"render_method": RENDER_METHOD,
 			"render_warnings": [],
 		}
@@ -125,7 +124,7 @@ def render_translated_panel(panel_path: Path, scan_result: dict[str, Any]) -> di
 		metadata_path.write_text(json.dumps({"cache_name": cache_name}, sort_keys=True), encoding="utf-8")
 		panel_id = ocr_panel_slug(panel_path)
 		return {
-			"translated_image_url": f"/data/panels/{panel_id}/rendered/current.png",
+			"translated_image_url": f"/api/media/rendered/{panel_id}/current.png",
 			"render_method": RENDER_METHOD,
 			"render_warnings": warnings,
 		}

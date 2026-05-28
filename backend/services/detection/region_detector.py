@@ -1035,7 +1035,7 @@ class TextDetector:
         self.nms_thresh = nms_thresh
         self.seg_rep = SegDetectorRepresenter(thresh=0.3)
 
-    def __call__(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False):
+    def __call__(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False, options: dict | None = None):
         """
         Run the full comic-text-detector pipeline on an image.
 
@@ -1047,6 +1047,12 @@ class TextDetector:
         Returns:
             (mask, mask_refined, blk_list)
         """
+        options = options or {}
+        conf_thresh = float(options.get("confidence_threshold", self.conf_thresh))
+        nms_thresh = float(options.get("nms_threshold", self.nms_thresh))
+        mask_thresh = float(options.get("mask_threshold", _MASK_THRESH))
+        box_thresh = float(options.get("box_threshold", _BOX_THRESH))
+        seg_rep = self.seg_rep if mask_thresh == _MASK_THRESH else SegDetectorRepresenter(thresh=mask_thresh)
         img_in, ratio, dw, dh = preprocess_img(img, input_size=self.input_size)
         im_h, im_w = img.shape[:2]
 
@@ -1060,7 +1066,7 @@ class TextDetector:
         resize_ratio = (im_w / (self.input_size[0] - dw), im_h / (self.input_size[1] - dh))
 
         # Post-process block detections
-        blks = postprocess_yolo(blks, self.conf_thresh, self.nms_thresh, resize_ratio)
+        blks = postprocess_yolo(blks, conf_thresh, nms_thresh, resize_ratio)
 
         # Handle possible reversed outputs in some OpenCV versions
         if mask.shape[1] == 2:
@@ -1072,8 +1078,8 @@ class TextDetector:
         mask = postprocess_mask(mask)
 
         # Post-process text lines via DBNet SegDetectorRepresenter
-        lines, scores = self.seg_rep(self.input_size, lines_map)
-        idx = np.where(scores[0] > _BOX_THRESH)
+        lines, scores = seg_rep(self.input_size, lines_map)
+        idx = np.where(scores[0] > box_thresh)
         lines, scores = lines[0][idx], scores[0][idx]
 
         # Map outputs to input image coordinates
@@ -1120,7 +1126,7 @@ def _get_detector() -> TextDetector:
     return _detector
 
 
-def detect_text_regions(image_path: str, max_regions: int | None = None) -> list[dict]:
+def detect_text_regions(image_path: str, max_regions: int | None = None, options: dict | None = None) -> list[dict]:
     """
     Detect text regions in a manga/comic image using the full
     comic-text-detector pipeline.
@@ -1137,6 +1143,7 @@ def detect_text_regions(image_path: str, max_regions: int | None = None) -> list
     Args:
         image_path: Path to the manga panel image.
         max_regions: If set, return only the top N regions by confidence.
+        options: Optional detector thresholds for this request.
 
     Returns:
         List of dicts with keys: x, y, width, height (pixel coords).
@@ -1146,8 +1153,20 @@ def detect_text_regions(image_path: str, max_regions: int | None = None) -> list
     if img is None:
         return []
 
+    options = options or {}
+    detector_options = dict(options.get("detection") or {})
+    for key in ("confidence_threshold", "nms_threshold", "mask_threshold", "box_threshold", "max_regions"):
+        if key in options and options[key] is not None:
+            detector_options[key] = options[key]
+    max_regions = max_regions or detector_options.get("max_regions")
+
     detector = _get_detector()
-    mask, mask_refined, blk_list = detector(img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=True)
+    mask, mask_refined, blk_list = detector(
+        img,
+        refine_mode=REFINEMASK_INPAINT,
+        keep_undetected_mask=True,
+        options=detector_options,
+    )
 
     # Convert TextBlock list to region dicts
     regions = []
