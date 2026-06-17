@@ -12,7 +12,6 @@ import hashlib
 import json
 import logging
 import shutil
-import traceback
 import time
 import uuid
 from pathlib import Path
@@ -273,7 +272,11 @@ def _export_panel_metadata(panel_path: Path, state: dict) -> None:
         
         logger.debug(f"Exported panel metadata for {panel_path.name} to {metadata_file}")
     except Exception as e:
-        logger.warning(f"Could not export panel metadata for {panel_path.name}: {e}")
+        logger.warning(
+            'component=metadata panel="%s" status=failed error=%r msg="Could not export panel metadata"',
+            panel_path.name,
+            e,
+        )
 
 
 def _region_id(region: dict) -> str:
@@ -601,12 +604,10 @@ def _texts_hash(annotations: list[dict]) -> str:
 
 
 def _translation_engine(options: dict) -> str:
-    return options.get("translation_engine", "ollama")
+    return "ollama"
 
 
 def _translation_model(options: dict, resolve_auto: bool = False) -> str | None:
-    if _translation_engine(options) != "ollama":
-        return None
     selected = options.get("translation_model") or None
     if selected:
         return selected
@@ -625,6 +626,9 @@ def _translation_options_key(options: dict, annotations: list[dict]) -> str:
         "translation_style": options.get("translation_style", "natural"),
         "temperature": options.get("temperature", 0.1),
         "prompt_version": translation_engine.PROMPT_VERSION,
+        "translation_strategy": translation_engine.MANGA_DIALOGUE_STRATEGY,
+        "target_chunk_size": translation_engine.MANGA_TARGET_CHUNK_SIZE,
+        "max_context_lines": translation_engine.MANGA_CONTEXT_LINE_LIMIT,
     }
     return _json_hash(relevant)
 
@@ -650,7 +654,13 @@ def _trace(trace: list[dict], scan_id: str, stage: str, status: str, message: st
     if started_at is not None:
         event["elapsed_ms"] = int((time.perf_counter() - started_at) * 1000)
     event.update({k: v for k, v in fields.items() if v is not None})
-    logger.info("[scan:%s] %s %s - %s %s", scan_id, stage, status, message, fields or "")
+    log_fields = " ".join(
+        f'{key}="{str(value).replace(chr(34), chr(39))}"' if isinstance(value, str) else f"{key}={value}"
+        for key, value in event.items()
+        if key not in {"scan_id", "stage", "status", "message", "ts"}
+    )
+    suffix = f" {log_fields}" if log_fields else ""
+    logger.info('scan_id=%s stage=%s status=%s msg="%s"%s', scan_id, stage, status, message.replace('"', "'"), suffix)
     trace.append(event)
 
 
@@ -867,7 +877,7 @@ def _run_ocr_stage(panel_path: Path, options: dict, state: dict, trace: list[dic
         cache_bucket[cache_key] = result
         return result
     except Exception as e:
-        logger.error("OCR stage exception: %s\n%s", e, traceback.format_exc())
+        logger.exception('stage=ocr status=failed msg="OCR stage exception"')
         _trace(trace, scan_id, "ocr", "error", str(e))
         return {
             "success": False,
@@ -900,7 +910,7 @@ def _empty_translation_result(text_count: int, options: dict, error: str | None 
         "success": error is None,
         "translations": [""] * text_count,
         "translation_engine_requested": engine,
-        "translation_engine_used": None if error else engine,
+        "translation_engine_used": None if error else "ollama",
         "translation_model": _translation_model(options, resolve_auto=True),
         "translation_target_lang": options.get("target_lang", "en"),
         "translation_style": options.get("translation_style", "natural"),
@@ -911,14 +921,56 @@ def _empty_translation_result(text_count: int, options: dict, error: str | None 
     }
 
 
+def _compact_bbox(bbox: list | tuple | None) -> dict | None:
+    if not bbox:
+        return None
+    try:
+        if len(bbox) == 4 and all(isinstance(item, (int, float)) for item in bbox):
+            x, y, width, height = bbox
+            return {"x": int(x), "y": int(y), "width": int(width), "height": int(height)}
+        points = [
+            (float(point[0]), float(point[1]))
+            for point in bbox
+            if isinstance(point, (list, tuple)) and len(point) >= 2
+        ]
+        if not points:
+            return None
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        return {
+            "x": int(round(min_x)),
+            "y": int(round(min_y)),
+            "width": int(round(max_x - min_x)),
+            "height": int(round(max_y - min_y)),
+        }
+    except Exception:
+        return None
+
+
+def _translation_context_unit(annotation: dict, annotation_index: int) -> dict:
+    region_id = annotation.get("region_id") or annotation.get("id") or f"ann_{annotation_index + 1:04d}"
+    return {
+        "region_id": str(region_id),
+        "index": annotation_index,
+        "text": annotation.get("text", ""),
+        "reading_order": annotation.get("reading_order") or annotation_index + 1,
+        "orientation": annotation.get("recognized_orientation") or ("vertical" if annotation.get("vertical") else "horizontal"),
+        "vertical": bool(annotation.get("vertical")),
+        "box": _compact_bbox(annotation.get("bbox")),
+    }
+
+
 def _run_translation_stage(ocr_result: dict, options: dict, state: dict, trace: list[dict], scan_id: str) -> tuple[dict, str | None, bool]:
     annotations = ocr_result.get("annotations", []) or []
-    indexed_texts = [
-        (index, ann.get("text", ""))
+    indexed_units = [
+        (index, _translation_context_unit(ann, index))
         for index, ann in enumerate(annotations)
         if ann.get("computed", True) and ann.get("text")
     ]
-    texts = [text for _, text in indexed_texts]
+    texts = [unit["text"] for _, unit in indexed_units]
+    context_units = [unit for _, unit in indexed_units]
     engine = _translation_engine(options)
     model = _translation_model(options, resolve_auto=True)
     requested_model = _translation_model(options, resolve_auto=False)
@@ -947,6 +999,9 @@ def _run_translation_stage(ocr_result: dict, options: dict, state: dict, trace: 
         "style": options.get("translation_style", "natural"),
         "temperature": float(options.get("temperature", 0.1)),
         "texts": texts,
+        "strategy": translation_engine.MANGA_DIALOGUE_STRATEGY,
+        "target_chunk_size": translation_engine.MANGA_TARGET_CHUNK_SIZE,
+        "max_context_lines": translation_engine.MANGA_CONTEXT_LINE_LIMIT,
     }
 
     _trace(
@@ -968,9 +1023,10 @@ def _run_translation_stage(ocr_result: dict, options: dict, state: dict, trace: 
             model=requested_model,
             style=options.get("translation_style", "natural"),
             temperature=float(options.get("temperature", 0.1)),
+            context_units=context_units,
         )
         expanded = [""] * len(annotations)
-        for (annotation_index, _text), translated in zip(indexed_texts, result.get("translations", [])):
+        for (annotation_index, _unit), translated in zip(indexed_units, result.get("translations", [])):
             expanded[annotation_index] = translated
         result["translations"] = expanded
         result["translation_prompt_payload"] = result.get("translation_prompt_payload") or prompt_payload
@@ -1320,7 +1376,7 @@ async def upload_panel(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload failed: {e}")
+        logger.exception('component=upload status=failed msg="Upload failed"')
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -1336,12 +1392,16 @@ async def scan_panel(filename: str, options: ScanOptions | None = None):
         opts = _scan_options_dict(options)
         result = await asyncio.get_event_loop().run_in_executor(None, _run_ocr, panel_path, opts)
     except Exception as e:
-        logger.error(f"OCR failed for {filename}: {e}\n{traceback.format_exc()}")
+        logger.exception('panel="%s" stage=ocr status=failed msg="OCR request failed"', filename)
         raise HTTPException(status_code=500, detail=f"OCR processing error: {e}")
 
     if result and result.get("success"):
         return result
-    raise HTTPException(status_code=503, detail=(result or {}).get("error", "OCR engine unavailable"))
+    error = (result or {}).get("error", "OCR engine unavailable")
+    raise HTTPException(
+        status_code=503,
+        detail=f"OCR unavailable: {error}. Check Runtime in settings and download OCR assets if needed.",
+    )
 
 
 @router.post("/{filename}/rabbithole")
@@ -1355,7 +1415,7 @@ async def build_rabbithole(filename: str, options: ScanOptions | None = None):
         opts = _scan_options_dict(options)
         result = await asyncio.get_event_loop().run_in_executor(None, _run_rabbithole_existing, panel_path, opts)
     except Exception as e:
-        logger.error(f"Rabbithole failed for {filename}: {e}\n{traceback.format_exc()}")
+        logger.exception('panel="%s" stage=rabbithole status=failed msg="Rabbithole request failed"', filename)
         raise HTTPException(status_code=500, detail=f"Rabbithole processing error: {e}")
 
     if result and result.get("success"):
@@ -1374,7 +1434,7 @@ async def translate_panel(filename: str, options: ScanOptions | None = None):
         opts = _scan_options_dict(options)
         result = await asyncio.get_event_loop().run_in_executor(None, _run_translate_existing, panel_path, opts)
     except Exception as e:
-        logger.error(f"Translate failed for {filename}: {e}\n{traceback.format_exc()}")
+        logger.exception('panel="%s" stage=translation status=failed msg="Translate request failed"', filename)
         raise HTTPException(status_code=500, detail=f"Translation processing error: {e}")
 
     if result and result.get("success"):

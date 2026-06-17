@@ -1,12 +1,13 @@
+from contextlib import asynccontextmanager
+import logging
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-import logging
-from pathlib import Path
 from PIL import Image
-import io
 from config import (
     API_HOST,
     API_PORT,
@@ -17,31 +18,45 @@ from config import (
     UPLOADS_DIR,
     PANEL_DATA_DIR,
 )
-from services.bootstrap import ensure_runtime_assets
+from services.logging_config import RequestLoggingMiddleware, configure_logging
+
+configure_logging()
+
+from services.bootstrap import check_runtime_status
 from services.storage.image_service import ImageService
+from routes.runtime import router as runtime_router
 from routes.scanner import router as scanner_router
 from routes.rabbithole import router as rabbithole_router
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 FRONTEND_DIR = BASE_DIR / "frontend"
 THUMB_CACHE_DIR = BASE_DIR / "backend" / "data" / "thumbs"
 THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    status = check_runtime_status()
+    logger.info(
+        'component=app status=startup ocr_ready=%s ollama_ready=%s warnings=%s msg="Backend startup check completed"',
+        status.get("ocr", {}).get("ready"),
+        status.get("ollama", {}).get("available"),
+        len(status.get("warnings", []) or []),
+    )
+    yield
+
+
 app = FastAPI(
     title=API_TITLE,
     version=API_VERSION,
-    description="Manga Language Learner - Learn Japanese through manga panels"
+    description="Manga Language Learner - Learn Japanese through manga panels",
+    lifespan=lifespan,
 )
 
 # GZip compression for all responses > 500 bytes
 app.add_middleware(GZipMiddleware, minimum_size=500)
+app.add_middleware(RequestLoggingMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,6 +72,7 @@ app.add_middleware(
 )
 
 # Routes
+app.include_router(runtime_router)
 app.include_router(scanner_router)
 app.include_router(rabbithole_router)
 
@@ -64,13 +80,6 @@ app.include_router(rabbithole_router)
 app.mount("/css", StaticFiles(directory=str(FRONTEND_DIR / "css")), name="css")
 app.mount("/js", StaticFiles(directory=str(FRONTEND_DIR / "js")), name="js")
 app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR / "assets")), name="assets")
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    status = ensure_runtime_assets()
-    logger.info("Startup assets ready: %s", status)
-
 
 def _is_relative_to(path: Path, root: Path) -> bool:
     try:
@@ -148,4 +157,4 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host=API_HOST, port=API_PORT, reload=True)
+    uvicorn.run("app:app", host=API_HOST, port=API_PORT, reload=True, access_log=False, log_config=None)

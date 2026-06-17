@@ -49,6 +49,7 @@ const Scanner = (() => {
     let engineControlsLoaded = false;
     let latestCacheStatus = null;
     let lastScannedOcrFingerprint = null;
+    let runtimeDownloadRunning = false;
     let activeDebugTab = 'rabbithole';
     let activeVisionOverlay = 'none';
     const DEBUG_PANEL_DEFAULT_WIDTH = 620;
@@ -88,6 +89,8 @@ const Scanner = (() => {
             btn.addEventListener('click', () => handleCacheClear(btn.dataset.cacheKind));
         });
         document.getElementById('btn-reset-scan-settings')?.addEventListener('click', resetScanSettings);
+        document.getElementById('btn-refresh-runtime')?.addEventListener('click', () => refreshRuntimeStatus());
+        document.getElementById('btn-download-ocr-assets')?.addEventListener('click', downloadOcrAssets);
         // Home Ollama controls removed
         document.getElementById('translation-slider').addEventListener('input', (e) => {
             setTranslationReveal(Number(e.target.value));
@@ -243,7 +246,10 @@ const Scanner = (() => {
         }
         panel.classList.toggle('hidden', !nextOpen);
         btn.setAttribute('aria-expanded', String(nextOpen));
-        if (nextOpen) await loadEngineControls();
+        if (nextOpen) {
+            await loadEngineControls();
+            await refreshRuntimeStatus();
+        }
     }
 
     function getScanOptions() {
@@ -254,6 +260,88 @@ const Scanner = (() => {
         ScannerSettings.reset();
         updateTranslationModelVisibility();
         markScanSettingsChanged();
+    }
+
+    function setRuntimeRow(id, available, value, detail = '') {
+        const row = document.getElementById(id);
+        if (!row) return;
+        row.classList.toggle('runtime-ready', Boolean(available));
+        row.classList.toggle('runtime-missing', !available);
+        row.querySelector('.runtime-status-value').textContent = value;
+        row.title = detail || value;
+    }
+
+    function renderRuntimeStatus(status, error = null) {
+        const note = document.getElementById('runtime-status-note');
+        const downloadBtn = document.getElementById('btn-download-ocr-assets');
+        if (error || !status) {
+            setRuntimeRow('runtime-mangaocr-package', false, 'Unknown');
+            setRuntimeRow('runtime-mangaocr-cache', false, 'Unknown');
+            setRuntimeRow('runtime-detector', false, 'Unknown');
+            setRuntimeRow('runtime-ollama', false, 'Unknown');
+            if (note) note.textContent = error ? `Runtime check failed: ${error.message}` : 'Runtime status unavailable.';
+            if (downloadBtn) downloadBtn.disabled = runtimeDownloadRunning;
+            return;
+        }
+
+        const ocr = status.ocr || {};
+        const pkg = ocr.package || {};
+        const cache = ocr.mangaocr_cache || {};
+        const detector = ocr.detector || {};
+        const ollama = status.ollama || {};
+
+        setRuntimeRow('runtime-mangaocr-package', pkg.available, pkg.available ? 'Ready' : 'Missing', pkg.error);
+        setRuntimeRow('runtime-mangaocr-cache', cache.available, cache.available ? 'Ready' : 'Missing', cache.error);
+        setRuntimeRow('runtime-detector', detector.available, detector.available ? 'Ready' : 'Missing', detector.error);
+        setRuntimeRow(
+            'runtime-ollama',
+            ollama.available,
+            ollama.available ? 'Ready' : (ollama.reachable ? 'Model missing' : 'Offline'),
+            ollama.error || ollama.configured_model || ''
+        );
+
+        if (downloadBtn) {
+            downloadBtn.disabled = runtimeDownloadRunning || !pkg.available;
+        }
+        if (note) {
+            const warnings = status.warnings || [];
+            note.textContent = warnings.length ? warnings.join(' · ') : 'Runtime ready.';
+        }
+    }
+
+    async function refreshRuntimeStatus() {
+        const note = document.getElementById('runtime-status-note');
+        if (note && !runtimeDownloadRunning) note.textContent = 'Checking runtime...';
+        try {
+            const status = await API.getRuntimeStatus(true);
+            renderRuntimeStatus(status);
+        } catch (err) {
+            renderRuntimeStatus(null, err);
+        }
+    }
+
+    async function downloadOcrAssets() {
+        const btn = document.getElementById('btn-download-ocr-assets');
+        const note = document.getElementById('runtime-status-note');
+        runtimeDownloadRunning = true;
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Downloading...';
+        }
+        if (note) note.textContent = 'Downloading OCR assets...';
+        try {
+            const status = await API.downloadOcrAssets();
+            renderRuntimeStatus(status);
+        } catch (err) {
+            renderRuntimeStatus(null, err);
+        } finally {
+            runtimeDownloadRunning = false;
+            if (btn) {
+                btn.textContent = 'Download OCR assets';
+                btn.disabled = false;
+            }
+            await refreshRuntimeStatus();
+        }
     }
 
     function getOcrFingerprint() {

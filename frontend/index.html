@@ -74,6 +74,36 @@
                             <button id="btn-clear-panel-cache" class="cache-action cache-action-danger" type="button">Clear Panel Data</button>
                         </div>
                     </section>
+                    <section class="scan-options-section runtime-options-section">
+                        <div class="scan-options-title">Runtime</div>
+                        <div id="runtime-status-list" class="runtime-status-list">
+                            <div id="runtime-mangaocr-package" class="runtime-status-row">
+                                <span class="runtime-status-dot"></span>
+                                <span class="runtime-status-name">MangaOCR package</span>
+                                <span class="runtime-status-value">Checking...</span>
+                            </div>
+                            <div id="runtime-mangaocr-cache" class="runtime-status-row">
+                                <span class="runtime-status-dot"></span>
+                                <span class="runtime-status-name">MangaOCR model</span>
+                                <span class="runtime-status-value">Checking...</span>
+                            </div>
+                            <div id="runtime-detector" class="runtime-status-row">
+                                <span class="runtime-status-dot"></span>
+                                <span class="runtime-status-name">Text detector</span>
+                                <span class="runtime-status-value">Checking...</span>
+                            </div>
+                            <div id="runtime-ollama" class="runtime-status-row">
+                                <span class="runtime-status-dot"></span>
+                                <span class="runtime-status-name">Ollama model</span>
+                                <span class="runtime-status-value">Checking...</span>
+                            </div>
+                        </div>
+                        <div class="runtime-actions">
+                            <button id="btn-refresh-runtime" class="cache-action" type="button">Refresh</button>
+                            <button id="btn-download-ocr-assets" class="cache-action" type="button">Download OCR assets</button>
+                        </div>
+                        <div id="runtime-status-note" class="runtime-status-note">Runtime status not checked yet.</div>
+                    </section>
                     <section class="scan-options-section">
                         <div class="scan-options-title">Detection</div>
                         <label title="Lower values detect more candidates.">
@@ -161,11 +191,11 @@
                     </section>
                     <section class="scan-options-section">
                         <div class="scan-options-title">Translation</div>
-                        <label title="Choose the translation engine. Ollama is the default.">
+                        <label title="Translation runs locally through Ollama. Sugoi is recommended.">
                             <span>Engine</span>
                             <select id="scan-translation-engine"><option value="ollama">Ollama</option></select>
                         </label>
-                        <label id="scan-ollama-model-field" title="Choose an installed Ollama model.">
+                        <label id="scan-ollama-model-field" title="Choose an installed Ollama model. Sugoi is recommended for manga dialogue.">
                             <span>Ollama model</span>
                             <select id="scan-translation-model"><option value="">Auto</option></select>
                         </label>

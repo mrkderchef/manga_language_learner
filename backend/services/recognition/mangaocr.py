@@ -9,6 +9,7 @@ import logging
 import re
 import hashlib
 import json
+import importlib.util
 from pathlib import Path
 
 import cv2
@@ -660,7 +661,10 @@ def extract_ocr(image_path: str, options: dict | None = None, regions_override: 
 	# Step 1: Detect text regions with comic-text-detector, unless the caller
 	# provides panel-state regions with manual overrides already applied.
 	regions = _sort_regions_reading_order(regions_override or detect_text_regions(image_path, options=options))
-	logger.info(f"manga-ocr pipeline: {len(regions)} text regions detected")
+	logger.info(
+		'component=mangaocr stage=detection status=done regions=%s msg="Text regions detected"',
+		len(regions),
+	)
 
 	if not regions:
 		return {
@@ -741,7 +745,11 @@ def extract_ocr(image_path: str, options: dict | None = None, regions_override: 
 	recognized_texts = [entry["text"] for entry in recognized_entries]
 	valid_regions = [entry["region"] for entry in recognized_entries]
 
-	logger.info(f"manga-ocr recognized text in {len(recognized_texts)}/{len(regions)} regions")
+	logger.info(
+		'component=mangaocr stage=recognition status=done recognized=%s regions=%s msg="Text recognition completed"',
+		len(recognized_texts),
+		len(regions),
+	)
 
 	# Step 3: Build OCR-only response
 	annotations = []
@@ -810,11 +818,7 @@ def extract_ocr(image_path: str, options: dict | None = None, regions_override: 
 
 
 def is_available() -> bool:
-	"""Check if manga-ocr can be loaded."""
-	try:
-		from manga_ocr import MangaOcr  # noqa: F401
-		return True
-	except ImportError:
-		return False
+	"""Check if manga-ocr is installed without importing the model package."""
+	return importlib.util.find_spec("manga_ocr") is not None
 
 __all__ = ['extract_ocr', 'is_available']

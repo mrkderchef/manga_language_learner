@@ -26,7 +26,7 @@ manga_language_learner/
 |   `-- services/
 |       |-- detection/         ONNX-based text region boundary detection
 |       |-- recognition/       MangaOCR crop preprocessing and OCR execution
-|       |-- translation/       Ollama/Gemini translation backends
+|       |-- translation/       Ollama translation backend
 |       `-- rabbithole/        NLP tokenization, glossing, and dictionary lookups
 |-- frontend/                 Vanilla HTML/CSS/JS frontend
 |-- panels/                   Manga images (synthetic tests & uploads)
@@ -65,9 +65,9 @@ backend/data/
 | MangaOCR | active | Primary Japanese manga OCR (HuggingFace-based, runs locally) |
 | Preprocessing | active | Crop upscaling, contrast scaling, denoising, adaptive thresholding |
 | Reader Rabbithole | active | Builds dictionary, reading, kanji, and segmentation data from OCR text |
-| Sugoi Translation Model | active/default | Primary translation model: provides smooth, fluent dialogue translation |
-| Ollama Text (llama3.1) | active | Fallback translation model |
-| Gemini | optional | Highly capable remote translation fallback |
+| MangaOCR-only OCR | active | The only OCR path; all recognition preprocessing is tailored to MangaOCR |
+| Ollama Translation Service | active/default | The only translation service; runs locally or on a configured Ollama host |
+| Sugoi Translation Model | recommended/default | Recommended Ollama model for manga dialogue translation |
 
 ## Reader Flow
 
@@ -103,28 +103,36 @@ python -m venv .venv
 # source .venv/bin/activate
 
 # Install dependencies
-pip install -r backend/requirements.txt
+pip install -r requirements.txt
 
 # Prepare config
 cp .env.example .env
 # Windows PowerShell: Copy-Item .env.example .env
 
 # Run FastAPI server
-cd backend
-python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
+./run_backend.sh
+# or:
+# cd backend
+# python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload --no-access-log
 ```
 
 The UI will be accessible at: `http://localhost:8000`
 
 ### 2. Configure Translation (Ollama)
 
-Translations run locally via Ollama by default. You can run Ollama on your machine or connect to a remote GPU host.
+Translations run through Ollama only. Sugoi is the recommended default model because the manga dialogue payload is tuned for it, but any installed Ollama text model can be selected.
 
-Required models:
+Install/start Ollama locally or on a remote GPU host:
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve
+```
+
+Recommended model:
 
 ```bash
 ollama pull hf.co/sugoitoolkit/Sugoi-14B-Ultra-GGUF:Q4_K_M
-ollama pull llama3.1:8b  # Fallback translation model
 ```
 
 If connecting to a remote host:
@@ -142,20 +150,15 @@ API_HOST=0.0.0.0
 API_PORT=8000
 
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-# Translation model (MangaOCR handles text recognition locally)
+# Default Ollama translation model. Sugoi is recommended for manga dialogue.
 OLLAMA_TEXT_MODEL=hf.co/sugoitoolkit/Sugoi-14B-Ultra-GGUF:Q4_K_M
-
-# Optional external integrations
-GEMINI_API_KEY=optional
-GOOGLE_APPLICATION_CREDENTIALS=optional
-GOOGLE_PROJECT_ID=optional
 
 # Dictionary and rendering dependencies
 KANJIAPI_BASE_URL=https://kanjiapi.dev/v1
 RENDER_FONT_PATH=optional/path/to/font.ttf
 ```
 
-> **Note:** The backend automatically ensures that necessary model caches (like the text-detector ONNX model and the `kha-white/manga-ocr-base` HuggingFace snapshot) are present during startup.
+> **Note:** Startup checks runtime readiness but does not download large assets. The Reader settings panel shows MangaOCR, detector, and Ollama status. Use **Download OCR assets** there, or call `POST /api/runtime/ocr-assets/download`, to fetch the MangaOCR snapshot and detector ONNX model.
 
 ## API Overview
 
@@ -176,6 +179,10 @@ DELETE /api/scanner/{filename}/regions/{region_id}
 GET    /api/scanner/translation-engines
 GET    /api/scanner/ollama/models
 
+# Runtime Health
+GET    /api/runtime/status
+POST   /api/runtime/ocr-assets/download
+
 # Validated Media
 GET    /api/media/panel/{filename}
 GET    /api/thumb/{filename}?size=160
@@ -195,7 +202,7 @@ GET    /api/rabbithole/reading/{reading}
 - **Detection & Vision:** ONNX, OpenCV DNN, Pillow, NumPy
 - **OCR:** MangaOCR (with heavily optimized crop-preprocessing)
 - **Geometry Processing:** Shapely, pyclipper
-- **Translation:** Ollama (default), Gemini (optional)
+- **Translation:** Ollama only; Sugoi is the recommended default model
 - **Frontend:** Vanilla HTML/CSS/JS with modular components
 
 ## Tests

@@ -56,12 +56,8 @@ done
 
 # 3. Modelle herunterladen
 echo ""
-echo "[*] Lade Text-Modell für Übersetzungen..."
+echo "[*] Lade empfohlenes Sugoi-Modell für Ollama-Übersetzungen..."
 ollama pull hf.co/sugoitoolkit/Sugoi-14B-Ultra-GGUF:Q4_K_M
-
-echo ""
-echo "[*] Lade Fallback Text-Modell..."
-ollama pull llama3.1:8b
 
 # 4. Verfügbare Modelle anzeigen
 echo ""

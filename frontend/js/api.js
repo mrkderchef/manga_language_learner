@@ -143,6 +143,18 @@ const API = (() => {
             return request('/api/scanner/ollama/models');
         },
 
+        getRuntimeStatus(force = false) {
+            const suffix = force ? `?t=${Date.now()}` : '';
+            return request(`/api/runtime/status${suffix}`);
+        },
+
+        downloadOcrAssets() {
+            return request('/api/runtime/ocr-assets/download', { method: 'POST' }).then(data => {
+                invalidateCache('/api/runtime/status');
+                return data;
+            });
+        },
+
         overrideRegion(filename, regionId, data) {
             return request(`/api/scanner/${filename}/regions/${regionId}/override`, {
                 method: 'POST',

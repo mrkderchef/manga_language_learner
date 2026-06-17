@@ -23,13 +23,6 @@ def _env(name: str, default: str = "") -> str:
 	return os.getenv(name, default)
 
 
-def _env_configured(name: str, default: str = "", placeholders: set[str] | None = None) -> str:
-	value = _env(name, default).strip()
-	if placeholders and value.lower() in {placeholder.lower() for placeholder in placeholders}:
-		return ""
-	return value
-
-
 def _env_int(name: str, default: int) -> int:
 	value = os.getenv(name)
 	if value is None or value.strip() == "":
@@ -58,9 +51,6 @@ class Paths:
 
 @dataclass(frozen=True)
 class Services:
-	google_application_credentials: str = _env_configured("GOOGLE_APPLICATION_CREDENTIALS", "", {"path/to/your/credentials.json"})
-	google_project_id: str = _env_configured("GOOGLE_PROJECT_ID", "", {"your-project-id"})
-	gemini_api_key: str = _env_configured("GEMINI_API_KEY", "", {"your-gemini-api-key"})
 	ollama_base_url: str = _env("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 	ollama_text_model: str = _env("OLLAMA_TEXT_MODEL", "hf.co/sugoitoolkit/Sugoi-14B-Ultra-GGUF:Q4_K_M")
 	kanjiapi_base_url: str = _env("KANJIAPI_BASE_URL", "https://kanjiapi.dev/v1").rstrip("/")
@@ -208,9 +198,6 @@ def panel_metadata_path(panel_path: Path) -> Path:
 # - backend/data/lookup_cache/ ... NLP cache entries (kanji, words, readings)
 # - backend/data/lookup_cache/kanji/, lookup/, readings/, words/ ... keyed by content, not panel
 
-GOOGLE_APPLICATION_CREDENTIALS = SERVICES.google_application_credentials
-GOOGLE_PROJECT_ID = SERVICES.google_project_id
-GEMINI_API_KEY = SERVICES.gemini_api_key
 OLLAMA_BASE_URL = SERVICES.ollama_base_url
 OLLAMA_TEXT_MODEL = SERVICES.ollama_text_model
 KANJIAPI_BASE_URL = SERVICES.kanjiapi_base_url

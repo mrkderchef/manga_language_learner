@@ -79,7 +79,7 @@ class ImageService:
             }
         
         except Exception as e:
-            logger.error(f"Failed to get panels: {str(e)}")
+            logger.exception('component=storage action=list_panels status=failed msg="Failed to get panels"')
             return {
                 "success": False,
                 "error": str(e),
@@ -106,7 +106,7 @@ class ImageService:
             return None
         
         except Exception as e:
-            logger.error(f"Failed to get panel: {str(e)}")
+            logger.exception('component=storage action=get_panel status=failed msg="Failed to get panel"')
             return None
     
     @staticmethod
@@ -153,7 +153,7 @@ class ImageService:
             }
         
         except Exception as e:
-            logger.error(f"Failed to save panel: {str(e)}")
+            logger.exception('component=storage action=save_panel status=failed msg="Failed to save panel"')
             return {
                 "success": False,
                 "error": str(e)
@@ -186,7 +186,7 @@ class ImageService:
             }
         
         except Exception as e:
-            logger.error(f"Failed to delete panel: {str(e)}")
+            logger.exception('component=storage action=delete_panel status=failed msg="Failed to delete panel"')
             return {
                 "success": False,
                 "error": str(e)

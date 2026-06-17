@@ -276,6 +276,68 @@
     background: rgba(255, 107, 107, 0.1);
 }
 
+.runtime-status-list {
+    display: grid;
+    gap: 0.35rem;
+}
+
+.runtime-status-row {
+    display: grid;
+    grid-template-columns: 10px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.45rem;
+    min-height: 28px;
+    padding: 0.25rem 0.35rem;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    font-weight: 800;
+}
+
+.runtime-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #9aa0aa;
+}
+
+.runtime-ready .runtime-status-dot {
+    background: #38d184;
+    box-shadow: 0 0 0 3px rgba(56, 209, 132, 0.14);
+}
+
+.runtime-missing .runtime-status-dot {
+    background: #ff6b6b;
+    box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.12);
+}
+
+.runtime-status-name,
+.runtime-status-value {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.runtime-status-value {
+    color: var(--text-primary);
+}
+
+.runtime-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    gap: 0.45rem;
+}
+
+.runtime-status-note {
+    min-height: 18px;
+    color: var(--text-secondary);
+    font-size: 0.7rem;
+    line-height: 1.35;
+}
+
 .scan-options-panel label {
     display: grid;
     grid-template-columns: 1fr minmax(110px, 46%);
