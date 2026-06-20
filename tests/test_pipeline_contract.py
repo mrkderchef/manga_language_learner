@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import asyncio
 from pathlib import Path
@@ -121,6 +122,49 @@ class PipelineContractTests(unittest.TestCase):
             self.assertEqual(result["annotations"][0]["rabbithole"]["reading_hiragana"], "ねこ")
             run_ocr.assert_not_called()
         finally:
+            _cleanup_panel(panel)
+
+    def test_rabbithole_endpoint_queues_background_job_and_poll_returns_result(self):
+        panel = _fake_panel()
+        try:
+            with scanner._RABBITHOLE_JOBS_LOCK:
+                scanner._RABBITHOLE_JOBS.clear()
+
+            with patch.object(scanner, "detect_text_regions", return_value=[_fake_region()]), \
+                    patch("services.recognition.ocr_provider.run_ocr", side_effect=_fake_ocr_result):
+                scanner._run_ocr(panel, {"use_cache": False})
+
+            rabbit_payload = {
+                "success": True,
+                "by_region": {
+                    scanner._region_id(_fake_region()): {
+                        "summary": {"token_count": 1, "kanji_count": 1},
+                        "reading_hiragana": "ねこ",
+                    }
+                },
+                "global_lookup_hits": 1,
+                "global_lookup_misses": 0,
+            }
+            with patch.object(scanner.ImageService, "get_panel_by_filename", return_value=panel), \
+                    patch.object(scanner.rabbithole_service, "build_panel_rabbithole", return_value=rabbit_payload):
+                queued = asyncio.run(scanner.build_rabbithole("panel.png", scanner.ScanOptions(use_cache=False)))
+                self.assertTrue(queued["rabbithole_job"])
+                self.assertIn(queued["status"], {"queued", "running"})
+
+                status = queued
+                for _ in range(100):
+                    status = asyncio.run(scanner.get_rabbithole_job("panel.png", queued["job_id"]))
+                    if status["status"] == "done":
+                        break
+                    time.sleep(0.02)
+
+            self.assertEqual(status["status"], "done")
+            result = status["result"]
+            self.assertTrue(result["success"])
+            self.assertEqual(result["annotations"][0]["rabbithole"]["reading_hiragana"], "ねこ")
+        finally:
+            with scanner._RABBITHOLE_JOBS_LOCK:
+                scanner._RABBITHOLE_JOBS.clear()
             _cleanup_panel(panel)
 
     def test_translation_requires_ocr_and_does_not_require_rabbithole(self):
@@ -253,6 +297,9 @@ class ApiContractTests(unittest.TestCase):
         for method, path in checks:
             with self.subTest(path=path):
                 self.assertNotIn((method, path), self.route_keys)
+
+    def test_rabbithole_job_polling_route_is_present(self):
+        self.assertIn(("GET", "/api/scanner/{filename}/rabbithole/jobs/{job_id}"), self.route_keys)
 
     def test_media_rejects_path_traversal(self):
         with self.assertRaises(HTTPException) as ctx:

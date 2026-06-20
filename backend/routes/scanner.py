@@ -7,11 +7,13 @@ import services.translation.engine as translation_engine
 from services.rendering.panel_renderer import render_translated_panel
 from services.detection.region_detector import detect_text_regions
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
 import json
 import logging
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -33,6 +35,11 @@ OCR_CACHE_VERSION = "ocr-stepwise-state-v1"
 MISSING_TRANSLATION_TEXT = "No translation available"
 STATE_CACHE_BUCKETS = ("ocr",)
 PANEL_CACHE_BUCKETS = ("ocr", "rabbithole", "translation")
+RABBITHOLE_JOB_TTL_SECONDS = 15 * 60
+RABBITHOLE_JOB_WORKERS = 2
+_RABBITHOLE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=RABBITHOLE_JOB_WORKERS, thread_name_prefix="rabbithole")
+_RABBITHOLE_JOBS: dict[str, dict] = {}
+_RABBITHOLE_JOBS_LOCK = threading.Lock()
 
 
 def _normalize_scan_result(result: dict | None) -> dict | None:
@@ -818,7 +825,7 @@ def _run_selected_ocr_engine(panel_path: Path, options: dict, regions: list[dict
     start = time.perf_counter()
     _trace(trace, scan_id, "ocr", "start", "OCR stage started", engine=ocr_engine)
 
-    # Delegate OCR invocation to the unified MangaOCR adapter.
+    # Delegate OCR invocation to the MangaOCR recognition service.
     result = run_ocr(panel_path, options=options, regions=regions)
 
     # Normalize and enrich result as before
@@ -1178,6 +1185,85 @@ def _run_rabbithole_existing(panel_path: Path, options: dict | None = None) -> d
     return enriched
 
 
+def _prune_rabbithole_jobs(now: float | None = None) -> None:
+    now = now or time.time()
+    with _RABBITHOLE_JOBS_LOCK:
+        stale = [
+            job_id
+            for job_id, job in _RABBITHOLE_JOBS.items()
+            if job.get("status") in {"done", "error"} and now - float(job.get("updated_at", now)) > RABBITHOLE_JOB_TTL_SECONDS
+        ]
+        for job_id in stale:
+            _RABBITHOLE_JOBS.pop(job_id, None)
+
+
+def _public_rabbithole_job(job: dict | None) -> dict | None:
+    if not job:
+        return None
+    payload = {
+        "success": True,
+        "rabbithole_job": True,
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "filename": job.get("filename"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
+    if job.get("error"):
+        payload["error"] = job.get("error")
+    if job.get("result") is not None:
+        payload["result"] = job.get("result")
+    return payload
+
+
+def _update_rabbithole_job(job_id: str, **updates) -> dict | None:
+    with _RABBITHOLE_JOBS_LOCK:
+        job = _RABBITHOLE_JOBS.get(job_id)
+        if not job:
+            return None
+        job.update(updates)
+        job["updated_at"] = round(time.time(), 3)
+        return copy.deepcopy(job)
+
+
+def _run_rabbithole_job(job_id: str, panel_path: Path, options: dict) -> None:
+    _update_rabbithole_job(job_id, status="running")
+    try:
+        result = _run_rabbithole_existing(panel_path, options)
+        if result and result.get("success"):
+            _update_rabbithole_job(job_id, status="done", result=result, error=None)
+        else:
+            error = (result or {}).get("error") or (result or {}).get("rabbithole_error") or "Rabbithole processing failed"
+            _update_rabbithole_job(job_id, status="error", result=result, error=error)
+    except Exception as exc:
+        logger.exception('panel="%s" stage=rabbithole status=failed job_id=%s msg="Rabbithole background job failed"', panel_path.name, job_id)
+        _update_rabbithole_job(job_id, status="error", error=str(exc))
+
+
+def _start_rabbithole_job(filename: str, panel_path: Path, options: dict) -> dict:
+    _prune_rabbithole_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    now = round(time.time(), 3)
+    job = {
+        "job_id": job_id,
+        "filename": filename,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "result": None,
+        "error": None,
+    }
+    with _RABBITHOLE_JOBS_LOCK:
+        _RABBITHOLE_JOBS[job_id] = job
+    _RABBITHOLE_JOB_EXECUTOR.submit(_run_rabbithole_job, job_id, panel_path, copy.deepcopy(options))
+    logger.info(
+        'panel="%s" stage=rabbithole status=queued job_id=%s msg="Rabbithole background job queued"',
+        filename,
+        job_id,
+    )
+    return copy.deepcopy(job)
+
+
 def _run_render_stage(panel_path: Path, enriched: dict, trace: list[dict], scan_id: str) -> dict:
     render_start = time.perf_counter()
     render_result = render_translated_panel(panel_path, enriched)
@@ -1406,13 +1492,17 @@ async def scan_panel(filename: str, options: ScanOptions | None = None):
 
 @router.post("/{filename}/rabbithole")
 async def build_rabbithole(filename: str, options: ScanOptions | None = None):
-    """Build Rabbithole data for the latest OCR result."""
+    """Queue Rabbithole data generation for the latest OCR result."""
     panel_path = ImageService.get_panel_by_filename(filename)
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
 
+    opts = _scan_options_dict(options)
+    if not opts.get("cache_only"):
+        job = _start_rabbithole_job(filename, panel_path, opts)
+        return _public_rabbithole_job(job)
+
     try:
-        opts = _scan_options_dict(options)
         result = await asyncio.get_event_loop().run_in_executor(None, _run_rabbithole_existing, panel_path, opts)
     except Exception as e:
         logger.exception('panel="%s" stage=rabbithole status=failed msg="Rabbithole request failed"', filename)
@@ -1421,6 +1511,17 @@ async def build_rabbithole(filename: str, options: ScanOptions | None = None):
     if result and result.get("success"):
         return result
     raise HTTPException(status_code=409, detail=(result or {}).get("error", "Run Scan before Rabbithole"))
+
+
+@router.get("/{filename}/rabbithole/jobs/{job_id}")
+async def get_rabbithole_job(filename: str, job_id: str):
+    """Return the current status or completed result for a Rabbithole job."""
+    _prune_rabbithole_jobs()
+    with _RABBITHOLE_JOBS_LOCK:
+        job = copy.deepcopy(_RABBITHOLE_JOBS.get(job_id))
+    if not job or job.get("filename") != filename:
+        raise HTTPException(status_code=404, detail="Rabbithole job not found")
+    return _public_rabbithole_job(job)
 
 
 @router.post("/{filename}/translate")

@@ -764,6 +764,7 @@ const Scanner = (() => {
             renderOverlays(ocrResult.annotations || [], ocrResult.image_width, ocrResult.image_height);
             setTranslateEnabled(hasComputedText(ocrResult.annotations || []) && !(ocrResult.annotations || []).some(isUncomputedAnnotation));
             try {
+                setPaneMessage('reader-rabbithole-content', 'Building Rabbithole context...');
                 const rabbitholeResult = await API.buildRabbithole(selectedPanel.filename, getScanOptions());
                 latestScan = rabbitholeResult;
                 ocrText = rabbitholeResult.text || ocrText;

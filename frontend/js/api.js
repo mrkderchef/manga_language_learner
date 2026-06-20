@@ -7,6 +7,8 @@ const API = (() => {
     // In-memory cache for GET requests
     const _cache = new Map();
     const CACHE_TTL = 60_000; // 60 seconds
+    const RABBITHOLE_POLL_INTERVAL_MS = 1000;
+    const RABBITHOLE_POLL_TIMEOUT_MS = 180_000;
 
     function _cacheKey(endpoint) { return endpoint; }
 
@@ -27,11 +29,41 @@ const API = (() => {
         }
     }
 
+    function delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function pollRabbitholeJob(filename, jobId, options = {}) {
+        const intervalMs = options.intervalMs || RABBITHOLE_POLL_INTERVAL_MS;
+        const timeoutMs = options.timeoutMs || RABBITHOLE_POLL_TIMEOUT_MS;
+        const started = Date.now();
+
+        while (Date.now() - started < timeoutMs) {
+            const job = await request(`/api/scanner/${filename}/rabbithole/jobs/${jobId}`, { responseCache: false });
+            if (job.status === 'done') {
+                if (job.result?.success) {
+                    invalidateCache(`/api/scanner/${filename}/cache-status`);
+                    return job.result;
+                }
+                throw new Error(job.result?.error || 'Rabbithole processing failed');
+            }
+            if (job.status === 'error') {
+                throw new Error(job.error || job.result?.error || 'Rabbithole processing failed');
+            }
+            await delay(intervalMs);
+        }
+
+        throw new Error('Rabbithole processing timed out');
+    }
+
     async function request(endpoint, options = {}) {
         const method = (options.method || 'GET').toUpperCase();
+        const responseCache = options.responseCache !== false;
+        const fetchOptions = { ...options };
+        delete fetchOptions.responseCache;
 
         // Use cache for GET requests
-        if (method === 'GET') {
+        if (method === 'GET' && responseCache) {
             const cached = _getCached(endpoint);
             if (cached) return cached;
         }
@@ -39,7 +71,7 @@ const API = (() => {
         try {
             const response = await fetch(`${BASE_URL}${endpoint}`, {
                 headers: { 'Content-Type': 'application/json' },
-                ...options,
+                ...fetchOptions,
             });
             if (!response.ok) {
                 const error = await response.json().catch(() => ({ detail: response.statusText }));
@@ -47,7 +79,7 @@ const API = (() => {
             }
             const data = await response.json();
 
-            if (method === 'GET') _setCache(endpoint, data);
+            if (method === 'GET' && responseCache) _setCache(endpoint, data);
             return data;
         } catch (err) {
             console.error(`API Error [${endpoint}]:`, err);
@@ -90,8 +122,15 @@ const API = (() => {
                 body: JSON.stringify(options),
             }).then(data => {
                 invalidateCache(`/api/scanner/${filename}/cache-status`);
+                if (data?.rabbithole_job && data.job_id) {
+                    return pollRabbitholeJob(filename, data.job_id);
+                }
                 return data;
             });
+        },
+
+        getRabbitholeJob(filename, jobId) {
+            return request(`/api/scanner/${filename}/rabbithole/jobs/${jobId}`, { responseCache: false });
         },
 
         getCachedRabbithole(filename, options = {}) {
