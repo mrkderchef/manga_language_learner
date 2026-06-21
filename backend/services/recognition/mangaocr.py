@@ -16,32 +16,33 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from config import PANEL_DATA_DIR, ocr_panel_slug
-from services.vision.bubble_allocator import candidate_box_from_region, estimate_allocation_space, reconcile_overlapping_bubble_spaces
+from config import MANGA_OCR_MODEL_DIR, PANEL_DATA_DIR, ocr_panel_slug
+from services.model_assets import BUBBLE_MODEL_REVISION, missing_manga_ocr_files
+from services.vision.bubble_allocator import associate_model_bubbles, candidate_box_from_region, estimate_allocation_space, reconcile_overlapping_bubble_spaces
+from services.vision.bubble_segmenter import model_unavailable_reason, predict_bubbles
 from services.rabbithole import nlp as rabbithole_service
 from services.detection.region_detector import detect_text_regions
 
 logger = logging.getLogger(__name__)
-
-MANGA_OCR_REPO_ID = "kha-white/manga-ocr-base"
 
 # Lazy-loaded singleton for the manga-ocr model
 _mocr = None
 
 
 def _get_mocr():
-	"""Load the manga-ocr model from the local Hugging Face snapshot."""
+	"""Load MangaOCR from the backend-owned model directory without downloading."""
 	global _mocr
 	if _mocr is None:
-		from huggingface_hub import snapshot_download
+		missing = missing_manga_ocr_files()
+		if missing:
+			raise RuntimeError(
+				"MangaOCR model assets are missing from "
+				f"{MANGA_OCR_MODEL_DIR}: {', '.join(missing)}. "
+				"Download OCR assets from Runtime settings."
+			)
 		from manga_ocr import MangaOcr
-		try:
-			model_path = snapshot_download(MANGA_OCR_REPO_ID, local_files_only=True)
-		except Exception:
-			logger.info("MangaOCR snapshot missing locally; downloading %s", MANGA_OCR_REPO_ID)
-			model_path = snapshot_download(MANGA_OCR_REPO_ID)
-		logger.info("Loading manga-ocr model from %s", model_path)
-		_mocr = MangaOcr(model_path)
+		logger.info("Loading manga-ocr model from %s", MANGA_OCR_MODEL_DIR)
+		_mocr = MangaOcr(str(MANGA_OCR_MODEL_DIR))
 		logger.info("manga-ocr model ready.")
 	return _mocr
 
@@ -723,10 +724,6 @@ def extract_ocr(image_path: str, options: dict | None = None, regions_override: 
 		debug_slug = f"{panel_debug_dir}/{scan_slug}_{_safe_debug_component(region_id)}_{geom_slug}"
 		text, ocr_meta = _ocr_crop(mocr, crop, region, debug_slug, options)
 		ocr_meta["crop_box"] = [int(x1), int(y1), int(x2), int(y2)]
-		allocation = _estimate_bubble_allocation(gray_img, region, options)
-		ocr_meta["vision"] = allocation.debug
-		ocr_meta["_allocation_space"] = allocation
-
 		if text:
 			region["ocr_meta"] = ocr_meta
 			recognized_entries.append({
@@ -740,8 +737,41 @@ def extract_ocr(image_path: str, options: dict | None = None, regions_override: 
 			)
 
 	recognized_entries = _suppress_nested_regions(recognized_entries)
-	if bool(_bubble_options(options).get("overlap_reconciliation", True)):
-		reconcile_overlapping_bubble_spaces(recognized_entries, im_w, im_h)
+	bubble_options = _bubble_options(options)
+	mode = str(bubble_options.get("mode", "hybrid") or "hybrid").lower()
+	mean_saturation = float(np.mean(cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[:, :, 1])) if img.ndim == 3 else 0.0
+	page_color_mode = "color" if mean_saturation >= 28.0 else "monochrome"
+	matched_entries: set[int] = set()
+	if mode == "hybrid":
+		predictions = predict_bubbles(img, bubble_options)
+		if predictions:
+			matched_entries = associate_model_bubbles(gray_img, recognized_entries, predictions, bubble_options)
+
+	classical_entries: list[dict] = []
+	for entry_index, entry in enumerate(recognized_entries):
+		if entry_index in matched_entries:
+			continue
+		region = entry.get("region") or {}
+		allocation = _estimate_bubble_allocation(gray_img, region, options)
+		if mode == "hybrid":
+			allocation.debug["model_fallback_reason"] = "no_model_match" if predictions else model_unavailable_reason()
+			allocation.debug.setdefault("fallback_reason", allocation.debug["model_fallback_reason"])
+			allocation.debug["model_revision"] = BUBBLE_MODEL_REVISION
+		if allocation.debug.get("source") == "compact_text_seed":
+			allocation.debug["unmatched_text_policy"] = "compact_text_only"
+			allocation.debug["possible_content_type"] = "caption_or_sfx_or_open_balloon"
+		allocation.debug["page_color_mode"] = page_color_mode
+		allocation.debug["page_mean_saturation"] = round(mean_saturation, 3)
+		entry["ocr_meta"]["vision"] = allocation.debug
+		entry["ocr_meta"]["_allocation_space"] = allocation
+		region["ocr_meta"] = entry["ocr_meta"]
+		classical_entries.append(entry)
+	for entry_index in matched_entries:
+		vision = recognized_entries[entry_index].get("ocr_meta", {}).get("vision", {})
+		vision["page_color_mode"] = page_color_mode
+		vision["page_mean_saturation"] = round(mean_saturation, 3)
+	if bool(bubble_options.get("overlap_reconciliation", True)):
+		reconcile_overlapping_bubble_spaces(classical_entries, im_w, im_h)
 	recognized_texts = [entry["text"] for entry in recognized_entries]
 	valid_regions = [entry["region"] for entry in recognized_entries]
 

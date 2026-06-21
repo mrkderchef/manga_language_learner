@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import re
+import time
+import unicodedata
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +21,16 @@ from config import BASE_DIR, KANJIAPI_BASE_URL, RABBITHOLE_GINZA_ENABLED
 logger = logging.getLogger(__name__)
 
 LOOKUP_CACHE_DIR = BASE_DIR / "backend" / "data" / "lookup_cache"
-for _name in ("kanji", "words", "readings", "lookup"):
+for _name in ("kanji", "words", "readings", "lookup", "kanjivg", "wiktionary"):
     (LOOKUP_CACHE_DIR / _name).mkdir(parents=True, exist_ok=True)
+
+CACHE_SCHEMA_VERSION = 4
+RABBITHOLE_CONTRACT_VERSION = 2
+KANJIVG_REVISION = "r20250816"
+KANJIVG_RAW_URL = "https://raw.githubusercontent.com/KanjiVG/kanjivg/{revision}/kanji/{codepoint}.svg"
+WIKTIONARY_API_URL = "https://en.wiktionary.org/w/api.php"
+WIKTIONARY_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
+HTTP_USER_AGENT = "MangaLanguageLearner/1.0 (local educational app; provenance-first lookup)"
 
 KANJI_RE = re.compile(r"[\u3400-\u9fff]")
 KANA_RE = re.compile(r"[\u3040-\u30ff]")
@@ -31,7 +44,104 @@ _kakasi = None
 LOCAL_GRAMMAR_SOURCE = "local:grammar"
 LOCAL_KANA_SOURCE = "local:kana"
 LOCAL_SYMBOL_SOURCE = "local:symbols"
-LOCAL_KANJI_COMPONENT_SOURCE = "local:kanji-components"
+
+
+def source_catalog() -> dict[str, dict[str, Any]]:
+    """Stable source descriptions shared by panel and lazy inspector payloads."""
+    catalog = {
+        "kanjidic2": {
+            "name": "KANJIDIC2 via KanjiAPI",
+            "dataset": "KANJIDIC2",
+            "intermediary": "kanjiapi.dev",
+            "canonical_url": "https://www.edrdg.org/wiki/KANJIDIC_Project.html",
+            "license": "EDRDG licence / acknowledgement required",
+            "version": "KanjiAPI current export",
+        },
+        "jmdict": {
+            "name": "JMdict via KanjiAPI",
+            "dataset": "JMdict",
+            "intermediary": "kanjiapi.dev",
+            "canonical_url": "https://www.edrdg.org/jmdict/j_jmdict.html",
+            "license": "EDRDG licence / acknowledgement required",
+            "version": "KanjiAPI current export",
+        },
+        "sudachi": {
+            "name": "SudachiPy",
+            "dataset": "SudachiDict",
+            "intermediary": "SudachiPy",
+            "canonical_url": "https://github.com/WorksApplications/SudachiPy",
+            "license": "Apache-2.0 (library); dictionary licence varies",
+            "version": "installed runtime",
+        },
+        "pykakasi": {
+            "name": "pykakasi",
+            "dataset": "pykakasi transliteration tables",
+            "intermediary": "local runtime",
+            "canonical_url": "https://github.com/miurahr/pykakasi",
+            "license": "GPL-3.0",
+            "version": "installed runtime",
+        },
+        "local_romaji": {
+            "name": "Local Hepburn fallback",
+            "dataset": "application kana-to-romaji table",
+            "intermediary": "local application",
+            "canonical_url": "https://en.wikipedia.org/wiki/Hepburn_romanization",
+            "license": "application source licence",
+            "version": "current application revision",
+        },
+        "kanjivg": {
+            "name": "KanjiVG",
+            "dataset": "KanjiVG Japanese stroke-order SVG",
+            "intermediary": "raw.githubusercontent.com",
+            "canonical_url": "https://github.com/KanjiVG/kanjivg",
+            "license": "CC BY-SA 3.0",
+            "version": KANJIVG_REVISION,
+        },
+        "wiktionary": {
+            "name": "English Wiktionary",
+            "dataset": "Chinese → Glyph origin editorial section",
+            "intermediary": "MediaWiki Action API",
+            "canonical_url": "https://en.wiktionary.org/",
+            "license": "CC BY-SA 4.0",
+            "version": "page revision recorded per lookup",
+        },
+        "unicode": {
+            "name": "Unicode",
+            "dataset": "Unicode Character Database",
+            "intermediary": "Python unicodedata",
+            "canonical_url": "https://www.unicode.org/ucd/",
+            "license": "Unicode data files licence",
+            "version": unicodedata.unidata_version,
+        },
+        "app_editorial": {
+            "name": "App editorial notes",
+            "dataset": "Manga Language Learner grammar and usage notes",
+            "intermediary": "local application",
+            "canonical_url": "",
+            "license": "application source licence",
+            "version": "current application revision",
+        },
+        "mangaocr": {
+            "name": "Manga OCR",
+            "dataset": "OCR model output",
+            "intermediary": "local runtime",
+            "canonical_url": "https://github.com/kha-white/manga-ocr",
+            "license": "Apache-2.0",
+            "version": "installed runtime",
+        },
+        "translation_engine": {
+            "name": "Translation engine",
+            "dataset": "generated translation",
+            "intermediary": "configured local/remote engine",
+            "canonical_url": "",
+            "license": "engine dependent",
+            "version": "request metadata",
+        },
+    }
+    retrieved_at = int(time.time())
+    for record in catalog.values():
+        record.setdefault("retrieved_at", retrieved_at)
+    return catalog
 
 FUNCTION_GLOSSARY = {
     "は": "topic marker",
@@ -72,25 +182,6 @@ LEXICAL_GLOSSARY = {
     "くん": "familiar honorific",
     "ガタッ": "clatter / thud",
     "ドキドキ": "heartbeat / nervous excitement",
-}
-
-KANJI_COMPONENTS = {
-    "夢": {
-        "components": ["艹", "罒", "冖", "夕"],
-        "source": LOCAL_KANJI_COMPONENT_SOURCE,
-    },
-    "果": {
-        "components": ["田", "木"],
-        "source": LOCAL_KANJI_COMPONENT_SOURCE,
-    },
-}
-
-PRIORITY_LABELS = {
-    "ichi": "common term",
-    "news": "news frequency",
-    "nf": "frequency rank",
-    "spec": "specialized/common",
-    "gai": "common loanword",
 }
 
 POS_LABELS = {
@@ -377,8 +468,11 @@ def _read_cache(kind: str, key: str) -> dict[str, Any] | None:
 
 def _write_cache(kind: str, key: str, data: dict[str, Any]) -> dict[str, Any]:
     path = _cache_path(kind, key)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return data
+    payload = dict(data)
+    payload["_cache_schema_version"] = CACHE_SCHEMA_VERSION
+    payload.setdefault("retrieved_at", int(time.time()))
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
 
 
 def _fetch_kanjiapi(path: str) -> Any | None:
@@ -419,16 +513,86 @@ def _get_kakasi():
     return _kakasi or None
 
 
+_KANA_ROMAJI = {
+    **dict(zip("あいうえお", ("a", "i", "u", "e", "o"))),
+    **dict(zip("かきくけこ", ("ka", "ki", "ku", "ke", "ko"))),
+    **dict(zip("がぎぐげご", ("ga", "gi", "gu", "ge", "go"))),
+    **dict(zip("さしすせそ", ("sa", "shi", "su", "se", "so"))),
+    **dict(zip("ざじずぜぞ", ("za", "ji", "zu", "ze", "zo"))),
+    **dict(zip("たちつてと", ("ta", "chi", "tsu", "te", "to"))),
+    **dict(zip("だぢづでど", ("da", "ji", "zu", "de", "do"))),
+    **dict(zip("なにぬねの", ("na", "ni", "nu", "ne", "no"))),
+    **dict(zip("はひふへほ", ("ha", "hi", "fu", "he", "ho"))),
+    **dict(zip("ばびぶべぼ", ("ba", "bi", "bu", "be", "bo"))),
+    **dict(zip("ぱぴぷぺぽ", ("pa", "pi", "pu", "pe", "po"))),
+    **dict(zip("まみむめも", ("ma", "mi", "mu", "me", "mo"))),
+    **dict(zip("やゆよ", ("ya", "yu", "yo"))),
+    **dict(zip("らりるれろ", ("ra", "ri", "ru", "re", "ro"))),
+    "わ": "wa", "ゐ": "i", "ゑ": "e", "を": "o", "ん": "n",
+    "ぁ": "a", "ぃ": "i", "ぅ": "u", "ぇ": "e", "ぉ": "o", "ゎ": "wa",
+    "ゔ": "vu",
+}
+_KANA_DIGRAPH_ROMAJI = {
+    **{f"{lead}{small}": roman for lead, values in {
+        "き": ("kya", "kyu", "kyo"), "ぎ": ("gya", "gyu", "gyo"),
+        "し": ("sha", "shu", "sho"), "じ": ("ja", "ju", "jo"),
+        "ち": ("cha", "chu", "cho"), "に": ("nya", "nyu", "nyo"),
+        "ひ": ("hya", "hyu", "hyo"), "び": ("bya", "byu", "byo"),
+        "ぴ": ("pya", "pyu", "pyo"), "み": ("mya", "myu", "myo"),
+        "り": ("rya", "ryu", "ryo"),
+    }.items() for small, roman in zip("ゃゅょ", values)},
+    "てぃ": "ti", "でぃ": "di", "とぅ": "tu", "どぅ": "du",
+    "ふぁ": "fa", "ふぃ": "fi", "ふぇ": "fe", "ふぉ": "fo",
+    "ゔぁ": "va", "ゔぃ": "vi", "ゔぇ": "ve", "ゔぉ": "vo",
+    "しぇ": "she", "じぇ": "je", "ちぇ": "che",
+}
+
+
+def _fallback_kana_to_romaji(text: str) -> str:
+    hira = katakana_to_hiragana(text)
+    output: list[str] = []
+    geminate = False
+    index = 0
+    while index < len(hira):
+        ch = hira[index]
+        if ch == "っ":
+            geminate = True
+            index += 1
+            continue
+        if ch == "ー":
+            previous = output[-1] if output else ""
+            vowel = next((value for value in reversed(previous) if value in "aeiou"), "")
+            output.append(vowel)
+            index += 1
+            continue
+        pair = hira[index:index + 2]
+        roman = _KANA_DIGRAPH_ROMAJI.get(pair)
+        if roman:
+            index += 2
+        else:
+            roman = _KANA_ROMAJI.get(ch, ch)
+            index += 1
+        if geminate and roman and roman[0].isalpha() and roman != "n":
+            roman = ("t" if roman.startswith("ch") else roman[0]) + roman
+        geminate = False
+        output.append(roman)
+    return "".join(output)
+
+
 def kana_to_romanji(text: str) -> str:
     if not text:
         return ""
     kakasi = _get_kakasi()
     if not kakasi:
-        return ""
+        return _fallback_kana_to_romaji(text)
     try:
         return " ".join(part.get("hepburn", "") for part in kakasi.convert(text)).strip()
     except Exception:
-        return ""
+        return _fallback_kana_to_romaji(text)
+
+
+def _romanization_source_id() -> str:
+    return "pykakasi" if _get_kakasi() else "local_romaji"
 
 
 def katakana_to_hiragana(text: str) -> str:
@@ -463,6 +627,7 @@ def tokenize_text(text: str, split_mode: str = "C") -> dict[str, Any]:
     if not normalized:
         return {
             "reading_hiragana": "",
+            "reading_romaji": "",
             "reading_romanji": "",
             "tokens": [],
             "kanji_spans": [],
@@ -497,12 +662,14 @@ def tokenize_text(text: str, split_mode: str = "C") -> dict[str, Any]:
                 reading_hira = katakana_to_hiragana(reading)
             
             reading_parts.append(reading_hira)
+            token_romaji = kana_to_romanji(reading_hira)
             tokens.append({
                 "id": f"tok_{index:03d}",
                 "surface": surface,
                 "lemma": morpheme.dictionary_form(),
                 "reading_hiragana": reading_hira,
-                "reading_romanji": kana_to_romanji(reading_hira),
+                "reading_romaji": token_romaji,
+                "reading_romanji": token_romaji,
                 "pos": pos,
                 "start": start,
                 "end": end,
@@ -515,6 +682,7 @@ def tokenize_text(text: str, split_mode: str = "C") -> dict[str, Any]:
             "surface": normalized,
             "lemma": normalized,
             "reading_hiragana": "",
+            "reading_romaji": "",
             "reading_romanji": "",
             "pos": [],
             "start": 0,
@@ -528,9 +696,11 @@ def tokenize_text(text: str, split_mode: str = "C") -> dict[str, Any]:
         if KANJI_RE.match(ch)
     ]
     reading_hiragana = "".join(reading_parts)
+    reading_romaji = kana_to_romanji(reading_hiragana)
     return {
         "reading_hiragana": reading_hiragana,
-        "reading_romanji": kana_to_romanji(reading_hiragana),
+        "reading_romaji": reading_romaji,
+        "reading_romanji": reading_romaji,
         "tokens": tokens,
         "kanji_spans": kanji_spans,
     }
@@ -640,69 +810,330 @@ def token_plausibility(text: str) -> dict[str, Any]:
     }
 
 
-def lookup_kanji(character: str) -> dict[str, Any]:
+def _source_subset(*source_ids: str) -> dict[str, dict[str, Any]]:
+    catalog = source_catalog()
+    return {source_id: catalog[source_id] for source_id in source_ids if source_id in catalog}
+
+
+def _structured_readings(readings: list[Any]) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    for value in readings:
+        kana = str(value or "").strip()
+        if not kana:
+            continue
+        romanized_parts = [
+            part if part in {".", "-"} else kana_to_romanji(part).replace(" ", "")
+            for part in re.split(r"([.-])", kana)
+            if part
+        ]
+        results.append({"kana": kana, "romaji": "".join(romanized_parts)})
+    return results
+
+
+def _unicode_metadata(character: str) -> dict[str, Any]:
+    if not character or len(character) != 1:
+        return {}
+    return {
+        "character": character,
+        "codepoint": f"U+{ord(character):04X}",
+        "name": unicodedata.name(character, "Unassigned character"),
+        "category": unicodedata.category(character),
+        "script_note": "Unicode identifies the encoded character; it does not define a word meaning or etymology.",
+    }
+
+
+def _cache_is_fresh(payload: dict[str, Any] | None, ttl_seconds: int) -> bool:
+    if not payload:
+        return False
+    retrieved_at = payload.get("retrieved_at")
+    try:
+        return (time.time() - float(retrieved_at)) < ttl_seconds
+    except (TypeError, ValueError):
+        return False
+
+
+def _kanjivg_lookup(character: str) -> dict[str, Any]:
+    cached = _read_cache("kanjivg", f"{KANJIVG_REVISION}:{character}")
+    if cached and cached.get("revision") == KANJIVG_REVISION:
+        return cached
+
+    codepoint = f"{ord(character):05x}"
+    url = KANJIVG_RAW_URL.format(revision=KANJIVG_REVISION, codepoint=codepoint)
+    try:
+        response = requests.get(url, headers={"User-Agent": HTTP_USER_AGENT}, timeout=6)
+        if response.status_code == 404:
+            raise LookupError("KanjiVG file is not available for this character")
+        response.raise_for_status()
+        if len(response.content) > 1_000_000:
+            raise ValueError("KanjiVG document exceeds the safe size limit")
+        root = ET.fromstring(response.content)
+        paths: list[dict[str, str]] = []
+        for index, element in enumerate(root.iter()):
+            if element.tag.rsplit("}", 1)[-1] != "path":
+                continue
+            path_data = str(element.attrib.get("d") or "").strip()
+            if path_data and len(path_data) <= 12_000 and re.fullmatch(r"[MmLlHhVvCcSsQqTtAaZzEe0-9.,+\-\s]+", path_data):
+                paths.append({
+                    "id": str(element.attrib.get("id") or f"stroke-{index + 1}"),
+                    "d": path_data,
+                })
+            if len(paths) >= 64:
+                break
+
+        components: list[dict[str, str]] = []
+        seen_components: set[tuple[str, str]] = set()
+        for element in root.iter():
+            component = next(
+                (str(value) for key, value in element.attrib.items() if key.rsplit("}", 1)[-1] == "element"),
+                "",
+            ).strip()
+            if not component or component == character:
+                continue
+            position = next(
+                (str(value) for key, value in element.attrib.items() if key.rsplit("}", 1)[-1] == "position"),
+                "",
+            ).strip()
+            key = (component, position)
+            if key not in seen_components:
+                seen_components.add(key)
+                components.append({"element": component[:16], "position": position[:24]})
+            if len(components) >= 64:
+                break
+
+        if not paths:
+            raise ValueError("KanjiVG document contained no stroke paths")
+        payload = {
+            "available": True,
+            "character": character,
+            "revision": KANJIVG_REVISION,
+            "source_url": url,
+            "view_box": str(root.attrib.get("viewBox") or "0 0 109 109"),
+            "paths": paths,
+            "components": components,
+            "source_id": "kanjivg",
+        }
+        return _write_cache("kanjivg", f"{KANJIVG_REVISION}:{character}", payload)
+    except Exception as exc:
+        logger.info("KanjiVG lookup skipped/failed for %s: %s", character, exc)
+        if cached:
+            return {**cached, "stale": True, "error": str(exc)}
+        return {
+            "available": False,
+            "character": character,
+            "revision": KANJIVG_REVISION,
+            "source_url": url,
+            "paths": [],
+            "components": [],
+            "source_id": "kanjivg",
+            "error": str(exc),
+        }
+
+
+class _GlyphOriginHTMLParser(HTMLParser):
+    """Extract readable paragraphs/list items; all markup is discarded."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.blocks: list[str] = []
+        self._parts: list[str] = []
+        self._block_depth = 0
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style", "table", "figure"}:
+            self._ignored_depth += 1
+        if not self._ignored_depth and tag in {"p", "li"}:
+            if self._block_depth == 0:
+                self._parts = []
+            self._block_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "table", "figure"} and self._ignored_depth:
+            self._ignored_depth -= 1
+            return
+        if not self._ignored_depth and tag in {"p", "li"} and self._block_depth:
+            self._block_depth -= 1
+            if self._block_depth == 0:
+                text = re.sub(r"\s+", " ", "".join(self._parts)).strip()
+                text = re.sub(r"\[\d+\]", "", text)
+                if text:
+                    self.blocks.append(text)
+
+    def handle_data(self, data: str) -> None:
+        if self._block_depth and not self._ignored_depth:
+            self._parts.append(data)
+
+
+def _wiktionary_glyph_origin(character: str) -> dict[str, Any]:
+    cache_key = f"en:{character}:glyph-origin"
+    cached = _read_cache("wiktionary", cache_key)
+    if _cache_is_fresh(cached, WIKTIONARY_CACHE_TTL_SECONDS):
+        return cached or {}
+
+    page_url = f"https://en.wiktionary.org/wiki/{requests.utils.quote(character)}"
+    try:
+        common_params = {"action": "parse", "page": character, "format": "json", "formatversion": "2"}
+        section_response = requests.get(
+            WIKTIONARY_API_URL,
+            params={**common_params, "prop": "sections|revid"},
+            headers={"User-Agent": HTTP_USER_AGENT},
+            timeout=8,
+        )
+        section_response.raise_for_status()
+        parse_data = section_response.json().get("parse", {})
+        revision_id = parse_data.get("revid")
+        glyph_section = None
+        in_chinese = False
+        for section in parse_data.get("sections", []):
+            level = int(section.get("level") or 0)
+            title = html.unescape(re.sub(r"<[^>]+>", "", str(section.get("line") or ""))).strip()
+            if level == 2:
+                in_chinese = title.casefold() == "chinese"
+            elif in_chinese and title.casefold() in {"glyph origin", "glyph origins"}:
+                glyph_section = str(section.get("index") or "")
+                break
+
+        text = ""
+        if glyph_section:
+            content_response = requests.get(
+                WIKTIONARY_API_URL,
+                params={**common_params, "prop": "text|revid", "section": glyph_section},
+                headers={"User-Agent": HTTP_USER_AGENT},
+                timeout=8,
+            )
+            content_response.raise_for_status()
+            content_parse = content_response.json().get("parse", {})
+            revision_id = content_parse.get("revid") or revision_id
+            parser = _GlyphOriginHTMLParser()
+            parser.feed(str(content_parse.get("text") or ""))
+            text = "\n\n".join(parser.blocks[:5])[:3000]
+
+        revision_url = (
+            f"https://en.wiktionary.org/w/index.php?title={requests.utils.quote(character)}&oldid={revision_id}"
+            if revision_id else page_url
+        )
+        payload = {
+            "available": bool(text),
+            "character": character,
+            "text": text,
+            "message": "" if text else "No glyph-origin note available",
+            "revision_id": revision_id,
+            "revision_url": revision_url,
+            "page_url": page_url,
+            "source_id": "wiktionary",
+        }
+        return _write_cache("wiktionary", cache_key, payload)
+    except Exception as exc:
+        logger.info("Wiktionary glyph-origin lookup skipped/failed for %s: %s", character, exc)
+        if cached:
+            return {**cached, "stale": True, "error": str(exc)}
+        return {
+            "available": False,
+            "character": character,
+            "text": "",
+            "message": "No glyph-origin note available",
+            "revision_id": None,
+            "revision_url": page_url,
+            "page_url": page_url,
+            "source_id": "wiktionary",
+            "error": str(exc),
+        }
+
+
+def _normalize_kanji_payload(character: str, raw: dict[str, Any], *, source: str) -> dict[str, Any]:
+    kun = list(raw.get("kun_readings") or [])
+    on = list(raw.get("on_readings") or [])
+    nanori = list(raw.get("name_readings") or [])
+    romaji_source = _romanization_source_id()
+    return {
+        "type": "kanji",
+        "kanji": raw.get("kanji") or character,
+        "meanings": list(raw.get("meanings") or []),
+        "kun_readings": kun,
+        "on_readings": on,
+        "name_readings": nanori,
+        "structured_readings": {
+            "kun": _structured_readings(kun),
+            "on": _structured_readings(on),
+            "nanori": _structured_readings(nanori),
+        },
+        "stroke_count": raw.get("stroke_count"),
+        "grade": raw.get("grade"),
+        "jlpt": raw.get("jlpt"),
+        "unicode": raw.get("unicode") or f"{ord(character):04X}",
+        "unicode_metadata": _unicode_metadata(character),
+        "heisig_en": raw.get("heisig_en"),
+        "freq_mainichi_shinbun": raw.get("freq_mainichi_shinbun"),
+        "notes": list(raw.get("notes") or []),
+        "source": source,
+        "sources": _source_subset("kanjidic2", romaji_source, "unicode"),
+        "field_sources": {
+            "meanings": ["kanjidic2"],
+            "kun_readings": ["kanjidic2"],
+            "on_readings": ["kanjidic2"],
+            "name_readings": ["kanjidic2"],
+            "structured_readings": ["kanjidic2", romaji_source],
+            "stroke_count": ["kanjidic2"],
+            "grade": ["kanjidic2"],
+            "jlpt": ["kanjidic2"],
+            "heisig_en": ["kanjidic2"],
+            "freq_mainichi_shinbun": ["kanjidic2"],
+            "unicode": ["unicode"],
+            "unicode_metadata": ["unicode"],
+        },
+    }
+
+
+def lookup_kanji(character: str, enrich: bool = False) -> dict[str, Any]:
     ch = (character or "")[:1]
+    if not ch:
+        return _normalize_kanji_payload("?", {}, source="unavailable")
     cached = _read_cache("kanji", ch)
-    if cached and cached.get("kanji") and (
+    cached_is_valid = bool(cached and cached.get("kanji") and (
         cached.get("meanings")
         or cached.get("kun_readings")
         or cached.get("on_readings")
         or cached.get("stroke_count") is not None
-    ):
-        return cached
-    api_data = _fetch_kanjiapi(f"/kanji/{ch}") if ch else None
+    ))
+    current_schema = bool(cached and cached.get("_cache_schema_version") == CACHE_SCHEMA_VERSION)
+    api_data = None if cached_is_valid and current_schema else _fetch_kanjiapi(f"/kanji/{ch}")
     if isinstance(api_data, dict):
+        data = _write_cache("kanji", ch, _normalize_kanji_payload(ch, api_data, source="KANJIDIC2 via KanjiAPI"))
+    elif cached_is_valid:
+        data = cached if current_schema else _write_cache(
+            "kanji", ch, _normalize_kanji_payload(ch, cached or {}, source="KANJIDIC2 via KanjiAPI (cached)")
+        )
+    else:
+        data = _normalize_kanji_payload(ch, {}, source="unavailable")
+
+    if enrich:
+        stroke_order = _kanjivg_lookup(ch)
+        glyph_origin = _wiktionary_glyph_origin(ch)
+        rich_sources = _source_subset("kanjivg", "wiktionary")
+        if "kanjivg" in rich_sources:
+            rich_sources["kanjivg"]["retrieved_at"] = stroke_order.get("retrieved_at")
+        if "wiktionary" in rich_sources:
+            rich_sources["wiktionary"]["retrieved_at"] = glyph_origin.get("retrieved_at")
+            rich_sources["wiktionary"]["version"] = (
+                f"revision {glyph_origin.get('revision_id')}" if glyph_origin.get("revision_id") else "revision unavailable"
+            )
         data = {
-            "type": "kanji",
-            "kanji": api_data.get("kanji") or ch,
-            "meanings": api_data.get("meanings", []),
-            "kun_readings": api_data.get("kun_readings", []),
-            "on_readings": api_data.get("on_readings", []),
-            "name_readings": api_data.get("name_readings", []),
-            "stroke_count": api_data.get("stroke_count"),
-            "grade": api_data.get("grade"),
-            "jlpt": api_data.get("jlpt"),
-            "unicode": api_data.get("unicode"),
-            "heisig_en": api_data.get("heisig_en"),
-            "freq_mainichi_shinbun": api_data.get("freq_mainichi_shinbun"),
-            "notes": api_data.get("notes", []),
-            "source": "kanjiapi.dev:/kanji",
+            **data,
+            "stroke_order": stroke_order,
+            "glyph_origin": glyph_origin,
+            "components": stroke_order.get("components", []),
+            "component_source": "kanjivg",
+            "sources": {
+                **(data.get("sources") or {}),
+                **rich_sources,
+            },
+            "field_sources": {
+                **(data.get("field_sources") or {}),
+                "stroke_order": ["kanjivg"],
+                "components": ["kanjivg"],
+                "glyph_origin": ["wiktionary"],
+            },
         }
-        return _write_cache("kanji", ch, data)
-    if cached:
-        data = {
-            "type": "kanji",
-            "kanji": cached.get("kanji") or ch,
-            "meanings": cached.get("meanings", []),
-            "kun_readings": cached.get("kun_readings", []),
-            "on_readings": cached.get("on_readings", []),
-            "name_readings": cached.get("name_readings", []),
-            "stroke_count": cached.get("stroke_count"),
-            "grade": cached.get("grade"),
-            "jlpt": cached.get("jlpt"),
-            "unicode": cached.get("unicode"),
-            "heisig_en": cached.get("heisig_en"),
-            "freq_mainichi_shinbun": cached.get("freq_mainichi_shinbun"),
-            "notes": cached.get("notes", []),
-            "source": _source_concept(cached.get("source") or "kanjiapi.dev:/kanji"),
-        }
-        return _write_cache("kanji", ch, data)
-    data = {
-        "type": "kanji",
-        "kanji": ch,
-        "meanings": [],
-        "kun_readings": [],
-        "on_readings": [],
-        "name_readings": [],
-        "stroke_count": None,
-        "grade": None,
-        "jlpt": None,
-        "unicode": None,
-        "heisig_en": None,
-        "freq_mainichi_shinbun": None,
-        "notes": [],
-        "source": "central-cache-placeholder",
-    }
     return data
 
 
@@ -716,20 +1147,37 @@ def lookup_word(text: str, reading_hiragana: str = "") -> dict[str, Any]:
     contextual_reading = (reading_hiragana or "").strip()
     cache_key = _word_lookup_cache_key(key, contextual_reading)
     cached = _read_cache("words", cache_key)
-    if cached and cached.get("text") and cached.get("entries"):
+    if cached and cached.get("text") and cached.get("entries") and cached.get("_cache_schema_version") == CACHE_SCHEMA_VERSION:
         return cached
     tokenized = tokenize_text(key)
     resolved_reading = contextual_reading or str(tokenized.get("reading_hiragana") or "")
     entries, candidate_count = _fetch_dictionary_entries(key, resolved_reading)
+    if not entries and cached and cached.get("entries"):
+        entries = list(cached.get("entries") or [])
+        candidate_count = int(cached.get("candidate_count") or len(entries))
+    reading_romaji = kana_to_romanji(resolved_reading) if contextual_reading else str(
+        tokenized.get("reading_romaji") or tokenized.get("reading_romanji") or ""
+    )
+    romaji_source = _romanization_source_id()
     data = {
         "type": "word",
         "text": key,
         "reading_hiragana": resolved_reading,
-        "reading_romanji": kana_to_romanji(resolved_reading) if contextual_reading else tokenized.get("reading_romanji", ""),
+        "reading_romaji": reading_romaji,
+        "reading_romanji": reading_romaji,
         "tokens": tokenized.get("tokens", []),
         "entries": entries,
         "candidate_count": candidate_count,
-        "source": "kanjiapi.dev:/words" if entries else "SudachiPy",
+        "source": "jmdict" if entries else "sudachi",
+        "sources": _source_subset("jmdict", "sudachi", romaji_source),
+        "field_sources": {
+            "reading_hiragana": ["sudachi"],
+            "reading_romaji": ["sudachi", romaji_source],
+            "reading_romanji": ["sudachi", romaji_source],
+            "tokens": ["sudachi"],
+            "entries": ["jmdict"],
+            "candidate_count": ["jmdict"],
+        },
     }
     if JAPANESE_RE.search(key) and not entries and candidate_count == 0:
         return data
@@ -739,17 +1187,28 @@ def lookup_word(text: str, reading_hiragana: str = "") -> dict[str, Any]:
 def lookup_reading(reading: str) -> dict[str, Any]:
     key = (reading or "").strip()
     cached = _read_cache("readings", key)
-    if cached:
+    if cached and cached.get("_cache_schema_version") == CACHE_SCHEMA_VERSION:
         return cached
     api_data = _fetch_kanjiapi(f"/reading/{key}") if key else None
     api_dict = api_data if isinstance(api_data, dict) else None
+    romaji = kana_to_romanji(key)
+    cached_dict = cached if isinstance(cached, dict) else {}
+    romaji_source = _romanization_source_id()
     data = {
         "type": "reading",
         "reading": key,
-        "romanji": kana_to_romanji(key),
-        "kanji": api_dict.get("main_kanji", []) if api_dict else [],
-        "name_kanji": api_dict.get("name_kanji", []) if api_dict else [],
-        "source": "kanjiapi.dev" if api_dict else "local",
+        "romaji": romaji,
+        "romanji": romaji,
+        "kanji": api_dict.get("main_kanji", []) if api_dict else cached_dict.get("kanji", []),
+        "name_kanji": api_dict.get("name_kanji", []) if api_dict else cached_dict.get("name_kanji", []),
+        "source": "jmdict" if api_dict or cached_dict.get("kanji") else romaji_source,
+        "sources": _source_subset("jmdict", romaji_source),
+        "field_sources": {
+            "romaji": [romaji_source],
+            "romanji": [romaji_source],
+            "kanji": ["jmdict"],
+            "name_kanji": ["jmdict"],
+        },
     }
     return _write_cache("readings", key, data)
 
@@ -757,7 +1216,7 @@ def lookup_reading(reading: str) -> dict[str, Any]:
 def lookup_text(text: str) -> dict[str, Any]:
     key = (text or "").strip()
     cached = _read_cache("lookup", key)
-    if cached:
+    if cached and cached.get("_cache_schema_version") == CACHE_SCHEMA_VERSION:
         return cached
     data = {
         "type": "lookup",
@@ -821,9 +1280,27 @@ def _priority_weight(priority: str) -> int:
 
 def _priority_label(priority: str) -> str:
     value = str(priority or "")
-    for prefix, label in PRIORITY_LABELS.items():
-        if value.startswith(prefix):
-            return label
+    if value == "news1":
+        return "Mainichi newspaper priority, first 12,000 words"
+    if value == "news2":
+        return "Mainichi newspaper priority, second 12,000 words"
+    if value == "ichi1":
+        return "Ichimango common-word list, higher-priority subset"
+    if value == "ichi2":
+        return "Ichimango common-word list, lower-priority subset"
+    if value == "spec1":
+        return "special common-word priority, first group"
+    if value == "spec2":
+        return "special common-word priority, second group"
+    if value == "gai1":
+        return "common loanword list, higher-priority subset"
+    if value == "gai2":
+        return "common loanword list, lower-priority subset"
+    nf_match = re.fullmatch(r"nf(\d{2})", value)
+    if nf_match:
+        band = int(nf_match.group(1))
+        start = ((band - 1) * 500) + 1
+        return f"Mainichi frequency band {band:02d} (approximately ranks {start}–{band * 500})"
     return value
 
 
@@ -889,7 +1366,7 @@ def _normalize_dictionary_entry(entry: dict[str, Any], text: str, reading_hiraga
         return None
 
     return {
-        "source": "kanjiapi.dev:/words",
+        "source": "jmdict",
         "match": "exact" if matching_variants else "candidate",
         "score": _entry_match_score(entry, text, reading_hiragana),
         "variants": [
@@ -980,7 +1457,7 @@ def _is_symbol_token(token: dict[str, Any]) -> bool:
 
 
 def _is_displayable_breakdown_token(token: dict[str, Any]) -> bool:
-    return not _is_symbol_token(token)
+    return bool(str(token.get("surface") or "").strip())
 
 
 def _fallback_gloss(token: dict[str, Any], prefer_reading: bool = False) -> str:
@@ -1012,16 +1489,16 @@ def _source_concept(source: str) -> str:
     value = str(source or "").strip()
     if not value:
         return ""
-    if value.startswith("kanjiapi.dev:/words"):
-        return "kanjiapi.dev:/words"
-    if value.startswith("kanjiapi.dev:/kanji") or value == "kanjiapi.dev":
-        return "kanjiapi.dev:/kanji"
+    if value == "jmdict" or value.startswith("kanjiapi.dev:/words"):
+        return "jmdict"
+    if value == "kanjidic2" or value.startswith("kanjiapi.dev:/kanji") or value == "kanjiapi.dev":
+        return "kanjidic2"
     if value.startswith("local:") and "extended" in value:
-        return "local"
+        return "app_editorial"
     if value.startswith("local:"):
-        return value
+        return "app_editorial"
     if value.startswith("SudachiPy"):
-        return "SudachiPy"
+        return "sudachi"
     return value
 
 
@@ -1165,7 +1642,9 @@ def _dictionary_source_summary(word_lookup: dict[str, Any], entries: list[dict[s
     ])
     if not sources:
         return "", []
-    return " + ".join(sources), sources
+    catalog = source_catalog()
+    labels = [str(catalog.get(source, {}).get("name") or source) for source in sources]
+    return " + ".join(labels), sources
 
 
 def _primary_meaning(token: dict[str, Any], kind: str, word_meanings: list[str], kanji_details: list[dict[str, Any]]) -> tuple[str, list[str]]:
@@ -1235,7 +1714,7 @@ def _unit_feature_groups(unit: dict[str, Any]) -> dict[str, Any]:
     return {
         "reading": {
             "hiragana": unit.get("reading_hiragana", ""),
-            "romaji": unit.get("reading_romanji", ""),
+            "romaji": unit.get("reading_romaji") or unit.get("reading_romanji", ""),
         },
         "meaning": {
             "glossary": unit.get("primary_meaning", ""),
@@ -1265,7 +1744,7 @@ def _kanji_unit(unit_id: str, character: str, start: int, end: int, kanji_lookup
     remote_entries = list(word_lookup.get("entries") or [])
     merged_entries = _merge_dictionary_entries(remote_entries, [])
     dictionary_source, dictionary_sources = _dictionary_source_summary(word_lookup, merged_entries)
-    component_details = KANJI_COMPONENTS.get(character, {})
+    romaji_source = _romanization_source_id()
     unit = {
         "id": unit_id,
         "kind": "kanji",
@@ -1275,6 +1754,7 @@ def _kanji_unit(unit_id: str, character: str, start: int, end: int, kanji_lookup
         "end": end,
         "lemma": character,
         "reading_hiragana": "",
+        "reading_romaji": "",
         "reading_romanji": "",
         "pos": [],
         "primary_meaning": meanings[0] if meanings else character,
@@ -1289,6 +1769,7 @@ def _kanji_unit(unit_id: str, character: str, start: int, end: int, kanji_lookup
             "kun_readings": kanji_lookup.get("kun_readings", []),
             "on_readings": kanji_lookup.get("on_readings", []),
             "name_readings": kanji_lookup.get("name_readings", []),
+            "structured_readings": kanji_lookup.get("structured_readings", {}),
             "stroke_count": kanji_lookup.get("stroke_count"),
             "grade": kanji_lookup.get("grade"),
             "jlpt": kanji_lookup.get("jlpt"),
@@ -1296,8 +1777,20 @@ def _kanji_unit(unit_id: str, character: str, start: int, end: int, kanji_lookup
             "heisig_en": kanji_lookup.get("heisig_en"),
             "freq_mainichi_shinbun": kanji_lookup.get("freq_mainichi_shinbun"),
             "notes": kanji_lookup.get("notes", []),
-            "components": component_details.get("components", []),
-            "component_source": component_details.get("source", ""),
+            "unicode_metadata": kanji_lookup.get("unicode_metadata", {}),
+            "components": [],
+            "component_source": "",
+            "sources": kanji_lookup.get("sources", {}),
+            "field_sources": kanji_lookup.get("field_sources", {}),
+        },
+        "sources": {
+            **_source_subset("kanjidic2", "jmdict", romaji_source, "unicode"),
+            **(word_lookup.get("sources") or {}),
+        },
+        "field_sources": {
+            "text": ["kanjidic2"],
+            "dictionary_entries": ["jmdict"],
+            "kanji_details": ["kanjidic2", romaji_source, "unicode"],
         },
         "children": [],
     }
@@ -1305,7 +1798,8 @@ def _kanji_unit(unit_id: str, character: str, start: int, end: int, kanji_lookup
     return unit
 
 
-def _whole_unit(text: str, reading_hiragana: str, reading_romanji: str, glossary: str, token_count: int, kanji_count: int) -> dict[str, Any]:
+def _whole_unit(text: str, reading_hiragana: str, reading_romaji: str, glossary: str, token_count: int, kanji_count: int) -> dict[str, Any]:
+    romaji_source = _romanization_source_id()
     unit = {
         "id": "whole_000",
         "kind": "whole",
@@ -1315,11 +1809,21 @@ def _whole_unit(text: str, reading_hiragana: str, reading_romanji: str, glossary
         "end": len(text),
         "lemma": text,
         "reading_hiragana": reading_hiragana,
-        "reading_romanji": reading_romanji,
+        "reading_romaji": reading_romaji,
+        "reading_romanji": reading_romaji,
         "pos": [],
         "primary_meaning": glossary,
         "alternate_meanings": [],
         "children": [],
+        "sources": _source_subset("mangaocr", "sudachi", romaji_source, "jmdict", "app_editorial", "translation_engine"),
+        "field_sources": {
+            "text": ["mangaocr"],
+            "reading_hiragana": ["sudachi"],
+            "reading_romaji": ["sudachi", romaji_source],
+            "reading_romanji": ["sudachi", romaji_source],
+            "primary_meaning": ["jmdict", "app_editorial"],
+            "translation": ["translation_engine"],
+        },
         "summary": {
             "token_count": token_count,
             "kanji_count": kanji_count,
@@ -1337,12 +1841,14 @@ def _segment_from_unit(unit: dict[str, Any], segment_id: str) -> dict[str, Any]:
         "unit_label": unit.get("unit_label", ""),
         "text": unit.get("text", ""),
         "hiragana": unit.get("reading_hiragana", ""),
+        "romaji": unit.get("reading_romaji") or unit.get("reading_romanji", ""),
         "romanji": unit.get("reading_romanji", ""),
         "gloss": unit.get("primary_meaning", ""),
         "start": unit.get("start", 0),
         "end": unit.get("end", 0),
         "children": unit.get("children", []),
         "feature_groups": unit.get("feature_groups", {}),
+        "field_sources": unit.get("field_sources", {}),
     }
 
 
@@ -1393,12 +1899,12 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
     by_region: dict[str, dict[str, Any]] = {}
     global_lookup_hits = 0
     global_lookup_misses = 0
+    romaji_source = _romanization_source_id()
 
     for index, ann in enumerate(annotations, start=1):
         text = str(ann.get("text") or "")
         region_id = ann.get("region_id") or ann.get("id") or f"region_{index:04d}"
         word_tokenized = tokenize_text(text, "C")
-        morpheme_tokenized = tokenize_text(text, "A")
         units_by_id: dict[str, dict[str, Any]] = {}
         breakdowns: dict[str, dict[str, Any]] = {}
         region_lookup_hits = 0
@@ -1466,6 +1972,16 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
                 dictionary_entries = _merge_dictionary_entries(remote_entries, local_entries)
                 dictionary_source, dictionary_sources = _dictionary_source_summary(word_lookup or {}, dictionary_entries)
                 unit_id = f"{layer_id}_{token_index:03d}"
+                reading_romaji = str(token.get("reading_romaji") or token.get("reading_romanji") or "")
+                grammar_detail = _grammar_detail_for_token(token)
+                editorial_dictionary = any(entry.get("source") == "app_editorial" for entry in dictionary_entries)
+                unit_source_ids = ["sudachi", romaji_source]
+                if remote_entries:
+                    unit_source_ids.append("jmdict")
+                if grammar_detail or editorial_dictionary:
+                    unit_source_ids.append("app_editorial")
+                if len(surface) == 1:
+                    unit_source_ids.append("unicode")
                 unit = {
                     "id": unit_id,
                     "kind": kind,
@@ -1475,7 +1991,8 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
                     "end": int(token.get("end", 0)),
                     "lemma": lemma,
                     "reading_hiragana": reading_hiragana,
-                    "reading_romanji": str(token.get("reading_romanji") or ""),
+                    "reading_romaji": reading_romaji,
+                    "reading_romanji": reading_romaji,
                     "pos": list(token.get("pos") or []),
                     "part_of_speech_labels": _pos_labels(list(token.get("pos") or [])),
                     "primary_meaning": primary_meaning,
@@ -1484,12 +2001,27 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
                     "dictionary_source": dictionary_source,
                     "dictionary_sources": dictionary_sources,
                     "dictionary_candidate_count": (word_lookup or {}).get("candidate_count", 0),
-                    "grammar_detail": _grammar_detail_for_token(token),
+                    "grammar_detail": grammar_detail,
+                    "unicode_metadata": _unicode_metadata(surface) if len(surface) == 1 else {},
                     "kanji_details": [
                         units_by_id[child_id].get("kanji_details", {})
                         for child_id in child_ids
                         if child_id in units_by_id
                     ],
+                    "sources": _source_subset(*unit_source_ids),
+                    "field_sources": {
+                        "text": ["sudachi"],
+                        "lemma": ["sudachi"],
+                        "pos": ["sudachi"],
+                        "part_of_speech_labels": ["sudachi", "app_editorial"],
+                        "reading_hiragana": ["sudachi"],
+                        "reading_romaji": ["sudachi", romaji_source],
+                        "reading_romanji": ["sudachi", romaji_source],
+                        "dictionary_entries": dictionary_sources,
+                        "primary_meaning": dictionary_sources or ["app_editorial"],
+                        "grammar_detail": ["app_editorial"] if grammar_detail else [],
+                        "unicode_metadata": ["unicode"] if len(surface) == 1 else [],
+                    },
                     "children": child_ids,
                 }
                 unit["feature_groups"] = _unit_feature_groups(unit)
@@ -1511,14 +2043,13 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
             }
 
         breakdowns["words"] = build_breakdown("words", word_tokenized.get("tokens", []))
-        breakdowns["morphemes"] = build_breakdown("morphemes", morpheme_tokenized.get("tokens", []))
 
-        whole_glossary = breakdowns["words"]["glossary"] or breakdowns["morphemes"]["glossary"]
+        whole_glossary = breakdowns["words"]["glossary"]
         kanji_count = len(KANJI_RE.findall(text))
         whole_unit = _whole_unit(
             text,
             word_tokenized.get("reading_hiragana", ""),
-            word_tokenized.get("reading_romanji", ""),
+            word_tokenized.get("reading_romaji") or word_tokenized.get("reading_romanji", ""),
             whole_glossary,
             breakdowns["words"]["summary"]["token_count"],
             kanji_count,
@@ -1546,11 +2077,11 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
         global_lookup_misses += region_lookup_misses
         by_region[region_id] = {
             "reading_hiragana": word_tokenized.get("reading_hiragana", ""),
+            "reading_romaji": word_tokenized.get("reading_romaji") or word_tokenized.get("reading_romanji", ""),
             "reading_romanji": word_tokenized.get("reading_romanji", ""),
             "glossary": whole_glossary,
             "segments": breakdowns["words"]["segments"],
             "lexical_segments": breakdowns["words"]["segments"],
-            "morpheme_segments": breakdowns["morphemes"]["segments"],
             "kanji_details": region_kanji_details,
             "enrichment": {
                 "ginza": _ginza_enrichment(text),
@@ -1559,10 +2090,16 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
             "units_by_id": units_by_id,
             "summary": {
                 "token_count": breakdowns["words"]["summary"]["token_count"],
-                "morpheme_count": breakdowns["morphemes"]["summary"]["token_count"],
                 "kanji_count": kanji_count,
                 "lookup_hits": region_lookup_hits,
                 "lookup_misses": region_lookup_misses,
+            },
+            "source_catalog": source_catalog(),
+            "field_sources": {
+                "reading_hiragana": ["sudachi"],
+                "reading_romaji": ["sudachi", romaji_source],
+                "reading_romanji": ["sudachi", romaji_source],
+                "glossary": ["jmdict", "app_editorial"],
             },
         }
 
@@ -1571,7 +2108,8 @@ def build_panel_rabbithole(annotations: list[dict[str, Any]]) -> dict[str, Any]:
         "by_region": by_region,
         "global_lookup_hits": global_lookup_hits,
         "global_lookup_misses": global_lookup_misses,
-        "source": "sudachi+kanjiapi-cache",
+        "source": "SudachiPy + JMdict/KANJIDIC2 via KanjiAPI",
+        "source_catalog": source_catalog(),
     }
 
 

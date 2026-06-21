@@ -20,6 +20,9 @@ const ScannerSettings = (() => {
             enable_rotated_variants: true,
         },
         bubble: {
+            mode: 'hybrid',
+            model_confidence: 0.25,
+            model_iou: 0.7,
             search_scale: 1.0,
             wand_enabled: true,
             overlap_reconciliation: true,
@@ -78,6 +81,9 @@ const ScannerSettings = (() => {
                 enable_rotated_variants: Boolean(document.getElementById('scan-rotated-variants')?.checked),
             },
             bubble: {
+                mode: document.getElementById('scan-bubble-mode')?.value || 'hybrid',
+                model_confidence: readNumberInput('scan-bubble-confidence', 0.25),
+                model_iou: readNumberInput('scan-bubble-iou', 0.7),
                 search_scale: readNumberInput('scan-bubble-search-scale', 1.0),
                 wand_enabled: Boolean(document.getElementById('scan-bubble-wand')?.checked),
                 overlap_reconciliation: Boolean(document.getElementById('scan-bubble-overlap')?.checked),
@@ -112,6 +118,9 @@ const ScannerSettings = (() => {
         setElementValue('scan-crop-padding-ratio', settings.ocr.crop_padding_ratio);
         setElementValue('scan-semantic-rerank', settings.ocr.semantic_rerank !== 'off');
         setElementValue('scan-rotated-variants', settings.ocr.enable_rotated_variants);
+        setElementValue('scan-bubble-mode', settings.bubble.mode);
+        setElementValue('scan-bubble-confidence', settings.bubble.model_confidence);
+        setElementValue('scan-bubble-iou', settings.bubble.model_iou);
         setElementValue('scan-bubble-search-scale', settings.bubble.search_scale);
         setElementValue('scan-bubble-wand', settings.bubble.wand_enabled);
         setElementValue('scan-bubble-overlap', settings.bubble.overlap_reconciliation);

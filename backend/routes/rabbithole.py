@@ -21,7 +21,8 @@ async def lookup_text(text: str):
 async def lookup_kanji(character: str):
     if not character:
         raise HTTPException(status_code=400, detail="No kanji provided")
-    return rabbithole_service.lookup_kanji(character)
+    # Rich origin/stroke sources are intentionally fetched only for an opened inspector.
+    return rabbithole_service.lookup_kanji(character, enrich=True)
 
 
 @router.get("/word")

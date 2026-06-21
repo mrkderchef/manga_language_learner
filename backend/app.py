@@ -27,6 +27,7 @@ from services.storage.image_service import ImageService
 from routes.runtime import router as runtime_router
 from routes.scanner import router as scanner_router
 from routes.rabbithole import router as rabbithole_router
+from routes.learning import router as learning_router
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ app.add_middleware(
 app.include_router(runtime_router)
 app.include_router(scanner_router)
 app.include_router(rabbithole_router)
+app.include_router(learning_router)
 
 # Serve frontend static files (CSS, JS)
 app.mount("/css", StaticFiles(directory=str(FRONTEND_DIR / "css")), name="css")

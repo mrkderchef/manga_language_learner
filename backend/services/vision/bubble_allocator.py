@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import cv2
 import numpy as np
+
+from services.vision.bubble_segmenter import BubblePrediction
 
 
 @dataclass
@@ -312,6 +315,105 @@ def annotation_to_region(ann: dict[str, Any], image_w: int, image_h: int) -> dic
     }
 
 
+def associate_model_bubbles(
+    gray_img: np.ndarray,
+    entries: list[dict[str, Any]],
+    predictions: list[BubblePrediction],
+    options: dict[str, Any] | None = None,
+) -> set[int]:
+    """Attach page-level model masks to OCR entries using text containment."""
+    options = options or {}
+    image_h, image_w = gray_img.shape[:2]
+    minimum_containment = float(options.get("model_min_containment", 0.60) or 0.60)
+    matched: set[int] = set()
+    dilated_masks = [
+        cv2.dilate(prediction.mask, np.ones((5, 5), np.uint8), iterations=1)
+        for prediction in predictions
+    ]
+
+    for entry_index, entry in enumerate(entries):
+        region = entry.get("region") or {}
+        candidate_box = candidate_box_from_region(region, gray_img)
+        if not candidate_box:
+            candidate_box = [
+                int(region.get("x", 0)),
+                int(region.get("y", 0)),
+                max(1, int(region.get("width", 1))),
+                max(1, int(region.get("height", 1))),
+            ]
+        text_rect = box_xywh_to_xyxy(candidate_box, image_w, image_h)
+        if text_rect is None:
+            continue
+        tx1, ty1, tx2, ty2 = text_rect
+        text_area = max(1, (tx2 - tx1) * (ty2 - ty1))
+        text_center = rect_center(text_rect)
+        best: tuple[float, float, BubblePrediction] | None = None
+
+        for prediction, dilated in zip(predictions, dilated_masks):
+            contained = cv2.countNonZero(dilated[ty1:ty2, tx1:tx2]) / text_area
+            if contained < minimum_containment:
+                continue
+            bubble_center = rect_center(prediction.bbox)
+            distance = math.hypot(text_center[0] - bubble_center[0], text_center[1] - bubble_center[1])
+            diagonal = max(1.0, math.hypot(prediction.bbox[2] - prediction.bbox[0], prediction.bbox[3] - prediction.bbox[1]))
+            proximity = max(0.0, 1.0 - distance / diagonal)
+            score = contained * 0.70 + prediction.confidence * 0.20 + proximity * 0.10
+            if best is None or score > best[0]:
+                best = (score, contained, prediction)
+
+        if best is None:
+            continue
+
+        association_score, containment, prediction = best
+        ys, xs = np.where(prediction.mask > 0)
+        if not len(xs):
+            continue
+        rect = (
+            max(0, int(xs.min())),
+            max(0, int(ys.min())),
+            min(image_w, int(xs.max()) + 1),
+            min(image_h, int(ys.max()) + 1),
+        )
+        local_mask = prediction.mask[rect[1]:rect[3], rect[0]:rect[2]].copy()
+        local_mask = _protect_text_geometry(local_mask, (rect[0], rect[1]), candidate_box, 0)
+        placement_box = _intersect_boxes(candidate_box, box_xyxy_to_xywh(rect)) or candidate_box
+        placement_rect = box_xywh_to_xyxy(placement_box, image_w, image_h)
+        debug = {
+            "box": [
+                int(region.get("x", 0)), int(region.get("y", 0)),
+                max(1, int(region.get("width", 1))), max(1, int(region.get("height", 1))),
+            ],
+            "candidate_box": candidate_box,
+            "bubble_box": box_xyxy_to_xywh(rect),
+            "bubble_points": _mask_to_points(local_mask, (rect[0], rect[1]), limit=128),
+            "placement_box": placement_box,
+            "bubble_id": prediction.bubble_id,
+            "bubble_confidence": round(prediction.confidence, 4),
+            "association_score": round(association_score, 4),
+            "text_containment": round(containment, 4),
+            "model_id": prediction.model_id,
+            "model_revision": prediction.model_revision,
+            "border_touching": bool(rect[0] == 0 or rect[1] == 0 or rect[2] == image_w or rect[3] == image_h),
+            "mask_topology": "model_instance_mask",
+            "open_balloon_handling": "model mask accepted without a closed-contour requirement",
+            "source": "model_instance",
+        }
+        allocation = AllocationSpace(
+            debug=debug,
+            bubble_rect=rect,
+            placement_rect=placement_rect,
+            mask=local_mask,
+            mask_origin=(rect[0], rect[1]),
+        )
+        ocr_meta = entry.setdefault("ocr_meta", {})
+        ocr_meta["vision"] = debug
+        ocr_meta["_allocation_space"] = allocation
+        if isinstance(region, dict):
+            region["ocr_meta"] = ocr_meta
+        matched.add(entry_index)
+    return matched
+
+
 def _intersect_boxes(a: list[int] | None, b: list[int] | None) -> list[int] | None:
     if not a or not b:
         return None
@@ -541,6 +643,99 @@ def _edge_pressure_from_lengths(
     edge_pressure = sum(excess.values()) / max(1, 2 * (width + height))
     significant_touch_count = sum(1 for value in excess.values() if value > 0)
     return edge_pressure, significant_touch_count, excess
+
+
+def _try_adaptive_topology_allocation(
+    gray_img: np.ndarray,
+    region: dict[str, Any],
+    debug: dict[str, Any],
+    candidate_box: list[int] | None,
+    sx1: int,
+    sy1: int,
+    sx2: int,
+    sy2: int,
+) -> AllocationSpace | None:
+    """Find a light enclosing component with dark, text-like children."""
+    roi = gray_img[sy1:sy2, sx1:sx2]
+    if roi.size == 0 or min(roi.shape[:2]) < 15:
+        return None
+    image_h, image_w = gray_img.shape[:2]
+    blurred = cv2.GaussianBlur(roi, (5, 5), 0)
+    max_block = min(61, min(blurred.shape[:2]) - 1)
+    block_size = max_block if max_block % 2 else max_block - 1
+    if block_size < 15:
+        return None
+    light = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
+        block_size, 7,
+    )
+    light = cv2.morphologyEx(light, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+    contours, hierarchy = cv2.findContours(light, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours or hierarchy is None:
+        return None
+
+    seed = candidate_box or [
+        int(region.get("x", 0)), int(region.get("y", 0)),
+        max(1, int(region.get("width", 1))), max(1, int(region.get("height", 1))),
+    ]
+    anchor = (seed[0] + seed[2] / 2 - sx1, seed[1] + seed[3] / 2 - sy1)
+    seed_area = max(1, seed[2] * seed[3])
+    roi_area = max(1, roi.shape[0] * roi.shape[1])
+    best: tuple[float, np.ndarray, float, int] | None = None
+    tree = hierarchy[0]
+    for index, contour in enumerate(contours):
+        area = float(cv2.contourArea(contour))
+        if area < max(80, seed_area * 1.1) or area > roi_area * 0.85:
+            continue
+        if cv2.pointPolygonTest(contour, anchor, False) < 0:
+            continue
+        child_count = sum(1 for node in tree if int(node[3]) == index)
+        contour_mask = np.zeros_like(light)
+        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+        dark_ratio = float(np.mean(blurred[contour_mask > 0] < 175)) if cv2.countNonZero(contour_mask) else 0.0
+        if child_count < 2 and not (0.015 <= dark_ratio <= 0.40):
+            continue
+        touches, lengths, tolerances, edge_pressure, significant = _border_touch_profile(contour_mask)
+        if significant >= 2 and edge_pressure > 0.04:
+            continue
+        perimeter = max(1.0, cv2.arcLength(contour, True))
+        circularity = min(1.0, 4.0 * np.pi * area / (perimeter * perimeter))
+        score = child_count * 0.08 + min(0.35, dark_ratio) + circularity * 0.35 - edge_pressure
+        if best is None or score > best[0]:
+            best = (score, contour, dark_ratio, child_count)
+    if best is None:
+        return None
+
+    score, contour, dark_ratio, child_count = best
+    full_mask = np.zeros_like(light)
+    cv2.drawContours(full_mask, [contour], -1, 255, -1)
+    full_mask = _protect_text_geometry(full_mask, (sx1, sy1), seed, 0)
+    repaired = _mask_bounding_rect(full_mask, (sx1, sy1))
+    if repaired is None:
+        return None
+    left, top = repaired[0] - sx1, repaired[1] - sy1
+    width, height = repaired[2] - repaired[0], repaired[3] - repaired[1]
+    local_mask = full_mask[top:top + height, left:left + width]
+    box = box_xyxy_to_xywh(repaired)
+    placement_box = _intersect_boxes(seed, box) or seed
+    debug.update({
+        "adaptive_block_size": block_size,
+        "adaptive_child_components": child_count,
+        "adaptive_dark_ratio": round(dark_ratio, 4),
+        "adaptive_score": round(score, 4),
+        "bubble_box": box,
+        "bubble_points": _mask_to_points(local_mask, (repaired[0], repaired[1]), limit=128),
+        "placement_box": placement_box,
+        "bubble_confidence": round(min(0.90, max(0.20, score)), 3),
+        "source": "adaptive_topology",
+    })
+    return AllocationSpace(
+        debug=debug,
+        bubble_rect=repaired,
+        placement_rect=box_xywh_to_xyxy(placement_box, image_w, image_h),
+        mask=local_mask,
+        mask_origin=(repaired[0], repaired[1]),
+    )
 
 
 def _try_magic_wand_allocation(
@@ -1108,6 +1303,12 @@ def estimate_allocation_space(gray_img: np.ndarray, region: dict[str, Any], opti
     if roi.size == 0:
         return AllocationSpace(debug=debug)
 
+    topology_space = _try_adaptive_topology_allocation(
+        gray_img, region, debug, candidate_box, sx1, sy1, sx2, sy2,
+    )
+    if topology_space is not None:
+        return topology_space
+
     if bool(options.get("wand_enabled", True)):
         wand_space = _try_magic_wand_allocation(
             gray_img,
@@ -1123,86 +1324,8 @@ def estimate_allocation_space(gray_img: np.ndarray, region: dict[str, Any], opti
             return wand_space
     else:
         debug["wand_rejected"] = "disabled_by_settings"
-    if debug.get("wand_rejected") in {
-        "likely_background_leak",
-        "overgrown_from_seed",
-        "large_unenclosed_area",
-        "oversized_unenclosed_area",
-        "not_bubbly_or_rectangular_enough",
-    }:
-        return _compact_text_allocation(region, debug, candidate_box, image_w, image_h)
-
-    blurred = cv2.GaussianBlur(roi, (5, 5), 0)
-    otsu_value, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    threshold_value = int(max(180, otsu_value))
-    bright = cv2.threshold(blurred, threshold_value, 255, cv2.THRESH_BINARY)[1]
-    kernel_size = max(3, int(max(3, min(width, height) * 0.08))) | 1
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, kernel, iterations=2)
-    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-    component_count, component_labels, stats, _ = cv2.connectedComponentsWithStats(bright, 8, cv2.CV_32S)
-    debug["threshold"] = threshold_value
-    if component_count <= 1:
-        return AllocationSpace(debug=debug)
-
-    if candidate_box:
-        anchor_x = candidate_box[0] + candidate_box[2] // 2 - sx1
-        anchor_y = candidate_box[1] + candidate_box[3] // 2 - sy1
-    else:
-        anchor_x = x + width // 2 - sx1
-        anchor_y = y + height // 2 - sy1
-
-    label = _nearest_foreground_label(component_labels, anchor_x, anchor_y)
-    if label <= 0 or label >= len(stats):
-        return AllocationSpace(debug=debug)
-
-    left = int(stats[label, cv2.CC_STAT_LEFT])
-    top = int(stats[label, cv2.CC_STAT_TOP])
-    comp_w = int(stats[label, cv2.CC_STAT_WIDTH])
-    comp_h = int(stats[label, cv2.CC_STAT_HEIGHT])
-    area = int(stats[label, cv2.CC_STAT_AREA])
-    component_mask = np.where(component_labels == label, 255, 0).astype(np.uint8)
-    contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return AllocationSpace(debug=debug)
-
-    contour = max(contours, key=cv2.contourArea)
-
-    bubble_box = [sx1 + left, sy1 + top, comp_w, comp_h]
-    box_area = max(1, width * height)
-    bubble_area = max(1, comp_w * comp_h)
-    placement_box = _intersect_boxes(candidate_box, bubble_box) or candidate_box or bubble_box
-    overlap_box = _intersect_boxes([x, y, width, height], bubble_box)
-    overlap_area = (overlap_box[2] * overlap_box[3]) if overlap_box else 0
-
-    full_mask = np.zeros(bright.shape, dtype=np.uint8)
-    cv2.drawContours(full_mask, [contour], -1, 255, -1)
-    margin_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    inset_mask = cv2.erode(full_mask, margin_kernel, iterations=1)
-    min_area = max(80, box_area * 1.25)
-    if cv2.countNonZero(inset_mask) > min_area * 0.6:
-        full_mask = inset_mask
-    local_mask = full_mask[top:top + comp_h, left:left + comp_w]
-    bubble_rect = box_xywh_to_xyxy(bubble_box, image_w, image_h)
-    placement_rect = box_xywh_to_xyxy(placement_box, image_w, image_h) if placement_box else None
-
-    debug.update({
-        "bubble_box": bubble_box,
-        "bubble_points": [[sx1 + px, sy1 + py] for px, py in _sample_contour_points(contour, limit=None)],
-        "placement_box": placement_box,
-        "bubble_area_ratio": round(area / box_area, 3),
-        "bubble_fill_ratio": round(area / bubble_area, 3),
-        "bubble_overlap_ratio": round(overlap_area / box_area, 3),
-        "bubble_confidence": round(min(0.99, max(0.05, (overlap_area / box_area) * 0.6 + (area / bubble_area) * 0.4)), 3),
-        "source": "white_component",
-    })
-    return AllocationSpace(
-        debug=debug,
-        bubble_rect=bubble_rect,
-        placement_rect=placement_rect,
-        mask=local_mask,
-        mask_origin=(bubble_rect[0], bubble_rect[1]) if bubble_rect else None,
-    )
+    debug["fallback_reason"] = debug.get("wand_rejected") or "no_enclosing_topology"
+    return _compact_text_allocation(region, debug, candidate_box, image_w, image_h)
 
 
 def allocation_space_from_annotation(

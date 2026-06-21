@@ -5,20 +5,29 @@
 const Scanner = (() => {
     const TRANSLATION_PENDING_TEXT = 'Translation not available yet.';
     const UNCOMPUTED_TEXT = 'Please run scan to see contents.';
-    const RABBITHOLE_LAYER_DEFS = [
-        { id: 'words', label: 'Lexical Break', upcoming: false },
-        { id: 'morphemes', label: 'Morpheme Break', upcoming: false },
-        { id: 'phrases', label: 'Phrases', upcoming: true },
-        { id: 'stems', label: 'Stems', upcoming: true },
-        { id: 'grammar', label: 'Grammar', upcoming: true },
-    ];
     const DETECTOR_DOC = {
         source: 'comic-text-detector ONNX pipeline via backend/services/detection/region_detector.py',
         stages: 'letterbox resize -> YOLOv5 blocks + UNet mask + DBNet lines -> grouping -> mask refinement -> reading-order sort',
         mask: 'The raw mask is a coarse text-region prediction, not a speech-bubble boundary.',
         refined_mask: 'The refined mask is a per-text-block cleanup pass around detected text, useful as a candidate text area but still not a true bubble extraction.',
-        bubble: 'Bubble allocation is currently heuristic: bright connected regions around the text evidence are estimated as likely balloon interiors and exposed as placement hints.',
-        next_step: 'A cleaner pipeline would keep text detection, OCR reading, and bubble allocation separate, with a seeded wand/flood-fill style bubble pass using OCR text geometry as support evidence.',
+        bubble: 'Bubble allocation is model-first when the optional pinned segmentation asset is installed. Text is associated by mask containment; adaptive topology and compact text-only allocation are fallbacks.',
+        next_step: 'Use the vision overlay to inspect model confidence, association score, mask source, bubble ID, and any fallback reason.',
+    };
+    const RABBITHOLE_HELP = {
+        kunyomi: ['Kun’yomi is a Japanese-origin reading associated with a kanji.', "https://en.wikipedia.org/wiki/Kun%27yomi"],
+        onyomi: ['On’yomi is a reading derived historically from Chinese pronunciations.', "https://en.wikipedia.org/wiki/On%27yomi"],
+        nanori: ['Nanori are readings used mainly in Japanese names.', 'https://en.wikipedia.org/wiki/Nanori'],
+        okurigana: ['Okurigana are kana suffixes attached to kanji stems. A dot in KANJIDIC marks the boundary.', 'https://en.wikipedia.org/wiki/Okurigana'],
+        romaji: ['Romaji represents Japanese sounds with the Latin alphabet.', 'https://en.wikipedia.org/wiki/Romanization_of_Japanese'],
+        components: ['Visual components describe KanjiVG element groupings; they are not necessarily historical etymology.', 'https://kanjivg.tagaini.net/svg-format.html'],
+        grade: ['School grade is the Japanese curriculum grade in which a jōyō kanji is normally introduced.', 'https://en.wikipedia.org/wiki/Ky%C5%8Diku_kanji'],
+        jlpt: ['This is the legacy pre-2010 JLPT level from KANJIDIC2, not an official current assignment.', 'https://en.wikipedia.org/wiki/Japanese-Language_Proficiency_Test'],
+        unicode: ['Unicode assigns a stable code point to a character; it does not define its meaning or origin.', 'https://www.unicode.org/standard/standard.html'],
+        frequency: ['JMdict priority codes are historical, approximate usage signals—not universal frequency scores.', 'https://www.edrdg.org/jmdict_edict_list/2016/msg00060.html'],
+        lemma: ['A lemma is the dictionary form selected for an inflected surface form.', 'https://en.wikipedia.org/wiki/Lemma_(morphology)'],
+        particle: ['A Japanese particle marks grammatical or discourse relationships between expressions.', 'https://en.wikipedia.org/wiki/Japanese_particles'],
+        auxiliary: ['An auxiliary follows another expression to add tense, politeness, negation, or another grammatical function.', 'https://en.wikipedia.org/wiki/Auxiliary_verb'],
+        pos: ['Part of speech is Sudachi’s grammatical classification for this token.', 'https://github.com/WorksApplications/SudachiPy'],
     };
 
     let selectedPanel = null;
@@ -31,6 +40,12 @@ const Scanner = (() => {
     let popupOpenOrder = [];
     const popupPositionsByRegion = new Map();
     const rabbitholeCardStates = new Map();
+    const richKanjiCache = new Map();
+    const richKanjiRequests = new Map();
+    let rabbitholeHelpOverlay = null;
+    let rabbitholeHelpOwner = null;
+    let rabbitholeHelpPinned = false;
+    let rabbitholeHelpHideTimer = null;
 
     function elementRectWithinBounds(element, boundsRect) {
         const rect = element.getBoundingClientRect();
@@ -91,6 +106,7 @@ const Scanner = (() => {
         document.getElementById('btn-reset-scan-settings')?.addEventListener('click', resetScanSettings);
         document.getElementById('btn-refresh-runtime')?.addEventListener('click', () => refreshRuntimeStatus());
         document.getElementById('btn-download-ocr-assets')?.addEventListener('click', downloadOcrAssets);
+        document.getElementById('btn-download-bubble-assets')?.addEventListener('click', downloadBubbleAssets);
         // Home Ollama controls removed
         document.getElementById('translation-slider').addEventListener('input', (e) => {
             setTranslationReveal(Number(e.target.value));
@@ -120,6 +136,9 @@ const Scanner = (() => {
             'scan-semantic-rerank',
             'scan-rotated-variants',
             'scan-bubble-search-scale',
+            'scan-bubble-mode',
+            'scan-bubble-confidence',
+            'scan-bubble-iou',
             'scan-bubble-wand',
             'scan-bubble-overlap',
             'scan-target-lang',
@@ -231,10 +250,10 @@ const Scanner = (() => {
         }
     }
 
-    async function handleTranslationSettingsChanged() {
+    function handleTranslationSettingsChanged() {
         updateTranslationModelVisibility();
         ScannerSettings.persist();
-        await syncTranslatedPanelForCurrentSelection();
+        markScanSettingsChanged();
     }
 
     async function toggleScanOptions(force) {
@@ -274,25 +293,30 @@ const Scanner = (() => {
     function renderRuntimeStatus(status, error = null) {
         const note = document.getElementById('runtime-status-note');
         const downloadBtn = document.getElementById('btn-download-ocr-assets');
+        const bubbleDownloadBtn = document.getElementById('btn-download-bubble-assets');
         if (error || !status) {
             setRuntimeRow('runtime-mangaocr-package', false, 'Unknown');
-            setRuntimeRow('runtime-mangaocr-cache', false, 'Unknown');
+            setRuntimeRow('runtime-mangaocr-model', false, 'Unknown');
             setRuntimeRow('runtime-detector', false, 'Unknown');
+            setRuntimeRow('runtime-bubble-model', false, 'Unknown');
             setRuntimeRow('runtime-ollama', false, 'Unknown');
             if (note) note.textContent = error ? `Runtime check failed: ${error.message}` : 'Runtime status unavailable.';
             if (downloadBtn) downloadBtn.disabled = runtimeDownloadRunning;
+            if (bubbleDownloadBtn) bubbleDownloadBtn.disabled = runtimeDownloadRunning;
             return;
         }
 
         const ocr = status.ocr || {};
         const pkg = ocr.package || {};
-        const cache = ocr.mangaocr_cache || {};
+        const model = ocr.mangaocr_model || {};
         const detector = ocr.detector || {};
         const ollama = status.ollama || {};
+        const bubble = status.bubble_segmentation || {};
 
         setRuntimeRow('runtime-mangaocr-package', pkg.available, pkg.available ? 'Ready' : 'Missing', pkg.error);
-        setRuntimeRow('runtime-mangaocr-cache', cache.available, cache.available ? 'Ready' : 'Missing', cache.error);
+        setRuntimeRow('runtime-mangaocr-model', model.available, model.available ? 'Ready' : 'Missing', model.error);
         setRuntimeRow('runtime-detector', detector.available, detector.available ? 'Ready' : 'Missing', detector.error);
+        setRuntimeRow('runtime-bubble-model', bubble.available, bubble.available ? 'Ready' : 'Fallback', bubble.error);
         setRuntimeRow(
             'runtime-ollama',
             ollama.available,
@@ -303,6 +327,7 @@ const Scanner = (() => {
         if (downloadBtn) {
             downloadBtn.disabled = runtimeDownloadRunning || !pkg.available;
         }
+        if (bubbleDownloadBtn) bubbleDownloadBtn.disabled = runtimeDownloadRunning;
         if (note) {
             const warnings = status.warnings || [];
             note.textContent = warnings.length ? warnings.join(' · ') : 'Runtime ready.';
@@ -338,6 +363,30 @@ const Scanner = (() => {
             runtimeDownloadRunning = false;
             if (btn) {
                 btn.textContent = 'Download OCR assets';
+                btn.disabled = false;
+            }
+            await refreshRuntimeStatus();
+        }
+    }
+
+    async function downloadBubbleAssets() {
+        const btn = document.getElementById('btn-download-bubble-assets');
+        const note = document.getElementById('runtime-status-note');
+        runtimeDownloadRunning = true;
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Downloading...';
+        }
+        if (note) note.textContent = 'Downloading the pinned bubble model...';
+        try {
+            const status = await API.downloadBubbleAssets();
+            renderRuntimeStatus(status);
+        } catch (err) {
+            renderRuntimeStatus(null, err);
+        } finally {
+            runtimeDownloadRunning = false;
+            if (btn) {
+                btn.textContent = 'Download bubble model';
                 btn.disabled = false;
             }
             await refreshRuntimeStatus();
@@ -589,7 +638,7 @@ const Scanner = (() => {
             requests.push(API.getCachedRabbithole(filename, getScanOptions()).then(result => ({ kind: 'rabbithole', result })));
         }
         if (buckets.translation?.has_cache) {
-            requests.push(API.getCachedTranslation(filename, getScanOptions()).then(result => ({ kind: 'translation', result })));
+            requests.push(API.getCurrentTranslation(filename, getScanOptions()).then(result => ({ kind: 'translation', result })));
         }
         if (!requests.length) return null;
 
@@ -617,40 +666,6 @@ const Scanner = (() => {
         return hydrated;
     }
 
-    async function syncTranslatedPanelForCurrentSelection() {
-        if (!selectedPanel || !latestScan) {
-            markScanSettingsChanged();
-            return;
-        }
-        const annotations = latestScan.annotations || [];
-        if (!hasComputedText(annotations) || annotations.some(isUncomputedAnnotation)) {
-            markScanSettingsChanged();
-            return;
-        }
-        if ((document.getElementById('scan-translation-engine')?.value || 'ollama') !== 'ollama') {
-            markScanSettingsChanged();
-            return;
-        }
-
-        try {
-            const result = await API.getCachedTranslation(selectedPanel.filename, getScanOptions());
-            if (!result || result.cache_miss) {
-                markScanSettingsChanged();
-                return;
-            }
-            latestScan = mergeHydratedScanResult(latestScan, result);
-            ocrText = latestScan.text || ocrText;
-            renderDebugPanel(latestScan);
-            renderOverlays(latestScan.annotations || [], latestScan.image_width, latestScan.image_height);
-            showTranslatedPanel(latestScan.translated_image_url);
-            await refreshCacheStatus();
-        } catch (err) {
-            console.warn('Could not hydrate cached translation for current model:', err);
-        } finally {
-            markScanSettingsChanged();
-        }
-    }
-
     function mergeHydratedScanResult(baseResult, stageResult) {
         const merged = {
             ...baseResult,
@@ -658,8 +673,11 @@ const Scanner = (() => {
         };
         const baseAnnotations = baseResult.annotations || [];
         const stageAnnotations = stageResult.annotations || [];
+        const stageAnnotationsByRegion = new Map(
+            stageAnnotations.map((ann, index) => [getAnnotationRegionId(ann, index), ann])
+        );
         merged.annotations = baseAnnotations.map((ann, index) => {
-            const stageAnn = stageAnnotations[index] || {};
+            const stageAnn = stageAnnotationsByRegion.get(getAnnotationRegionId(ann, index)) || {};
             return {
                 ...ann,
                 ...stageAnn,
@@ -1117,7 +1135,20 @@ const Scanner = (() => {
                 line_count: vision.line_count ?? (ann.lines || []).length,
                 threshold: vision.threshold,
                 bubble_source: vision.source,
+                bubble_id: vision.bubble_id,
                 bubble_confidence: vision.bubble_confidence,
+                association_score: vision.association_score,
+                text_containment: vision.text_containment,
+                model_id: vision.model_id,
+                model_revision: vision.model_revision,
+                fallback_reason: vision.fallback_reason,
+                model_fallback_reason: vision.model_fallback_reason,
+                unmatched_text_policy: vision.unmatched_text_policy,
+                possible_content_type: vision.possible_content_type,
+                border_touching: vision.border_touching,
+                open_balloon_handling: vision.open_balloon_handling,
+                page_color_mode: vision.page_color_mode,
+                page_mean_saturation: vision.page_mean_saturation,
                 bubble_area_ratio: vision.bubble_area_ratio,
                 bubble_fill_ratio: vision.bubble_fill_ratio,
                 bubble_overlap_ratio: vision.bubble_overlap_ratio,
@@ -1283,14 +1314,9 @@ const Scanner = (() => {
         if (!rabbitholeCardStates.has(key)) {
             rabbitholeCardStates.set(key, {
                 selection: { regionId: null, unitId: null },
-                layer: 'words',
             });
         }
         return rabbitholeCardStates.get(key);
-    }
-
-    function getCardLayer(instanceKey) {
-        return getRabbitholeCardState(instanceKey).layer || 'words';
     }
 
     function getSelectedRabbitholeUnit(ann, fallback = 0, instanceKey = 'side:default') {
@@ -1332,43 +1358,6 @@ const Scanner = (() => {
         valueEl.textContent = value || '—';
         row.appendChild(valueEl);
         return row;
-    }
-
-    function setActiveRabbitholeLayer(layerId, instanceKey = 'side:default') {
-        const target = RABBITHOLE_LAYER_DEFS.find(layer => layer.id === layerId && !layer.upcoming);
-        if (!target || getCardLayer(instanceKey) === target.id) return;
-        getRabbitholeCardState(instanceKey).layer = target.id;
-        if (latestScan) {
-            renderDebugPanel(latestScan);
-            renderOpenPopups();
-        }
-    }
-
-    function createRabbitholeLayerTabs(compact = false, instanceKey = 'side:default') {
-        const tabs = document.createElement('div');
-        tabs.className = `rabbithole-layer-tabs${compact ? ' compact' : ''}`;
-        const activeLayer = getCardLayer(instanceKey);
-
-        RABBITHOLE_LAYER_DEFS.forEach(layer => {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.className = `rabbithole-layer-tab${activeLayer === layer.id ? ' active' : ''}${layer.upcoming ? ' upcoming' : ''}`;
-            button.textContent = layer.label;
-            button.disabled = Boolean(layer.upcoming);
-            button.setAttribute('aria-pressed', String(activeLayer === layer.id));
-            if (layer.upcoming) {
-                button.title = `${layer.label} is planned for the next rabbithole phase.`;
-            } else {
-                button.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setActiveRabbitholeLayer(layer.id, instanceKey);
-                });
-            }
-            tabs.appendChild(button);
-        });
-
-        return tabs;
     }
 
     function createRabbitholeUnitRow(label, ann, items, compact = false, fallback = '', className = '', instanceKey = 'side:default') {
@@ -1464,9 +1453,10 @@ const Scanner = (() => {
         const pos = Array.isArray(unit.pos) ? unit.pos.map(String) : [];
         if (pos.some(part => part.includes('補助記号'))) return false;
         const hasJapaneseOrAlnum = Array.from(text).some(char => /[\u3040-\u30ff\u3400-\u9fff\p{L}\p{N}]/u.test(char));
-        if (!hasJapaneseOrAlnum) return false;
+        if (!hasJapaneseOrAlnum) return Boolean(unit.unicode_metadata?.codepoint || unit.dictionary_entries?.length);
         return unit.kind !== 'token'
             || Boolean(unit.reading_hiragana)
+            || Boolean(unit.reading_romaji)
             || Boolean(unit.reading_romanji)
             || Boolean(unit.dictionary_entries?.length);
     }
@@ -1479,7 +1469,7 @@ const Scanner = (() => {
     function buildKanjiItems(ann, instanceKey = 'side:default') {
         const rabbit = getRabbitholeData(ann);
         const units = rabbit?.units_by_id || {};
-        const kanjiSpans = getBreakdownSegments(ann, getCardLayer(instanceKey))
+        const kanjiSpans = getBreakdownSegments(ann)
             .map(segment => getUnitForSegment(rabbit, segment))
             .filter(unit => unit && unit.kind !== 'kanji')
             .flatMap(unit => (unit.children || [])
@@ -1533,19 +1523,20 @@ const Scanner = (() => {
         })));
     }
 
-    function buildRabbitholeItems(ann, layerId, instanceKey = 'side:default') {
+    function buildRabbitholeItems(ann, layerId) {
         const rabbit = getRabbitholeData(ann);
-        const activeLayer = getCardLayer(instanceKey);
         if (layerId === 'hiragana') {
-            return buildSegmentItems(ann, activeLayer, getSegmentHiragana);
+            return buildSegmentItems(ann, 'words', getSegmentHiragana);
         }
         if (layerId === 'romaji') {
-            return buildSegmentItems(ann, activeLayer, segment => segment.romanji || getUnitForSegment(rabbit, segment)?.reading_romanji || '');
+            return buildSegmentItems(ann, 'words', segment => segment.romaji || segment.romanji
+                || getUnitForSegment(rabbit, segment)?.reading_romaji
+                || getUnitForSegment(rabbit, segment)?.reading_romanji || '');
         }
         if (layerId === 'glossary') {
-            return buildSegmentItems(ann, activeLayer, segment => segment.gloss || getUnitForSegment(rabbit, segment)?.primary_meaning || '');
+            return buildSegmentItems(ann, 'words', segment => segment.gloss || getUnitForSegment(rabbit, segment)?.primary_meaning || '');
         }
-        if (layerId === 'words' || layerId === 'morphemes') return buildSegmentItems(ann, layerId);
+        if (layerId === 'words') return buildSegmentItems(ann, layerId);
         return [];
     }
 
@@ -1566,35 +1557,255 @@ const Scanner = (() => {
         const rabbit = getRabbitholeData(ann);
         return [
             createRabbitholeTextRow('Recognized Text', ann.text || '', compact),
-            createRabbitholeTextRow('Hiragana', getRabbitHiragana(rabbit), compact),
             createRabbitholeTextRow('EN', ann.translated?.trim() || TRANSLATION_PENDING_TEXT, compact, 'rabbithole-translation'),
         ];
     }
 
-    function createRabbitholeLayerRows(ann, compact = false, instanceKey = 'side:default') {
-        const layer = getCardLayer(instanceKey);
+    function createRabbitholeRows(ann, compact = false, instanceKey = 'side:default') {
         const rows = createRabbitholeBaseRows(ann, compact);
-        const label = RABBITHOLE_LAYER_DEFS.find(item => item.id === layer)?.label || 'Breakdown';
 
-        rows.push(createRabbitholeUnitRow(label, ann, buildRabbitholeItems(ann, layer, instanceKey), compact, ann.text || '', '', instanceKey));
-        rows.push(createRabbitholeUnitRow('Hiragana', ann, buildRabbitholeItems(ann, 'hiragana', instanceKey), compact, getRabbitHiragana(getRabbitholeData(ann)), '', instanceKey));
+        rows.push(createRabbitholeUnitRow('Lexical Break', ann, buildRabbitholeItems(ann, 'words'), compact, ann.text || '', '', instanceKey));
+        rows.push(createRabbitholeUnitRow('Hiragana', ann, buildRabbitholeItems(ann, 'hiragana'), compact, getRabbitHiragana(getRabbitholeData(ann)), '', instanceKey));
 
         const kanjiItems = buildKanjiItems(ann, instanceKey);
         if (kanjiItems.length) {
             rows.push(createRabbitholeUnitRow('Kanji', ann, kanjiItems, compact, 'No kanji units available.', '', instanceKey));
         }
 
-        rows.push(createRabbitholeUnitRow('Romaji', ann, buildRabbitholeItems(ann, 'romaji', instanceKey), compact, getRabbitholeData(ann)?.reading_romanji || '', 'rabbithole-romanji-row', instanceKey));
+        rows.push(createRabbitholeUnitRow('Romaji', ann, buildRabbitholeItems(ann, 'romaji'), compact,
+            getRabbitholeData(ann)?.reading_romaji || getRabbitholeData(ann)?.reading_romanji || '', 'rabbithole-romanji-row', instanceKey));
         return rows;
     }
 
-    function createDictionaryEntriesBlock(unit) {
+    function createExternalLink(label, href, className = '') {
+        const link = document.createElement('a');
+        link.textContent = label;
+        link.href = href;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        if (className) link.className = className;
+        return link;
+    }
+
+    function clearHelpPopoverHideTimer() {
+        window.clearTimeout(rabbitholeHelpHideTimer);
+        rabbitholeHelpHideTimer = null;
+    }
+
+    function hideHelpPopover(force = false) {
+        clearHelpPopoverHideTimer();
+        if (rabbitholeHelpPinned && !force) return;
+        if (rabbitholeHelpOwner) {
+            rabbitholeHelpOwner.setAttribute('aria-expanded', 'false');
+        }
+        if (rabbitholeHelpOverlay) {
+            rabbitholeHelpOverlay.hidden = true;
+        }
+        rabbitholeHelpOwner = null;
+        rabbitholeHelpPinned = false;
+    }
+
+    function scheduleHelpPopoverHide() {
+        clearHelpPopoverHideTimer();
+        rabbitholeHelpHideTimer = window.setTimeout(() => hideHelpPopover(), 120);
+    }
+
+    function ensureHelpPopoverOverlay() {
+        if (rabbitholeHelpOverlay) return rabbitholeHelpOverlay;
+        const overlay = document.createElement('div');
+        overlay.id = 'rabbithole-help-overlay';
+        overlay.className = 'rabbithole-help-content';
+        overlay.setAttribute('role', 'dialog');
+        overlay.setAttribute('aria-label', 'Rabbithole help');
+        overlay.hidden = true;
+        overlay.addEventListener('pointerenter', clearHelpPopoverHideTimer);
+        overlay.addEventListener('pointerleave', scheduleHelpPopoverHide);
+        overlay.addEventListener('focusin', clearHelpPopoverHideTimer);
+        overlay.addEventListener('focusout', scheduleHelpPopoverHide);
+        document.body.appendChild(overlay);
+        rabbitholeHelpOverlay = overlay;
+
+        window.addEventListener('resize', () => hideHelpPopover(true));
+        document.addEventListener('scroll', () => hideHelpPopover(true), true);
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape') hideHelpPopover(true);
+        });
+        document.addEventListener('pointerdown', event => {
+            if (!rabbitholeHelpOwner || overlay.hidden) return;
+            if (event.target === rabbitholeHelpOwner || overlay.contains(event.target)) return;
+            hideHelpPopover(true);
+        }, true);
+        return overlay;
+    }
+
+    function positionHelpPopover(button, overlay) {
+        const margin = 10;
+        const gap = 6;
+        overlay.style.left = '0px';
+        overlay.style.top = '0px';
+        overlay.style.visibility = 'hidden';
+        const triggerRect = button.getBoundingClientRect();
+        const overlayRect = overlay.getBoundingClientRect();
+        const maxLeft = Math.max(margin, window.innerWidth - overlayRect.width - margin);
+        const left = Math.max(margin, Math.min(triggerRect.left, maxLeft));
+        let top = triggerRect.bottom + gap;
+        if (top + overlayRect.height > window.innerHeight - margin) {
+            top = triggerRect.top - overlayRect.height - gap;
+        }
+        top = Math.max(margin, Math.min(top, window.innerHeight - overlayRect.height - margin));
+        overlay.style.left = `${Math.round(left)}px`;
+        overlay.style.top = `${Math.round(top)}px`;
+        overlay.style.visibility = 'visible';
+    }
+
+    function showHelpPopover(button, help, pinned = false) {
+        clearHelpPopoverHideTimer();
+        const overlay = ensureHelpPopoverOverlay();
+        if (rabbitholeHelpOwner && rabbitholeHelpOwner !== button) {
+            rabbitholeHelpOwner.setAttribute('aria-expanded', 'false');
+        }
+        overlay.replaceChildren(
+            document.createTextNode(`${help[0]} `),
+            createExternalLink('Learn more', help[1]),
+        );
+        overlay.hidden = false;
+        rabbitholeHelpOwner = button;
+        rabbitholeHelpPinned = pinned;
+        button.setAttribute('aria-expanded', 'true');
+        positionHelpPopover(button, overlay);
+    }
+
+    function createHelpPopover(helpKey) {
+        const help = RABBITHOLE_HELP[helpKey];
+        if (!help) return null;
+        const wrapper = document.createElement('span');
+        wrapper.className = 'rabbithole-help';
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'rabbithole-help-trigger';
+        button.textContent = '?';
+        button.setAttribute('aria-label', `Explain ${helpKey}`);
+        button.setAttribute('aria-expanded', 'false');
+        button.setAttribute('aria-controls', 'rabbithole-help-overlay');
+        wrapper.addEventListener('pointerenter', () => showHelpPopover(button, help));
+        wrapper.addEventListener('pointerleave', scheduleHelpPopoverHide);
+        button.addEventListener('focus', () => showHelpPopover(button, help));
+        button.addEventListener('blur', scheduleHelpPopoverHide);
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (rabbitholeHelpOwner === button && rabbitholeHelpPinned) {
+                hideHelpPopover(true);
+                return;
+            }
+            showHelpPopover(button, help, true);
+        });
+        wrapper.appendChild(button);
+        return wrapper;
+    }
+
+    function getSourceRecord(unit, sourceId, rabbit = null) {
+        return unit?.sources?.[sourceId]
+            || unit?.kanji_details?.sources?.[sourceId]
+            || rabbit?.source_catalog?.[sourceId]
+            || latestScan?.rabbithole?.source_catalog?.[sourceId]
+            || null;
+    }
+
+    function createSourceBadge(sourceId, unit, rabbit = null) {
+        if (!sourceId) return null;
+        const record = getSourceRecord(unit, sourceId, rabbit);
+        const label = record?.name || ({
+            jmdict: 'JMdict',
+            kanjidic2: 'KANJIDIC2',
+            app_editorial: 'Editorial',
+            sudachi: 'Sudachi',
+            pykakasi: 'pykakasi',
+            local_romaji: 'Local Hepburn fallback',
+            kanjivg: 'KanjiVG',
+            wiktionary: 'Wiktionary',
+            unicode: 'Unicode',
+            mangaocr: 'Manga OCR',
+            translation_engine: 'Translation engine',
+        }[sourceId] || sourceId);
+        const badge = document.createElement(record?.canonical_url ? 'a' : 'span');
+        badge.className = 'rabbithole-source-badge';
+        badge.textContent = label;
+        if (record?.canonical_url) {
+            badge.href = record.canonical_url;
+            badge.target = '_blank';
+            badge.rel = 'noopener noreferrer';
+        }
+        badge.title = [record?.dataset, record?.version].filter(Boolean).join(' · ');
+        return badge;
+    }
+
+    function sourceIdsFor(unit, field, fallback = []) {
+        const direct = unit?.field_sources?.[field]
+            || unit?.kanji_details?.field_sources?.[field];
+        return Array.isArray(direct) && direct.length ? direct : fallback;
+    }
+
+    function appendInspectorValue(container, value) {
+        if (value instanceof Node) {
+            container.appendChild(value);
+            return;
+        }
+        if (Array.isArray(value)) {
+            value.filter(item => item !== null && item !== undefined && String(item).trim()).forEach(item => {
+                const chip = document.createElement('span');
+                chip.className = 'rabbithole-value-chip';
+                chip.textContent = String(item);
+                container.appendChild(chip);
+            });
+            return;
+        }
+        container.textContent = String(value ?? '—');
+    }
+
+    function createInspectorRow(label, value, { helpKey = '', sources = [], unit = null, rabbit = null, className = '' } = {}) {
+        if (value === null || value === undefined || value === '' || (Array.isArray(value) && !value.length)) return null;
+        const row = document.createElement('div');
+        row.className = `rabbithole-inspector-row${className ? ` ${className}` : ''}`;
+        const labelEl = document.createElement('div');
+        labelEl.className = 'rabbithole-inspector-label';
+        labelEl.appendChild(document.createTextNode(label));
+        const help = createHelpPopover(helpKey);
+        if (help) labelEl.appendChild(help);
+        const valueEl = document.createElement('div');
+        valueEl.className = 'rabbithole-inspector-value';
+        appendInspectorValue(valueEl, value);
+        const badges = document.createElement('span');
+        badges.className = 'rabbithole-source-badges';
+        [...new Set(sources.filter(Boolean))].forEach(sourceId => {
+            const badge = createSourceBadge(sourceId, unit, rabbit);
+            if (badge) badges.appendChild(badge);
+        });
+        if (badges.children.length) valueEl.appendChild(badges);
+        row.append(labelEl, valueEl);
+        return row;
+    }
+
+    function createInspectorSection(title, rows, className = '') {
+        const filtered = rows.filter(Boolean);
+        if (!filtered.length) return null;
+        const section = document.createElement('section');
+        section.className = `rabbithole-feature-section${className ? ` ${className}` : ''}`;
+        section.appendChild(createDebugBlockTitle(title));
+        const grid = document.createElement('div');
+        grid.className = 'rabbithole-inspector-grid';
+        filtered.forEach(row => grid.appendChild(row));
+        section.appendChild(grid);
+        return section;
+    }
+
+    function createDictionaryEntriesBlock(unit, rabbit = null, title = 'Dictionary', suppressRepeatedHeadword = false) {
         const entries = Array.isArray(unit?.dictionary_entries) ? unit.dictionary_entries : [];
         if (!entries.length) return null;
 
         const block = document.createElement('div');
         block.className = 'rabbithole-dictionary';
-        block.appendChild(createDebugBlockTitle('Dictionary'));
+        block.appendChild(createDebugBlockTitle(title));
 
         entries.slice(0, 3).forEach((entry, index) => {
             const article = document.createElement('article');
@@ -1606,7 +1817,7 @@ const Scanner = (() => {
             const primaryVariant = variants[0] || {};
             const term = document.createElement('strong');
             term.textContent = primaryVariant.written || unit.text || `Entry ${index + 1}`;
-            header.appendChild(term);
+            if (!suppressRepeatedHeadword || term.textContent !== unit.text) header.appendChild(term);
 
             const reading = primaryVariant.reading_hiragana || '';
             if (reading && reading !== term.textContent) {
@@ -1616,10 +1827,11 @@ const Scanner = (() => {
             }
 
             if (entry.source) {
-                const sourceEl = document.createElement('span');
-                sourceEl.className = 'rabbithole-dictionary-source';
-                sourceEl.textContent = entry.source;
-                header.appendChild(sourceEl);
+                const sourceEl = createSourceBadge(entry.source, unit, rabbit);
+                if (sourceEl) {
+                    sourceEl.classList.add('rabbithole-dictionary-source');
+                    header.appendChild(sourceEl);
+                }
             }
             article.appendChild(header);
 
@@ -1635,6 +1847,8 @@ const Scanner = (() => {
                     chip.textContent = tag.text;
                     tagRow.appendChild(chip);
                 });
+                const help = createHelpPopover('frequency');
+                if (help) tagRow.appendChild(help);
                 article.appendChild(tagRow);
             }
 
@@ -1652,63 +1866,6 @@ const Scanner = (() => {
         });
 
         return block;
-    }
-
-    function getUnitFeatureGroups(unit) {
-        return unit?.feature_groups || {
-            reading: {
-                hiragana: getUnitHiragana(unit),
-                romaji: unit?.reading_romanji,
-            },
-            meaning: {
-                glossary: unit?.primary_meaning,
-                alternate_glossary: unit?.alternate_meanings,
-            },
-            grammar: {
-                segment_type: unit?.kind,
-                part_of_speech: unit?.part_of_speech_labels,
-                analysis_tags: unit?.pos,
-                function: unit?.grammar_detail,
-            },
-            kanji: unit?.kanji_details,
-            dictionary: {
-                source: unit?.dictionary_source,
-                sources: unit?.dictionary_sources,
-                candidate_count: unit?.dictionary_candidate_count,
-            },
-            translation_context: {},
-        };
-    }
-
-    function getUnitInformation(unit) {
-        const features = getUnitFeatureGroups(unit);
-        if (unit?.kind === 'kanji') {
-            return {
-                ...features.kanji,
-                meanings: features.kanji?.meanings || unit.alternate_meanings || [],
-                primary_meaning: unit.primary_meaning,
-            };
-        }
-        return {
-            text: unit?.text,
-            hiragana: features.reading?.hiragana,
-            romaji: features.reading?.romaji,
-            meaning: features.meaning?.glossary,
-            alternate_meaning: features.meaning?.alternate_glossary,
-            unit_type: unit?.unit_label || getRabbitholeUnitKindLabel(unit),
-            part_of_speech: features.grammar?.part_of_speech,
-            grammar_notes: features.grammar?.function,
-            analysis_tags: features.grammar?.analysis_tags,
-        };
-    }
-
-    function createRabbitholeFeatureSection(title, data) {
-        if (isEmptyDebugValue(data)) return null;
-        const section = document.createElement('section');
-        section.className = 'rabbithole-feature-section';
-        section.appendChild(createDebugBlockTitle(title));
-        section.appendChild(createKeyValueGrid(data));
-        return section;
     }
 
     function createNestedUnitsBlock(ann, rabbit, unit, instanceKey = 'side:default') {
@@ -1733,6 +1890,317 @@ const Scanner = (() => {
         return block.children.length > 1 ? block : null;
     }
 
+    function mergeRichKanji(unit, data) {
+        if (!data || unit?.kind !== 'kanji') return;
+        unit.kanji_details = { ...(unit.kanji_details || {}), ...data };
+        unit.sources = { ...(unit.sources || {}), ...(data.sources || {}) };
+        unit.field_sources = { ...(unit.field_sources || {}), ...(data.field_sources || {}) };
+    }
+
+    function ensureRichKanji(unit) {
+        const character = String(unit?.text || '').slice(0, 1);
+        if (!character || unit?.kind !== 'kanji') return;
+        if (richKanjiCache.has(character)) {
+            mergeRichKanji(unit, richKanjiCache.get(character));
+            return;
+        }
+        if (richKanjiRequests.has(character)) return;
+        unit.rich_kanji_loading = true;
+        const request = API.lookupKanji(character)
+            .then(data => {
+                richKanjiCache.set(character, data);
+                mergeRichKanji(unit, data);
+            })
+            .catch(error => {
+                const fallback = { rich_load_error: error?.message || 'Kanji enrichment unavailable.' };
+                richKanjiCache.set(character, fallback);
+                mergeRichKanji(unit, fallback);
+            })
+            .finally(() => {
+                unit.rich_kanji_loading = false;
+                richKanjiRequests.delete(character);
+                if (latestScan) {
+                    renderDebugPanel(latestScan);
+                    renderOpenPopups();
+                }
+            });
+        richKanjiRequests.set(character, request);
+    }
+
+    function createReadingValue(readings) {
+        const list = document.createElement('div');
+        list.className = 'rabbithole-reading-list';
+        let hasOkuriganaMarker = false;
+        (readings || []).forEach(reading => {
+            const item = document.createElement('span');
+            const kana = typeof reading === 'string' ? reading : reading?.kana;
+            const romaji = typeof reading === 'string' ? '' : reading?.romaji;
+            if (String(kana || '').includes('.')) hasOkuriganaMarker = true;
+            item.appendChild(document.createTextNode(kana || ''));
+            if (romaji) {
+                const romanized = document.createElement('small');
+                romanized.textContent = romaji;
+                item.appendChild(romanized);
+            }
+            list.appendChild(item);
+        });
+        if (list.children.length) {
+            const romajiHelp = createHelpPopover('romaji');
+            if (romajiHelp) list.appendChild(romajiHelp);
+        }
+        if (hasOkuriganaMarker) {
+            const okuriganaHelp = createHelpPopover('okurigana');
+            if (okuriganaHelp) list.appendChild(okuriganaHelp);
+        }
+        return list;
+    }
+
+    function createStrokeOrderValue(strokeOrder, character) {
+        if (!strokeOrder?.available || !Array.isArray(strokeOrder.paths) || !strokeOrder.paths.length) {
+            const status = document.createElement('span');
+            status.className = 'rabbithole-muted';
+            status.textContent = strokeOrder?.error ? 'Stroke order unavailable.' : 'Loading stroke order…';
+            return status;
+        }
+        const wrapper = document.createElement('div');
+        wrapper.className = 'kanji-stroke-order';
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        const validViewBox = /^-?[\d.]+(?:\s+-?[\d.]+){3}$/.test(String(strokeOrder.view_box || ''));
+        svg.setAttribute('viewBox', validViewBox ? strokeOrder.view_box : '0 0 109 109');
+        svg.setAttribute('role', 'img');
+        svg.setAttribute('aria-label', `Animated stroke order for ${character}`);
+        strokeOrder.paths.forEach((stroke, index) => {
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', String(stroke.d || ''));
+            path.setAttribute('pathLength', '1');
+            path.style.setProperty('--stroke-index', index);
+            svg.appendChild(path);
+        });
+        const replay = document.createElement('button');
+        replay.type = 'button';
+        replay.className = 'kanji-stroke-replay';
+        replay.textContent = 'Replay';
+        replay.addEventListener('click', () => {
+            svg.classList.remove('playing');
+            requestAnimationFrame(() => requestAnimationFrame(() => svg.classList.add('playing')));
+        });
+        svg.classList.add('playing');
+        wrapper.append(svg, replay);
+        return wrapper;
+    }
+
+    function createGlyphOriginValue(origin) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'rabbithole-origin-note';
+        const text = document.createElement('p');
+        text.textContent = origin?.text || origin?.message || 'No glyph-origin note available';
+        wrapper.appendChild(text);
+        const caveat = document.createElement('small');
+        caveat.className = 'rabbithole-origin-caveat';
+        caveat.textContent = 'Wiktionary is an editorial starting point, not an authoritative etymology. ';
+        caveat.appendChild(createExternalLink(
+            'CUHK character database (further research)',
+            'https://humanum.arts.cuhk.edu.hk/Lexis/lexi-mf/',
+        ));
+        wrapper.appendChild(caveat);
+        if (origin?.revision_url) {
+            wrapper.appendChild(createExternalLink(
+                origin.revision_id ? `Wiktionary revision ${origin.revision_id}` : 'Wiktionary page',
+                origin.revision_url,
+            ));
+        }
+        if (origin?.stale) {
+            const stale = document.createElement('span');
+            stale.className = 'rabbithole-stale';
+            stale.textContent = 'Cached copy (network refresh failed)';
+            wrapper.appendChild(stale);
+        }
+        return wrapper;
+    }
+
+    function createSourcesDrawer(unit, rabbit) {
+        const records = {
+            ...(rabbit?.source_catalog || {}),
+            ...(unit?.sources || {}),
+            ...(unit?.kanji_details?.sources || {}),
+        };
+        const usedIds = new Set(Object.values(unit?.field_sources || {}).flat().filter(Boolean));
+        Object.values(unit?.kanji_details?.field_sources || {}).flat().filter(Boolean).forEach(id => usedIds.add(id));
+        if (!usedIds.size) Object.keys(unit?.sources || {}).forEach(id => usedIds.add(id));
+        const details = document.createElement('details');
+        details.className = 'rabbithole-sources-drawer';
+        const summary = document.createElement('summary');
+        summary.textContent = 'Sources used';
+        details.appendChild(summary);
+        [...usedIds].forEach(sourceId => {
+            const record = records[sourceId];
+            if (!record) return;
+            const article = document.createElement('article');
+            const heading = document.createElement('strong');
+            if (record.canonical_url) heading.appendChild(createExternalLink(record.name || sourceId, record.canonical_url));
+            else heading.textContent = record.name || sourceId;
+            article.appendChild(heading);
+            const meta = [
+                record.dataset && `Dataset: ${record.dataset}`,
+                record.intermediary && `Via: ${record.intermediary}`,
+                record.version && `Version: ${record.version}`,
+                record.license && `License: ${record.license}`,
+                record.retrieved_at && `Retrieved: ${new Date(Number(record.retrieved_at) * 1000).toLocaleString()}`,
+            ].filter(Boolean);
+            const paragraph = document.createElement('p');
+            paragraph.textContent = meta.join(' · ');
+            article.appendChild(paragraph);
+            details.appendChild(article);
+        });
+        return details;
+    }
+
+    function createKanjiInspectorContent(inspector, ann, rabbit, unit, instanceKey) {
+        ensureRichKanji(unit);
+        const details = unit.kanji_details || {};
+        const writing = createInspectorSection('Writing & origin', [
+            createInspectorRow('Stroke order', createStrokeOrderValue(details.stroke_order, unit.text), {
+                sources: sourceIdsFor(details, 'stroke_order', ['kanjivg']), unit, rabbit,
+            }),
+            createInspectorRow('Stroke count', details.stroke_count, {
+                sources: sourceIdsFor(details, 'stroke_count', ['kanjidic2']), unit, rabbit,
+            }),
+            createInspectorRow('Visual components', (details.components || []).map(component => {
+                if (typeof component === 'string') return component;
+                return [component.element, component.position && `(${component.position})`].filter(Boolean).join(' ');
+            }), {
+                helpKey: 'components', sources: sourceIdsFor(details, 'components', ['kanjivg']), unit, rabbit,
+            }),
+            createInspectorRow('Unicode', [details.unicode_metadata?.codepoint || (details.unicode && `U+${details.unicode}`), details.unicode_metadata?.name].filter(Boolean).join(' — '), {
+                helpKey: 'unicode', sources: sourceIdsFor(details, 'unicode', ['unicode']), unit, rabbit,
+            }),
+            createInspectorRow('Glyph origin', details.glyph_origin
+                ? createGlyphOriginValue(details.glyph_origin)
+                : (unit.rich_kanji_loading ? 'Loading glyph-origin note…' : 'No glyph-origin note available'), {
+                sources: sourceIdsFor(details, 'glyph_origin', ['wiktionary']), unit, rabbit, className: 'wide',
+            }),
+        ]);
+        if (writing) inspector.appendChild(writing);
+
+        const readings = details.structured_readings || {};
+        const readingSection = createInspectorSection('Readings', [
+            createInspectorRow('Kun’yomi', createReadingValue(readings.kun || []), {
+                helpKey: 'kunyomi', sources: sourceIdsFor(details, 'structured_readings', ['kanjidic2', 'pykakasi']), unit, rabbit,
+            }),
+            createInspectorRow('On’yomi', createReadingValue(readings.on || []), {
+                helpKey: 'onyomi', sources: sourceIdsFor(details, 'structured_readings', ['kanjidic2', 'pykakasi']), unit, rabbit,
+            }),
+            createInspectorRow('Nanori', createReadingValue(readings.nanori || []), {
+                helpKey: 'nanori', sources: sourceIdsFor(details, 'structured_readings', ['kanjidic2', 'pykakasi']), unit, rabbit,
+            }),
+        ]);
+        if (readingSection) inspector.appendChild(readingSection);
+
+        const dictionary = createDictionaryEntriesBlock(unit, rabbit, 'Dictionary', true);
+        if (dictionary) {
+            const metadata = createInspectorSection('Dictionary metadata', [
+                createInspectorRow('School grade', details.grade, {
+                    helpKey: 'grade', sources: sourceIdsFor(details, 'grade', ['kanjidic2']), unit, rabbit,
+                }),
+                createInspectorRow('Legacy JLPT (pre-2010)', details.jlpt, {
+                    helpKey: 'jlpt', sources: sourceIdsFor(details, 'jlpt', ['kanjidic2']), unit, rabbit,
+                }),
+                createInspectorRow('Mainichi rank', details.freq_mainichi_shinbun, {
+                    helpKey: 'frequency', sources: sourceIdsFor(details, 'freq_mainichi_shinbun', ['kanjidic2']), unit, rabbit,
+                }),
+            ]);
+            inspector.appendChild(dictionary);
+            if (metadata) inspector.appendChild(metadata);
+        } else {
+            const fallback = createInspectorSection('Dictionary', [
+                createInspectorRow('KANJIDIC character gloss', details.meanings || [], {
+                    sources: sourceIdsFor(details, 'meanings', ['kanjidic2']), unit, rabbit,
+                }),
+                createInspectorRow('School grade', details.grade, {
+                    helpKey: 'grade', sources: sourceIdsFor(details, 'grade', ['kanjidic2']), unit, rabbit,
+                }),
+                createInspectorRow('Legacy JLPT (pre-2010)', details.jlpt, {
+                    helpKey: 'jlpt', sources: sourceIdsFor(details, 'jlpt', ['kanjidic2']), unit, rabbit,
+                }),
+            ]);
+            if (fallback) inspector.appendChild(fallback);
+        }
+
+        if (details.heisig_en) {
+            const learning = document.createElement('details');
+            learning.className = 'rabbithole-learning-references';
+            const summary = document.createElement('summary');
+            summary.textContent = 'Learning references';
+            learning.appendChild(summary);
+            const row = createInspectorRow('Heisig mnemonic keyword', details.heisig_en, {
+                sources: sourceIdsFor(details, 'heisig_en', ['kanjidic2']), unit, rabbit,
+            });
+            if (row) learning.appendChild(row);
+            inspector.appendChild(learning);
+        }
+        const nested = createNestedUnitsBlock(ann, rabbit, unit, instanceKey);
+        if (nested) inspector.appendChild(nested);
+    }
+
+    function createGeneralInspectorContent(inspector, ann, rabbit, unit, instanceKey) {
+        const romaji = unit.reading_romaji || unit.reading_romanji || '';
+        const identity = createInspectorSection('Identity', [
+            createInspectorRow('Lemma', unit.lemma !== unit.text ? unit.lemma : '', {
+                helpKey: 'lemma', sources: sourceIdsFor(unit, 'lemma', ['sudachi']), unit, rabbit,
+            }),
+            createInspectorRow('Part of speech', unit.part_of_speech_labels || unit.pos || [], {
+                helpKey: 'pos', sources: sourceIdsFor(unit, 'pos', ['sudachi']), unit, rabbit,
+            }),
+        ]);
+        if (identity) inspector.appendChild(identity);
+        const reading = createInspectorSection('Reading', [
+            createInspectorRow('Hiragana', unit.reading_hiragana, {
+                sources: sourceIdsFor(unit, 'reading_hiragana', ['sudachi']), unit, rabbit,
+            }),
+            createInspectorRow('Romaji', romaji, {
+                helpKey: 'romaji', sources: sourceIdsFor(unit, 'reading_romaji', ['sudachi', 'pykakasi']), unit, rabbit,
+            }),
+        ]);
+        if (reading) inspector.appendChild(reading);
+        if (unit.grammar_detail && Object.keys(unit.grammar_detail).length) {
+            const helpKey = unit.kind === 'particle' ? 'particle' : (unit.kind === 'aux' ? 'auxiliary' : '');
+            const grammar = createInspectorSection('Grammar', [
+                createInspectorRow(unit.grammar_detail.label || 'Function', unit.grammar_detail.notes || [], {
+                    helpKey, sources: sourceIdsFor(unit, 'grammar_detail', ['app_editorial']), unit, rabbit,
+                }),
+            ]);
+            if (grammar) inspector.appendChild(grammar);
+        }
+        const dictionary = createDictionaryEntriesBlock(unit, rabbit);
+        if (dictionary) inspector.appendChild(dictionary);
+        else if (unit.primary_meaning && unit.kind !== 'whole') {
+            const fallback = createInspectorSection('Dictionary', [
+                createInspectorRow('Contextual gloss', unit.primary_meaning, {
+                    sources: sourceIdsFor(unit, 'primary_meaning', ['app_editorial']), unit, rabbit,
+                }),
+            ]);
+            if (fallback) inspector.appendChild(fallback);
+        }
+        if (unit.kind === 'whole') {
+            const translation = createInspectorSection('Translation', [
+                createInspectorRow('English', ann.translated?.trim() || TRANSLATION_PENDING_TEXT, {
+                    sources: ['translation_engine'], unit, rabbit,
+                }),
+            ]);
+            if (translation) inspector.appendChild(translation);
+        }
+        if (unit.unicode_metadata?.codepoint) {
+            const writing = createInspectorSection('Writing & origin', [
+                createInspectorRow('Unicode', `${unit.unicode_metadata.codepoint} — ${unit.unicode_metadata.name}`, {
+                    helpKey: 'unicode', sources: sourceIdsFor(unit, 'unicode_metadata', ['unicode']), unit, rabbit,
+                }),
+            ]);
+            if (writing) inspector.appendChild(writing);
+        }
+        const nested = createNestedUnitsBlock(ann, rabbit, unit, instanceKey);
+        if (nested) inspector.appendChild(nested);
+    }
+
     function createRabbitholeUnitInspector(ann, compact = false, instanceKey = 'side:default') {
         const rabbit = getRabbitholeData(ann);
         const unit = getSelectedRabbitholeUnit(ann, 0, instanceKey);
@@ -1743,18 +2211,22 @@ const Scanner = (() => {
 
         const title = document.createElement('div');
         title.className = 'rabbithole-inspector-title';
-        title.textContent = `${unit.text} · ${getRabbitholeUnitKindLabel(unit)}`;
+        const titleText = document.createElement('strong');
+        titleText.textContent = unit.text;
+        const kind = document.createElement('span');
+        kind.textContent = getRabbitholeUnitKindLabel(unit);
+        title.append(titleText, kind);
+        const kindHelpKey = unit.kind === 'particle' ? 'particle'
+            : (unit.kind === 'aux' ? 'auxiliary' : '');
+        const kindHelp = createHelpPopover(kindHelpKey);
+        if (kindHelp) title.appendChild(kindHelp);
+        const identitySource = createSourceBadge(sourceIdsFor(unit, 'text', [unit.kind === 'kanji' ? 'kanjidic2' : 'sudachi'])[0], unit, rabbit);
+        if (identitySource) title.appendChild(identitySource);
         inspector.appendChild(title);
 
-        const infoTitle = unit.kind === 'kanji' ? 'Kanji information' : 'Segment information';
-        const infoBlock = createRabbitholeFeatureSection(infoTitle, getUnitInformation(unit));
-        if (infoBlock) inspector.appendChild(infoBlock);
-
-        const dictionaryBlock = createDictionaryEntriesBlock(unit);
-        if (dictionaryBlock) inspector.appendChild(dictionaryBlock);
-
-        const nestedBlock = createNestedUnitsBlock(ann, rabbit, unit, instanceKey);
-        if (nestedBlock) inspector.appendChild(nestedBlock);
+        if (unit.kind === 'kanji') createKanjiInspectorContent(inspector, ann, rabbit, unit, instanceKey);
+        else createGeneralInspectorContent(inspector, ann, rabbit, unit, instanceKey);
+        inspector.appendChild(createSourcesDrawer(unit, rabbit));
 
         return inspector;
     }
@@ -1839,11 +2311,9 @@ const Scanner = (() => {
 
         entry.appendChild(header);
 
-        entry.appendChild(createRabbitholeLayerTabs(compact, instanceKey));
-
         const grid = document.createElement('div');
         grid.className = 'rabbithole-table';
-        createRabbitholeLayerRows(ann, compact, instanceKey).forEach(row => grid.appendChild(row));
+        createRabbitholeRows(ann, compact, instanceKey).forEach(row => grid.appendChild(row));
         entry.appendChild(grid);
 
         const inspector = createRabbitholeUnitInspector(ann, compact, instanceKey);
@@ -2190,6 +2660,7 @@ const Scanner = (() => {
     }
 
     function renderOverlays(annotations, imgNatW, imgNatH) {
+        hideHelpPopover(true);
         const overlay = document.getElementById('ocr-overlay');
         const panelImg = document.getElementById('scanner-panel-img');
         overlay.innerHTML = '';

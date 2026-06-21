@@ -37,6 +37,13 @@ logger = logging.getLogger(__name__)
 RENDER_METHOD = "opencv-pillow-v5"
 
 
+def _rendered_image_url(panel_id: str, cache_name: str) -> str:
+	# current.png is intentionally overwritten. A content-derived query value
+	# prevents the browser from displaying the previous render for the same panel.
+	version = cache_name.rsplit("_", 1)[-1].removesuffix(".png")
+	return f"/api/media/rendered/{panel_id}/current.png?v={version}"
+
+
 @dataclass
 class LayoutSpace:
 	ann: dict[str, Any]
@@ -94,7 +101,7 @@ def render_translated_panel(panel_path: Path, scan_result: dict[str, Any]) -> di
 	if output_path.exists() and _render_metadata_matches(metadata_path, cache_name):
 		panel_id = ocr_panel_slug(panel_path)
 		return {
-			"translated_image_url": f"/api/media/rendered/{panel_id}/current.png",
+			"translated_image_url": _rendered_image_url(panel_id, cache_name),
 			"render_method": RENDER_METHOD,
 			"render_warnings": [],
 		}
@@ -124,7 +131,7 @@ def render_translated_panel(panel_path: Path, scan_result: dict[str, Any]) -> di
 		metadata_path.write_text(json.dumps({"cache_name": cache_name}, sort_keys=True), encoding="utf-8")
 		panel_id = ocr_panel_slug(panel_path)
 		return {
-			"translated_image_url": f"/api/media/rendered/{panel_id}/current.png",
+			"translated_image_url": _rendered_image_url(panel_id, cache_name),
 			"render_method": RENDER_METHOD,
 			"render_warnings": warnings,
 		}
@@ -264,9 +271,16 @@ def _is_flat_bubble_background(metrics: dict[str, float], color: np.ndarray) -> 
 def _clean_annotation_regions(bgr: np.ndarray, gray: np.ndarray, annotations: list[dict[str, Any]]) -> np.ndarray:
 	cleaned = bgr.copy()
 	image_h, image_w = bgr.shape[:2]
+	painted_bubble_ids: set[str] = set()
 	for ann in annotations:
 		text_mask = _annotation_text_mask((image_h, image_w), ann)
 		allocation = allocation_space_from_annotation(gray, ann, image_w, image_h)
+		bubble_id = str(allocation.debug.get("bubble_id") or "")
+		if bubble_id and bubble_id in painted_bubble_ids:
+			vision = (ann.get("ocr_debug") or {}).setdefault("render_cleaning", {})
+			vision["mode"] = "reuse_shared_bubble"
+			vision["bubble_id"] = bubble_id
+			continue
 		bubble_mask = None
 		if allocation.mask is not None and allocation.mask_origin is not None:
 			bubble_mask = _allocation_global_mask(allocation.mask, allocation.mask_origin, (image_h, image_w))
@@ -283,6 +297,8 @@ def _clean_annotation_regions(bgr: np.ndarray, gray: np.ndarray, annotations: li
 			if _is_flat_bubble_background(metrics, color):
 				cleaned[bubble_mask > 0] = color
 				vision["mode"] = "paint_bubble_median"
+				if bubble_id:
+					painted_bubble_ids.add(bubble_id)
 				continue
 			vision["mode"] = "inpaint_text_bbox_nonflat"
 

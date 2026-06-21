@@ -6,6 +6,7 @@
     <title>Manga Language Learner</title>
     <link rel="stylesheet" href="css/main.css">
     <link rel="stylesheet" href="css/scanner.css">
+    <link rel="stylesheet" href="css/learning.css">
 </head>
 <body>
     <nav id="navbar">
@@ -13,6 +14,7 @@
         <div class="nav-links">
             <a href="#" data-page="home" class="nav-link active">Home</a>
             <a href="#" data-page="scanner" class="nav-link">Reader</a>
+            <a href="#" data-page="learning" class="nav-link">Learning</a>
         </div>
     </nav>
 
@@ -27,6 +29,11 @@
                         <div class="mode-icon">🔍</div>
                         <h2>Reader</h2>
                         <p>Lies Manga-Panels im Original oder mit platzierter Übersetzung.</p>
+                    </div>
+                    <div class="mode-card" data-goto="learning">
+                        <div class="mode-icon">📚</div>
+                        <h2>Learning</h2>
+                        <p>Lerne spielerisch Vokabeln und Grammatik direkt aus Manga-Panels.</p>
                     </div>
                 </div>
                 <!-- Ollama Home panel removed -->
@@ -82,7 +89,7 @@
                                 <span class="runtime-status-name">MangaOCR package</span>
                                 <span class="runtime-status-value">Checking...</span>
                             </div>
-                            <div id="runtime-mangaocr-cache" class="runtime-status-row">
+                            <div id="runtime-mangaocr-model" class="runtime-status-row">
                                 <span class="runtime-status-dot"></span>
                                 <span class="runtime-status-name">MangaOCR model</span>
                                 <span class="runtime-status-value">Checking...</span>
@@ -90,6 +97,11 @@
                             <div id="runtime-detector" class="runtime-status-row">
                                 <span class="runtime-status-dot"></span>
                                 <span class="runtime-status-name">Text detector</span>
+                                <span class="runtime-status-value">Checking...</span>
+                            </div>
+                            <div id="runtime-bubble-model" class="runtime-status-row">
+                                <span class="runtime-status-dot"></span>
+                                <span class="runtime-status-name">Bubble segmenter</span>
                                 <span class="runtime-status-value">Checking...</span>
                             </div>
                             <div id="runtime-ollama" class="runtime-status-row">
@@ -101,6 +113,7 @@
                         <div class="runtime-actions">
                             <button id="btn-refresh-runtime" class="cache-action" type="button">Refresh</button>
                             <button id="btn-download-ocr-assets" class="cache-action" type="button">Download OCR assets</button>
+                            <button id="btn-download-bubble-assets" class="cache-action" type="button">Download bubble model</button>
                         </div>
                         <div id="runtime-status-note" class="runtime-status-note">Runtime status not checked yet.</div>
                     </section>
@@ -176,6 +189,21 @@
                     </section>
                     <section class="scan-options-section">
                         <div class="scan-options-title">Bubble Allocation</div>
+                        <label title="Hybrid uses the optional instance-segmentation model with automatic classical fallback.">
+                            <span>Mode</span>
+                            <select id="scan-bubble-mode">
+                                <option value="hybrid">Hybrid model</option>
+                                <option value="classical">Classical only</option>
+                            </select>
+                        </label>
+                        <label title="Minimum model confidence for a predicted bubble.">
+                            <span>Model confidence</span>
+                            <input id="scan-bubble-confidence" type="number" min="0.05" max="0.95" step="0.05" value="0.25">
+                        </label>
+                        <label title="Mask non-maximum-suppression overlap threshold.">
+                            <span>Model IoU</span>
+                            <input id="scan-bubble-iou" type="number" min="0.1" max="0.95" step="0.05" value="0.7">
+                        </label>
                         <label title="Scale the search area used for bubble/placement estimation.">
                             <span>Search scale</span>
                             <input id="scan-bubble-search-scale" type="number" min="0.4" max="2.5" step="0.1" value="1">
@@ -263,11 +291,44 @@
             </div>
         </section>
 
+        <!-- Learning Page -->
+        <section id="page-learning" class="page learning-page">
+            <h1>Learning</h1>
+            <div class="learning-layout">
+                <div class="learning-panel-area">
+                    <img id="learning-panel-img" src="" alt="Learning manga panel" loading="lazy" decoding="async">
+                    <div id="learning-overlay" class="learning-overlay"></div>
+                </div>
+                <div class="learning-sidebar">
+                    <div class="learning-progress-card">
+                        <h3>Fortschritt</h3>
+                        <div class="learning-progress-bar">
+                            <div id="learning-progress-fill" class="learning-progress-fill" style="width: 0%"></div>
+                        </div>
+                        <p id="learning-progress-text" class="learning-progress-text">0 / 0 Wörter</p>
+                    </div>
+                    <div id="learning-vocab-card" class="learning-vocab-card">
+                        <h3>Vokabel</h3>
+                        <div id="learning-vocab-japanese" class="learning-vocab-japanese"></div>
+                        <div id="learning-vocab-reading" class="learning-vocab-reading"></div>
+                        <div id="learning-vocab-meaning" class="learning-vocab-meaning hidden"></div>
+                        <button id="btn-learning-reveal" class="btn btn-primary">Bedeutung zeigen</button>
+                        <div id="learning-vocab-actions" class="learning-vocab-actions hidden">
+                            <button id="btn-learning-knew" class="btn btn-success">Wusste ich ✓</button>
+                            <button id="btn-learning-didnt-know" class="btn btn-danger">Wusste ich nicht ✗</button>
+                        </div>
+                    </div>
+                    <button id="btn-learning-next-panel" class="btn btn-secondary">Nächstes Panel →</button>
+                </div>
+            </div>
+        </section>
+
     </main>
 
     <script src="js/api.js"></script>
     <script src="js/scanner-settings.js"></script>
     <script src="js/scanner.js"></script>
+    <script src="js/learning.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>

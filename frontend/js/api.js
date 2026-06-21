@@ -101,6 +101,7 @@ const API = (() => {
                 body: formData,
             }).then(r => r.json()).then(data => {
                 invalidateCache('/api/scanner/panels');
+                invalidateCache('/api/learning/panels');
                 return data;
             });
         },
@@ -150,7 +151,7 @@ const API = (() => {
             });
         },
 
-        getCachedTranslation(filename, options = {}) {
+        getCurrentTranslation(filename, options = {}) {
             return request(`/api/scanner/${filename}/translate`, {
                 method: 'POST',
                 body: JSON.stringify({ ...options, cache_only: true }),
@@ -189,6 +190,13 @@ const API = (() => {
 
         downloadOcrAssets() {
             return request('/api/runtime/ocr-assets/download', { method: 'POST' }).then(data => {
+                invalidateCache('/api/runtime/status');
+                return data;
+            });
+        },
+
+        downloadBubbleAssets() {
+            return request('/api/runtime/bubble-assets/download', { method: 'POST' }).then(data => {
                 invalidateCache('/api/runtime/status');
                 return data;
             });
@@ -235,6 +243,29 @@ const API = (() => {
                 invalidateCache(`/api/scanner/${filename}/regions`);
                 return result;
             });
+        },
+
+        // === Learning page endpoints ===
+        getLearningPanels() {
+            return request('/api/learning/panels');
+        },
+
+        getLearningPanelVocab(filename) {
+            return request(`/api/learning/${encodeURIComponent(filename)}/vocab`);
+        },
+
+        submitLearningAnswer(filename, word, knew) {
+            return request(`/api/learning/${encodeURIComponent(filename)}/answer`, {
+                method: 'POST',
+                body: JSON.stringify({ word, knew }),
+            }).then(data => {
+                invalidateCache('/api/learning/progress');
+                return data;
+            });
+        },
+
+        getLearningProgress() {
+            return request('/api/learning/progress');
         },
 
         lookupText(text) {

@@ -1,0 +1,118 @@
+.learning-page {
+    overflow: auto;
+}
+
+.learning-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 350px;
+    gap: 2rem;
+    margin-top: 1.5rem;
+}
+
+.learning-panel-area {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 500px;
+    padding: 1rem;
+    border-radius: var(--border-radius);
+    background: var(--bg-card);
+}
+
+.learning-panel-area img {
+    max-width: 100%;
+    max-height: 600px;
+    border-radius: 8px;
+}
+
+.learning-overlay {
+    position: absolute;
+    inset: 1rem;
+    pointer-events: none;
+}
+
+.learning-sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+}
+
+.learning-progress-card,
+.learning-vocab-card {
+    padding: 1.25rem;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: var(--border-radius);
+    background: var(--bg-card);
+}
+
+.learning-progress-card h3,
+.learning-vocab-card h3 {
+    margin-bottom: 0.75rem;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
+
+.learning-progress-bar {
+    height: 8px;
+    margin-bottom: 0.5rem;
+    overflow: hidden;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.learning-progress-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--accent), var(--success));
+    transition: width 0.4s ease;
+}
+
+.learning-progress-text {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
+.learning-vocab-card {
+    padding: 1.5rem;
+    text-align: center;
+}
+
+.learning-vocab-japanese {
+    margin-bottom: 0.5rem;
+    font-size: 2.5rem;
+    font-weight: 700;
+}
+
+.learning-vocab-reading {
+    margin-bottom: 1rem;
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+}
+
+.learning-vocab-meaning {
+    margin-bottom: 1rem;
+    padding: 0.75rem;
+    border-radius: 8px;
+    background: rgba(78, 205, 196, 0.1);
+    color: var(--success);
+    font-size: 1.3rem;
+}
+
+.learning-vocab-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+}
+
+.learning-vocab-actions .btn {
+    margin-top: 0;
+}
+
+@media (max-width: 900px) {
+    .learning-layout {
+        grid-template-columns: 1fr;
+    }
+}

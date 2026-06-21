@@ -65,6 +65,17 @@ RENDER_FONT_PATH=optional/path/to/font.ttf
 
 Startup checks runtime readiness. Asset downloads happen through the Reader runtime panel or `POST /api/runtime/ocr-assets/download`.
 
+Backend-owned model assets are stored under `backend/models/`. The text detector is
+`backend/models/comictextdetector.pt.onnx`; the explicit OCR asset download installs
+the pinned MangaOCR snapshot into `backend/models/manga-ocr-base/`. OCR requests never
+download model files implicitly. Ollama remains an external service and manages its own
+translation-model storage.
+
+Bubble allocation defaults to hybrid mode. The optional, revision- and checksum-pinned
+balloon segmentation checkpoint is installed explicitly through the Reader runtime panel
+or `POST /api/runtime/bubble-assets/download`; when absent or unusable, scans fall back to
+the classical adaptive-topology allocator.
+
 ## Main API
 
 ```text
@@ -87,6 +98,12 @@ GET    /api/rabbithole/lookup?text=...
 GET    /api/rabbithole/kanji/{character}
 GET    /api/rabbithole/word?text=...
 GET    /api/rabbithole/reading/{reading}
+POST   /api/runtime/bubble-assets/download
+
+GET    /api/learning/panels
+GET    /api/learning/{filename}/vocab
+POST   /api/learning/{filename}/answer
+GET    /api/learning/progress
 ```
 
 ## Tests

@@ -17,6 +17,7 @@
         if (activeLink) activeLink.classList.add('active');
 
         if (pageName === 'scanner') Scanner.loadPanels();
+        if (pageName === 'learning') Learning.loadPanels();
     }
 
     // Nav link clicks
@@ -35,4 +36,5 @@
     });
 
     Scanner.init();
+    Learning.init();
 })();

@@ -27,17 +27,18 @@ import logging
 import math
 import numpy as np
 import pyclipper
-from pathlib import Path
 from shapely.geometry import Polygon
 from typing import List, Union
+
+from config import MODELS_DIR, TEXT_REGION_MODEL_PATH
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Model paths & thresholds (matching comic-text-detector defaults)
 # ---------------------------------------------------------------------------
-_MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
-_MODEL_PATH = _MODEL_DIR / "comictextdetector.pt.onnx"
+_MODEL_DIR = MODELS_DIR
+_MODEL_PATH = TEXT_REGION_MODEL_PATH
 _MODEL_URL = (
     "https://github.com/zyddnys/manga-image-translator/releases/"
     "download/beta-0.2.1/comictextdetector.pt.onnx"

@@ -45,6 +45,9 @@ class Paths:
 	base_dir: Path = PROJECT_ROOT
 	panels_dir: Path = PROJECT_ROOT / "panels"
 	uploads_dir: Path = PROJECT_ROOT / "panels" / "uploads"
+	models_dir: Path = PROJECT_ROOT / "backend" / "models"
+	manga_ocr_model_dir: Path = PROJECT_ROOT / "backend" / "models" / "manga-ocr-base"
+	bubble_model_dir: Path = PROJECT_ROOT / "backend" / "models" / "manga-bubble-segmentation"
 	lookup_cache_dir: Path = PROJECT_ROOT / "backend" / "data" / "lookup_cache"
 	thumbs_dir: Path = PROJECT_ROOT / "backend" / "data" / "thumbs"
 
@@ -92,6 +95,7 @@ PANEL_DATA_DIR = DATA_DIR / "panel_data"
 for path in (
 	PATHS.panels_dir,
 	PATHS.uploads_dir,
+	PATHS.models_dir,
 	PATHS.lookup_cache_dir,
 	PATHS.thumbs_dir,
 	PANEL_DATA_DIR,
@@ -102,6 +106,11 @@ for path in (
 BASE_DIR = PATHS.base_dir
 PANELS_DIR = PATHS.panels_dir
 UPLOADS_DIR = PATHS.uploads_dir
+MODELS_DIR = PATHS.models_dir
+MANGA_OCR_MODEL_DIR = PATHS.manga_ocr_model_dir
+BUBBLE_MODEL_DIR = PATHS.bubble_model_dir
+BUBBLE_MODEL_PATH = BUBBLE_MODEL_DIR / "best.pt"
+TEXT_REGION_MODEL_PATH = MODELS_DIR / "comictextdetector.pt.onnx"
 LOOKUP_CACHE_DIR = PATHS.lookup_cache_dir
 THUMBS_DIR = PATHS.thumbs_dir
 

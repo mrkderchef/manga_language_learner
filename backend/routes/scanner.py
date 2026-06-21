@@ -6,6 +6,7 @@ import services.rabbithole.nlp as rabbithole_service
 import services.translation.engine as translation_engine
 from services.rendering.panel_renderer import render_translated_panel
 from services.detection.region_detector import detect_text_regions
+from services.model_assets import BUBBLE_MODEL_REVISION
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import copy
@@ -128,28 +129,87 @@ def _stage_cache_path(panel_path: Path, kind: str, cache_key: str) -> Path:
     return _stage_cache_dir(panel_path, kind) / f"{cache_key}.json"
 
 
-def _load_persisted_stage(panel_path: Path, kind: str, cache_key: str) -> dict | None:
-    path = _stage_cache_path(panel_path, kind, cache_key)
+def _read_persisted_stage(path: Path) -> tuple[dict | None, dict | None]:
     if not path.exists():
-        return None
+        return None, None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    result = payload.get("result") if "result" in payload else payload
+    return (result if isinstance(result, dict) else None), payload
+
+
+def _translation_current_path(panel_path: Path) -> Path:
+    return _stage_root_dir(panel_path, "translation") / "current.json"
+
+
+def _legacy_translation_paths(panel_path: Path) -> list[Path]:
+    root = _stage_root_dir(panel_path, "translation")
+    paths = list((root / "cache").glob("*.json")) if (root / "cache").exists() else []
+    legacy_latest = root / "latest.json"
+    if legacy_latest.exists():
+        paths.append(legacy_latest)
+    return paths
+
+
+def _remove_legacy_translation_artifacts(panel_path: Path) -> None:
+    root = _stage_root_dir(panel_path, "translation")
+    shutil.rmtree(root / "cache", ignore_errors=True)
+    legacy_latest = root / "latest.json"
+    if legacy_latest.exists():
+        legacy_latest.unlink()
+
+
+def _load_current_translation(panel_path: Path) -> dict | None:
+    current, _payload = _read_persisted_stage(_translation_current_path(panel_path))
+    if current is not None:
+        _remove_legacy_translation_artifacts(panel_path)
+        return current
+
+    # One-time migration: retain only the newest result from the former
+    # model/settings-keyed cache, then remove the obsolete cache directory.
+    candidates: list[tuple[float, str, dict]] = []
+    for path in _legacy_translation_paths(panel_path):
+        result, payload = _read_persisted_stage(path)
+        if result is None:
+            continue
+        saved_at = float((payload or {}).get("saved_at") or path.stat().st_mtime)
+        cache_key = str((payload or {}).get("cache_key") or path.stem)
+        candidates.append((saved_at, cache_key, result))
+    if not candidates:
         return None
-    if isinstance(payload, dict) and "result" in payload:
-        return payload.get("result")
-    return payload if isinstance(payload, dict) else None
+
+    _saved_at, cache_key, result = max(candidates, key=lambda item: item[0])
+    _save_persisted_stage(panel_path, "translation", cache_key, result)
+    return result
+
+
+def _load_persisted_stage(panel_path: Path, kind: str, cache_key: str) -> dict | None:
+    if kind == "translation":
+        return _load_current_translation(panel_path)
+    result, _payload = _read_persisted_stage(_stage_cache_path(panel_path, kind, cache_key))
+    return result
 
 
 def _save_persisted_stage(panel_path: Path, kind: str, cache_key: str, result: dict) -> None:
-    cache_dir = _stage_cache_dir(panel_path, kind)
-    cache_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "cache_key": cache_key,
         "saved_at": round(time.time(), 3),
         "result": result,
     }
-    _stage_cache_path(panel_path, kind, cache_key).write_text(
+    if kind == "translation":
+        root = _stage_root_dir(panel_path, kind)
+        root.mkdir(parents=True, exist_ok=True)
+        _remove_legacy_translation_artifacts(panel_path)
+        path = _translation_current_path(panel_path)
+    else:
+        cache_dir = _stage_cache_dir(panel_path, kind)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = _stage_cache_path(panel_path, kind, cache_key)
+    path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -578,6 +638,11 @@ def _ocr_settings_key(options: dict) -> str:
         "crop_padding_min": options.get("crop_padding_min", 4),
         "enable_rotated_variants": options.get("enable_rotated_variants", True),
         "bubble": {
+            "pipeline_version": "hybrid-v1",
+            "model_revision": BUBBLE_MODEL_REVISION,
+            "mode": (options.get("bubble") or {}).get("mode", "hybrid") if isinstance(options.get("bubble"), dict) else "hybrid",
+            "model_confidence": (options.get("bubble") or {}).get("model_confidence", 0.25) if isinstance(options.get("bubble"), dict) else 0.25,
+            "model_iou": (options.get("bubble") or {}).get("model_iou", 0.7) if isinstance(options.get("bubble"), dict) else 0.7,
             "search_scale": (options.get("bubble") or {}).get("search_scale", 1.0) if isinstance(options.get("bubble"), dict) else 1.0,
             "wand_enabled": (options.get("bubble") or {}).get("wand_enabled", True) if isinstance(options.get("bubble"), dict) else True,
             "overlap_reconciliation": (options.get("bubble") or {}).get("overlap_reconciliation", True) if isinstance(options.get("bubble"), dict) else True,
@@ -610,6 +675,18 @@ def _texts_hash(annotations: list[dict]) -> str:
     return _json_hash(texts)
 
 
+def _translation_units_hash(annotations: list[dict]) -> str:
+    units = [
+        {
+            "region_id": str(ann.get("region_id") or ann.get("id") or f"ann_{index + 1:04d}"),
+            "text": ann.get("text", ""),
+        }
+        for index, ann in enumerate(annotations)
+        if ann.get("computed", True) and ann.get("text")
+    ]
+    return _json_hash(units)
+
+
 def _translation_engine(options: dict) -> str:
     return "ollama"
 
@@ -626,7 +703,8 @@ def _translation_model(options: dict, resolve_auto: bool = False) -> str | None:
 def _translation_options_key(options: dict, annotations: list[dict]) -> str:
     engine = _translation_engine(options)
     relevant = {
-        "text_hash": _texts_hash(annotations),
+        "translation_units_hash": _translation_units_hash(annotations),
+        "association_version": "region-id-v1",
         "translation_engine": engine,
         "translation_model": _translation_model(options, resolve_auto=True) or "",
         "target_lang": options.get("target_lang", "en"),
@@ -643,6 +721,7 @@ def _translation_options_key(options: dict, annotations: list[dict]) -> str:
 def _rabbithole_options_key(annotations: list[dict]) -> str:
     return _json_hash({
         "text_hash": _texts_hash(annotations),
+        "contract_version": rabbithole_service.RABBITHOLE_CONTRACT_VERSION,
     })
 
 
@@ -678,6 +757,7 @@ def _panel_cache_status(state: dict, panel_path: Path) -> dict:
     legacy_key = _cache_key(panel_path)
     legacy_file = LEGACY_OCR_CACHE_DIR / f"{legacy_key}.json"
     legacy_count = int(legacy_file.exists())
+    has_current_translation = _translation_current_path(panel_path).exists() or bool(_legacy_translation_paths(panel_path))
     buckets = {
         "ocr": {
             "has_cache": bool(cache.get("ocr")),
@@ -688,8 +768,8 @@ def _panel_cache_status(state: dict, panel_path: Path) -> dict:
             "entries": len(list(_stage_cache_dir(panel_path, "rabbithole").glob("*.json"))) if _stage_cache_dir(panel_path, "rabbithole").exists() else 0,
         },
         "translation": {
-            "has_cache": any(_stage_cache_dir(panel_path, "translation").glob("*.json")) if _stage_cache_dir(panel_path, "translation").exists() else False,
-            "entries": len(list(_stage_cache_dir(panel_path, "translation").glob("*.json"))) if _stage_cache_dir(panel_path, "translation").exists() else 0,
+            "has_cache": has_current_translation,
+            "entries": int(has_current_translation),
         },
     }
     if state.get("annotations"):
@@ -978,22 +1058,22 @@ def _run_translation_stage(ocr_result: dict, options: dict, state: dict, trace: 
     ]
     texts = [unit["text"] for _, unit in indexed_units]
     context_units = [unit for _, unit in indexed_units]
+    if options.get("cache_only"):
+        cached = _load_persisted_stage(state["panel_path"], "translation", "current")
+        if cached:
+            _trace(trace, scan_id, "translation", "current_hit", "Current translation loaded")
+            return copy.deepcopy(cached), None, False
+        _trace(trace, scan_id, "translation", "current_miss", "Current translation is missing")
+        return {
+            "success": True,
+            "translations": [""] * len(annotations),
+            "cache_miss": True,
+        }, None, False
+
     engine = _translation_engine(options)
     model = _translation_model(options, resolve_auto=True)
     requested_model = _translation_model(options, resolve_auto=False)
     cache_key = _translation_options_key(options, annotations)
-    use_cache = bool(options.get("use_cache", True)) and not bool(options.get("fresh", False))
-
-    if use_cache:
-        cached = _load_persisted_stage(state["panel_path"], "translation", cache_key)
-        if cached:
-            _trace(trace, scan_id, "translation", "cache_hit", "Translation cache hit", cache_key=cache_key)
-            return copy.deepcopy(cached), cache_key, False
-    if options.get("cache_only"):
-        _trace(trace, scan_id, "translation", "cache_miss", "Translation cache miss for current model", cache_key=cache_key, model=model)
-        result = _empty_translation_result(len(annotations), options)
-        result["cache_miss"] = True
-        return result, cache_key, False
 
     if not texts:
         result = _empty_translation_result(len(annotations), options)
@@ -1032,10 +1112,13 @@ def _run_translation_stage(ocr_result: dict, options: dict, state: dict, trace: 
             temperature=float(options.get("temperature", 0.1)),
             context_units=context_units,
         )
+        translated_by_region: dict[str, str] = {}
         expanded = [""] * len(annotations)
         for (annotation_index, _unit), translated in zip(indexed_units, result.get("translations", [])):
             expanded[annotation_index] = translated
+            translated_by_region[str(_unit["region_id"])] = translated
         result["translations"] = expanded
+        result["translations_by_region"] = translated_by_region
         result["translation_prompt_payload"] = result.get("translation_prompt_payload") or prompt_payload
         _trace(
             trace,
@@ -1126,8 +1209,14 @@ def _merge_translation_result(base_result: dict, translation_result: dict, optio
     result = copy.deepcopy(base_result)
     annotations = result.get("annotations", []) or []
     translations = translation_result.get("translations", [])
+    translations_by_region = translation_result.get("translations_by_region", {}) or {}
     for index, ann in enumerate(annotations):
-        ann["translated"] = translations[index] if index < len(translations) else ""
+        region_id = str(ann.get("region_id") or ann.get("id") or f"ann_{index + 1:04d}")
+        ann["translated"] = (
+            translations_by_region[region_id]
+            if region_id in translations_by_region
+            else translations[index] if index < len(translations) else ""
+        )
     result["annotations"] = annotations
     result.update({key: value for key, value in translation_result.items() if key != "translations"})
     result["translation_engine_requested"] = translation_result.get(
@@ -1397,6 +1486,9 @@ def _flatten_scan_options(options: dict | None) -> dict:
             "temperature": "temperature",
         },
         "bubble": {
+            "mode": "mode",
+            "model_confidence": "model_confidence",
+            "model_iou": "model_iou",
             "search_scale": "search_scale",
             "wand_enabled": "wand_enabled",
             "overlap_reconciliation": "overlap_reconciliation",

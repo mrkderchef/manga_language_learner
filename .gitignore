@@ -11,6 +11,9 @@ __pycache__/
 .vscode/
 # Data / Progress
 backend/data/
+# Downloaded model weights (the detector ONNX file is intentionally tracked)
+backend/models/manga-ocr-base/
+backend/models/manga-bubble-segmentation/
 inspiration_from_github/
 # Upstream comic-text-detector reference template
 template/
