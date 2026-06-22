@@ -16,9 +16,8 @@
         const activeLink = document.querySelector(`[data-page="${pageName}"]`);
         if (activeLink) activeLink.classList.add('active');
 
-        // Lazy-load data only when navigating to the page
         if (pageName === 'scanner') Scanner.loadPanels();
-        if (pageName === 'rabbithole') Rabbithole.loadPanels();
+        if (pageName === 'learning') Learning.loadPanels();
     }
 
     // Nav link clicks
@@ -36,7 +35,6 @@
         });
     });
 
-    // Initialize modules (no data loading until navigation)
     Scanner.init();
-    Rabbithole.init();
+    Learning.init();
 })();

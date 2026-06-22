@@ -10,4 +10,4 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 cd "$ROOT_DIR/backend"
-"$PYTHON_BIN" -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
+"$PYTHON_BIN" -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload --no-access-log

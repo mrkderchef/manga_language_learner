@@ -4,6 +4,11 @@
     box-sizing: border-box;
 }
 
+html {
+    height: 100%;
+    overflow: hidden;
+}
+
 :root {
     --bg-dark: #1a1a2e;
     --bg-card: #16213e;
@@ -22,7 +27,16 @@ body {
     font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
     background: var(--bg-dark);
     color: var(--text-primary);
+    height: 100dvh;
     min-height: 100vh;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    overflow: hidden;
+}
+
+#app {
+    min-height: 0;
+    overflow: hidden;
 }
 
 /* Navigation */
@@ -71,9 +85,12 @@ body {
 /* Pages */
 .page {
     display: none;
+    height: 100%;
+    min-height: 0;
     padding: 2rem;
     max-width: 1400px;
     margin: 0 auto;
+    overflow: hidden;
 }
 
 .page.active {
@@ -266,8 +283,7 @@ body {
 /* GPU-accelerated transitions */
 .mode-card,
 .panel-thumb,
-.ocr-box,
-.progress-fill {
+.ocr-box {
     will-change: transform;
 }
 

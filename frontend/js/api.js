@@ -7,6 +7,8 @@ const API = (() => {
     // In-memory cache for GET requests
     const _cache = new Map();
     const CACHE_TTL = 60_000; // 60 seconds
+    const RABBITHOLE_POLL_INTERVAL_MS = 1000;
+    const RABBITHOLE_POLL_TIMEOUT_MS = 180_000;
 
     function _cacheKey(endpoint) { return endpoint; }
 
@@ -27,11 +29,41 @@ const API = (() => {
         }
     }
 
+    function delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function pollRabbitholeJob(filename, jobId, options = {}) {
+        const intervalMs = options.intervalMs || RABBITHOLE_POLL_INTERVAL_MS;
+        const timeoutMs = options.timeoutMs || RABBITHOLE_POLL_TIMEOUT_MS;
+        const started = Date.now();
+
+        while (Date.now() - started < timeoutMs) {
+            const job = await request(`/api/scanner/${filename}/rabbithole/jobs/${jobId}`, { responseCache: false });
+            if (job.status === 'done') {
+                if (job.result?.success) {
+                    invalidateCache(`/api/scanner/${filename}/cache-status`);
+                    return job.result;
+                }
+                throw new Error(job.result?.error || 'Rabbithole processing failed');
+            }
+            if (job.status === 'error') {
+                throw new Error(job.error || job.result?.error || 'Rabbithole processing failed');
+            }
+            await delay(intervalMs);
+        }
+
+        throw new Error('Rabbithole processing timed out');
+    }
+
     async function request(endpoint, options = {}) {
         const method = (options.method || 'GET').toUpperCase();
+        const responseCache = options.responseCache !== false;
+        const fetchOptions = { ...options };
+        delete fetchOptions.responseCache;
 
         // Use cache for GET requests
-        if (method === 'GET') {
+        if (method === 'GET' && responseCache) {
             const cached = _getCached(endpoint);
             if (cached) return cached;
         }
@@ -39,7 +71,7 @@ const API = (() => {
         try {
             const response = await fetch(`${BASE_URL}${endpoint}`, {
                 headers: { 'Content-Type': 'application/json' },
-                ...options,
+                ...fetchOptions,
             });
             if (!response.ok) {
                 const error = await response.json().catch(() => ({ detail: response.statusText }));
@@ -47,7 +79,7 @@ const API = (() => {
             }
             const data = await response.json();
 
-            if (method === 'GET') _setCache(endpoint, data);
+            if (method === 'GET' && responseCache) _setCache(endpoint, data);
             return data;
         } catch (err) {
             console.error(`API Error [${endpoint}]:`, err);
@@ -69,7 +101,7 @@ const API = (() => {
                 body: formData,
             }).then(r => r.json()).then(data => {
                 invalidateCache('/api/scanner/panels');
-                invalidateCache('/api/rabbithole/panels');
+                invalidateCache('/api/learning/panels');
                 return data;
             });
         },
@@ -85,25 +117,21 @@ const API = (() => {
             });
         },
 
-        scanAndTranslate(filename, options = {}) {
-            return request(`/api/scanner/${filename}/scan-translate`, {
-                method: 'POST',
-                body: JSON.stringify(options),
-            }).then(data => {
-                invalidateCache(`/api/scanner/${filename}/cache-status`);
-                invalidateCache(`/api/scanner/${filename}/regions`);
-                return data;
-            });
-        },
-
         buildRabbithole(filename, options = {}) {
             return request(`/api/scanner/${filename}/rabbithole`, {
                 method: 'POST',
                 body: JSON.stringify(options),
             }).then(data => {
                 invalidateCache(`/api/scanner/${filename}/cache-status`);
+                if (data?.rabbithole_job && data.job_id) {
+                    return pollRabbitholeJob(filename, data.job_id);
+                }
                 return data;
             });
+        },
+
+        getRabbitholeJob(filename, jobId) {
+            return request(`/api/scanner/${filename}/rabbithole/jobs/${jobId}`, { responseCache: false });
         },
 
         getCachedRabbithole(filename, options = {}) {
@@ -123,17 +151,10 @@ const API = (() => {
             });
         },
 
-        getCachedTranslation(filename, options = {}) {
+        getCurrentTranslation(filename, options = {}) {
             return request(`/api/scanner/${filename}/translate`, {
                 method: 'POST',
                 body: JSON.stringify({ ...options, cache_only: true }),
-            });
-        },
-
-        translateText(text, options = {}) {
-            return request('/api/scanner/translate', {
-                method: 'POST',
-                body: JSON.stringify({ text, ...options }),
             });
         },
 
@@ -154,16 +175,31 @@ const API = (() => {
             });
         },
 
-        getOcrEngines() {
-            return request('/api/scanner/ocr-engines');
-        },
-
         getTranslationEngines() {
             return request('/api/scanner/translation-engines');
         },
 
         getOllamaModels() {
             return request('/api/scanner/ollama/models');
+        },
+
+        getRuntimeStatus(force = false) {
+            const suffix = force ? `?t=${Date.now()}` : '';
+            return request(`/api/runtime/status${suffix}`);
+        },
+
+        downloadOcrAssets() {
+            return request('/api/runtime/ocr-assets/download', { method: 'POST' }).then(data => {
+                invalidateCache('/api/runtime/status');
+                return data;
+            });
+        },
+
+        downloadBubbleAssets() {
+            return request('/api/runtime/bubble-assets/download', { method: 'POST' }).then(data => {
+                invalidateCache('/api/runtime/status');
+                return data;
+            });
         },
 
         overrideRegion(filename, regionId, data) {
@@ -209,24 +245,27 @@ const API = (() => {
             });
         },
 
-        // === Rabbithole Endpoints ===
-        getRabbitholePanels() {
-            return request('/api/rabbithole/panels');
+        // === Learning page endpoints ===
+        getLearningPanels() {
+            return request('/api/learning/panels');
         },
 
-        getPanelVocab(filename) {
-            return request(`/api/rabbithole/${filename}/vocab`);
+        getLearningPanelVocab(filename) {
+            return request(`/api/learning/${encodeURIComponent(filename)}/vocab`);
         },
 
-        submitAnswer(filename, word, knew) {
-            return request(`/api/rabbithole/${filename}/answer`, {
+        submitLearningAnswer(filename, word, knew) {
+            return request(`/api/learning/${encodeURIComponent(filename)}/answer`, {
                 method: 'POST',
                 body: JSON.stringify({ word, knew }),
+            }).then(data => {
+                invalidateCache('/api/learning/progress');
+                return data;
             });
         },
 
-        getProgress() {
-            return request('/api/rabbithole/progress');
+        getLearningProgress() {
+            return request('/api/learning/progress');
         },
 
         lookupText(text) {
@@ -250,7 +289,7 @@ const API = (() => {
             if (pathOrFilename.startsWith('/')) {
                 return `${BASE_URL}${pathOrFilename}`;
             }
-            return `${BASE_URL}/panels/${pathOrFilename}`;
+            return `${BASE_URL}/api/media/panel/${pathOrFilename}`;
         },
 
         /** Thumbnail URL — small cached version for grid views */

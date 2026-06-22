@@ -5,20 +5,29 @@
 const Scanner = (() => {
     const TRANSLATION_PENDING_TEXT = 'Translation not available yet.';
     const UNCOMPUTED_TEXT = 'Please run scan to see contents.';
-    const RABBITHOLE_LAYER_DEFS = [
-        { id: 'words', label: 'Lexical Break', upcoming: false },
-        { id: 'morphemes', label: 'Morpheme Break', upcoming: false },
-        { id: 'phrases', label: 'Phrases', upcoming: true },
-        { id: 'stems', label: 'Stems', upcoming: true },
-        { id: 'grammar', label: 'Grammar', upcoming: true },
-    ];
     const DETECTOR_DOC = {
         source: 'comic-text-detector ONNX pipeline via backend/services/detection/region_detector.py',
         stages: 'letterbox resize -> YOLOv5 blocks + UNet mask + DBNet lines -> grouping -> mask refinement -> reading-order sort',
         mask: 'The raw mask is a coarse text-region prediction, not a speech-bubble boundary.',
         refined_mask: 'The refined mask is a per-text-block cleanup pass around detected text, useful as a candidate text area but still not a true bubble extraction.',
-        bubble: 'Bubble allocation is currently heuristic: bright connected regions around the text evidence are estimated as likely balloon interiors and exposed as placement hints.',
-        next_step: 'A cleaner pipeline would keep text detection, OCR reading, and bubble allocation separate, with a seeded wand/flood-fill style bubble pass using OCR text geometry as support evidence.',
+        bubble: 'Bubble allocation is model-first when the optional pinned segmentation asset is installed. Text is associated by mask containment; adaptive topology and compact text-only allocation are fallbacks.',
+        next_step: 'Use the vision overlay to inspect model confidence, association score, mask source, bubble ID, and any fallback reason.',
+    };
+    const RABBITHOLE_HELP = {
+        kunyomi: ['Kun’yomi is a Japanese-origin reading associated with a kanji.', "https://en.wikipedia.org/wiki/Kun%27yomi"],
+        onyomi: ['On’yomi is a reading derived historically from Chinese pronunciations.', "https://en.wikipedia.org/wiki/On%27yomi"],
+        nanori: ['Nanori are readings used mainly in Japanese names.', 'https://en.wikipedia.org/wiki/Nanori'],
+        okurigana: ['Okurigana are kana suffixes attached to kanji stems. A dot in KANJIDIC marks the boundary.', 'https://en.wikipedia.org/wiki/Okurigana'],
+        romaji: ['Romaji represents Japanese sounds with the Latin alphabet.', 'https://en.wikipedia.org/wiki/Romanization_of_Japanese'],
+        components: ['Visual components describe KanjiVG element groupings; they are not necessarily historical etymology.', 'https://kanjivg.tagaini.net/svg-format.html'],
+        grade: ['School grade is the Japanese curriculum grade in which a jōyō kanji is normally introduced.', 'https://en.wikipedia.org/wiki/Ky%C5%8Diku_kanji'],
+        jlpt: ['This is the legacy pre-2010 JLPT level from KANJIDIC2, not an official current assignment.', 'https://en.wikipedia.org/wiki/Japanese-Language_Proficiency_Test'],
+        unicode: ['Unicode assigns a stable code point to a character; it does not define its meaning or origin.', 'https://www.unicode.org/standard/standard.html'],
+        frequency: ['JMdict priority codes are historical, approximate usage signals—not universal frequency scores.', 'https://www.edrdg.org/jmdict_edict_list/2016/msg00060.html'],
+        lemma: ['A lemma is the dictionary form selected for an inflected surface form.', 'https://en.wikipedia.org/wiki/Lemma_(morphology)'],
+        particle: ['A Japanese particle marks grammatical or discourse relationships between expressions.', 'https://en.wikipedia.org/wiki/Japanese_particles'],
+        auxiliary: ['An auxiliary follows another expression to add tense, politeness, negation, or another grammatical function.', 'https://en.wikipedia.org/wiki/Auxiliary_verb'],
+        pos: ['Part of speech is Sudachi’s grammatical classification for this token.', 'https://github.com/WorksApplications/SudachiPy'],
     };
 
     let selectedPanel = null;
@@ -26,91 +35,43 @@ const Scanner = (() => {
     let latestScan = null;
     let _panelsLoaded = false;
     let controlsHideTimer = null;
-    let pinnedRegionIds = new Set();
-    let hoverSuppressedRegionIds = new Set();
-    const hoverCloseTimers = new Map();
-    const tooltipHorizontalByRegion = new Map();
-    const tooltipPositionByRegion = new Map();
+    const MAX_OPEN_POPUPS = 6;
+    let openPopupRegionIds = new Set();
+    let popupOpenOrder = [];
+    const popupPositionsByRegion = new Map();
+    const rabbitholeCardStates = new Map();
+    const richKanjiCache = new Map();
+    const richKanjiRequests = new Map();
+    let rabbitholeHelpOverlay = null;
+    let rabbitholeHelpOwner = null;
+    let rabbitholeHelpPinned = false;
+    let rabbitholeHelpHideTimer = null;
 
-    function clearAllHoverCloseTimers() {
-        hoverCloseTimers.forEach(timerId => window.clearTimeout(timerId));
-        hoverCloseTimers.clear();
+    function elementRectWithinBounds(element, boundsRect) {
+        const rect = element.getBoundingClientRect();
+        if (!rect.width || !rect.height) return null;
+        return {
+            left: rect.left - boundsRect.left,
+            top: rect.top - boundsRect.top,
+            right: rect.right - boundsRect.left,
+            bottom: rect.bottom - boundsRect.top,
+        };
     }
 
-    function captureOpenTooltipRegions() {
-        const openRegions = new Set();
-        const bounds = document.querySelector('.reader-shell') || document.getElementById('ocr-overlay');
-        const boundsRect = bounds?.getBoundingClientRect();
-        document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open').forEach(box => {
-            const regionId = String(box.dataset.regionId || '');
-            if (!regionId) return;
-            openRegions.add(regionId);
-            const tooltip = box.querySelector('.ocr-tooltip');
-            if (!tooltip || !boundsRect) return;
-            const rect = tooltip.getBoundingClientRect();
-            if (!rect.width || !rect.height) return;
-            const left = rect.left - boundsRect.left;
-            const top = rect.top - boundsRect.top;
-            tooltipHorizontalByRegion.set(regionId, left);
-            tooltipPositionByRegion.set(regionId, { left, top });
-        });
-        return openRegions;
-    }
-
-    function restoreTooltipPosition(box, tooltip, overlay, boundsRect) {
-        const regionId = String(box.dataset.regionId || '');
-        if (!regionId) return false;
-        const stored = tooltipPositionByRegion.get(regionId);
-        if (!stored || !Number.isFinite(stored.left) || !Number.isFinite(stored.top)) return false;
-        applyTooltipPosition(box, tooltip, overlay, boundsRect, stored.left, stored.top);
-        tooltipHorizontalByRegion.set(regionId, stored.left);
-        return true;
-    }
-
-    function collectOpenTooltipEntries(boundsRect) {
-        return Array.from(document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open .ocr-tooltip'))
-            .map(tooltip => {
-                const box = tooltip.closest('.ocr-box');
-                if (!box || !tooltip.isConnected) return null;
-                const rect = tooltip.getBoundingClientRect();
-                if (!rect.width || !rect.height) return null;
-                return {
-                    box,
-                    tooltip,
-                    rect: {
-                        left: rect.left - boundsRect.left,
-                        top: rect.top - boundsRect.top,
-                        right: rect.right - boundsRect.left,
-                        bottom: rect.bottom - boundsRect.top,
-                    },
-                };
-            })
-            .filter(Boolean);
-    }
-
-    function hasTooltipCollision(entries) {
-        for (let i = 0; i < entries.length; i += 1) {
-            for (let j = i + 1; j < entries.length; j += 1) {
-                if (rectsOverlap(entries[i].rect, entries[j].rect)) return true;
-            }
-        }
-        return false;
-    }
     let editMode = false;
     let addBoxMode = false;
     let draftBox = null;
     let engineControlsLoaded = false;
     let latestCacheStatus = null;
     let lastScannedOcrFingerprint = null;
+    let runtimeDownloadRunning = false;
     let activeDebugTab = 'rabbithole';
-    let activeRabbitholeSelection = { regionId: null, unitId: null };
-    let activeRabbitholeLayer = 'words';
     let activeVisionOverlay = 'none';
     const DEBUG_PANEL_DEFAULT_WIDTH = 620;
     const DEBUG_PANEL_MIN_WIDTH = 280;
     const DEBUG_PANEL_MAX_SCALE = 2;
-
     function init() {
+        ScannerSettings.restore();
         bindEvents();
         initializeDebugPanelWidth();
         loadEngineControls().catch(err => {
@@ -142,6 +103,10 @@ const Scanner = (() => {
         document.querySelectorAll('[data-cache-kind]').forEach(btn => {
             btn.addEventListener('click', () => handleCacheClear(btn.dataset.cacheKind));
         });
+        document.getElementById('btn-reset-scan-settings')?.addEventListener('click', resetScanSettings);
+        document.getElementById('btn-refresh-runtime')?.addEventListener('click', () => refreshRuntimeStatus());
+        document.getElementById('btn-download-ocr-assets')?.addEventListener('click', downloadOcrAssets);
+        document.getElementById('btn-download-bubble-assets')?.addEventListener('click', downloadBubbleAssets);
         // Home Ollama controls removed
         document.getElementById('translation-slider').addEventListener('input', (e) => {
             setTranslationReveal(Number(e.target.value));
@@ -156,8 +121,34 @@ const Scanner = (() => {
             const next = Number(slider.value) >= 50 ? 0 : 100;
             setTranslationReveal(next);
         });
-        ['scan-ocr-engine', 'scan-ocr-quality', 'scan-vertical-preference', 'scan-rotation-margin'].forEach(id => {
-            document.getElementById(id)?.addEventListener('change', markScanSettingsChanged);
+        [
+            'scan-detection-confidence',
+            'scan-detection-nms',
+            'scan-detection-mask',
+            'scan-detection-box',
+            'scan-detection-max-regions',
+            'scan-ocr-quality',
+            'scan-preprocessing-set',
+            'scan-vertical-preference',
+            'scan-rotation-margin',
+            'scan-crop-upscale',
+            'scan-crop-padding-ratio',
+            'scan-semantic-rerank',
+            'scan-rotated-variants',
+            'scan-bubble-search-scale',
+            'scan-bubble-mode',
+            'scan-bubble-confidence',
+            'scan-bubble-iou',
+            'scan-bubble-wand',
+            'scan-bubble-overlap',
+            'scan-target-lang',
+            'scan-translation-style',
+            'scan-temperature',
+        ].forEach(id => {
+            document.getElementById(id)?.addEventListener('change', () => {
+                ScannerSettings.persist();
+                markScanSettingsChanged();
+            });
         });
         document.getElementById('scanner-panel-img').addEventListener('load', rerenderLatestOverlays);
         window.addEventListener('resize', rerenderLatestOverlays);
@@ -203,6 +194,7 @@ const Scanner = (() => {
             ]);
             fillSelect('scan-translation-engine', translation.engines || [], 'ollama');
             fillOllamaModelSelect('scan-translation-model', ollama);
+            ScannerSettings.restore();
             updateTranslationModelVisibility();
             engineControlsLoaded = true;
         } catch (err) {
@@ -258,9 +250,10 @@ const Scanner = (() => {
         }
     }
 
-    async function handleTranslationSettingsChanged() {
+    function handleTranslationSettingsChanged() {
         updateTranslationModelVisibility();
-        await syncTranslatedPanelForCurrentSelection();
+        ScannerSettings.persist();
+        markScanSettingsChanged();
     }
 
     async function toggleScanOptions(force) {
@@ -272,41 +265,136 @@ const Scanner = (() => {
         }
         panel.classList.toggle('hidden', !nextOpen);
         btn.setAttribute('aria-expanded', String(nextOpen));
-        if (nextOpen) await loadEngineControls();
+        if (nextOpen) {
+            await loadEngineControls();
+            await refreshRuntimeStatus();
+        }
     }
 
     function getScanOptions() {
-        const translationEngine = document.getElementById('scan-translation-engine').value;
-        const translationModel = translationEngine === 'ollama'
-            ? document.getElementById('scan-translation-model').value || null
-            : null;
-        return {
-            ocr_engine: 'mangaocr',
-            ocr_quality_mode: document.getElementById('scan-ocr-quality').value,
-            semantic_rerank: 'close',
-            vertical_preference: document.getElementById('scan-vertical-preference').value,
-            rotation_win_margin: Number(document.getElementById('scan-rotation-margin').value) || 15,
-            preprocessing_set: 'standard',
-            detection_sensitivity: 'normal',
-            translation_engine: translationEngine,
-            translation_model: translationModel,
-            target_lang: document.getElementById('scan-target-lang').value || 'en',
-            translation_style: document.getElementById('scan-translation-style').value,
-            temperature: Number(document.getElementById('scan-temperature').value) || 0.1,
-            reset_manual_edits: false,
-        };
+        return ScannerSettings.getOptions();
+    }
+
+    function resetScanSettings() {
+        ScannerSettings.reset();
+        updateTranslationModelVisibility();
+        markScanSettingsChanged();
+    }
+
+    function setRuntimeRow(id, available, value, detail = '') {
+        const row = document.getElementById(id);
+        if (!row) return;
+        row.classList.toggle('runtime-ready', Boolean(available));
+        row.classList.toggle('runtime-missing', !available);
+        row.querySelector('.runtime-status-value').textContent = value;
+        row.title = detail || value;
+    }
+
+    function renderRuntimeStatus(status, error = null) {
+        const note = document.getElementById('runtime-status-note');
+        const downloadBtn = document.getElementById('btn-download-ocr-assets');
+        const bubbleDownloadBtn = document.getElementById('btn-download-bubble-assets');
+        if (error || !status) {
+            setRuntimeRow('runtime-mangaocr-package', false, 'Unknown');
+            setRuntimeRow('runtime-mangaocr-model', false, 'Unknown');
+            setRuntimeRow('runtime-detector', false, 'Unknown');
+            setRuntimeRow('runtime-bubble-model', false, 'Unknown');
+            setRuntimeRow('runtime-ollama', false, 'Unknown');
+            if (note) note.textContent = error ? `Runtime check failed: ${error.message}` : 'Runtime status unavailable.';
+            if (downloadBtn) downloadBtn.disabled = runtimeDownloadRunning;
+            if (bubbleDownloadBtn) bubbleDownloadBtn.disabled = runtimeDownloadRunning;
+            return;
+        }
+
+        const ocr = status.ocr || {};
+        const pkg = ocr.package || {};
+        const model = ocr.mangaocr_model || {};
+        const detector = ocr.detector || {};
+        const ollama = status.ollama || {};
+        const bubble = status.bubble_segmentation || {};
+
+        setRuntimeRow('runtime-mangaocr-package', pkg.available, pkg.available ? 'Ready' : 'Missing', pkg.error);
+        setRuntimeRow('runtime-mangaocr-model', model.available, model.available ? 'Ready' : 'Missing', model.error);
+        setRuntimeRow('runtime-detector', detector.available, detector.available ? 'Ready' : 'Missing', detector.error);
+        setRuntimeRow('runtime-bubble-model', bubble.available, bubble.available ? 'Ready' : 'Fallback', bubble.error);
+        setRuntimeRow(
+            'runtime-ollama',
+            ollama.available,
+            ollama.available ? 'Ready' : (ollama.reachable ? 'Model missing' : 'Offline'),
+            ollama.error || ollama.configured_model || ''
+        );
+
+        if (downloadBtn) {
+            downloadBtn.disabled = runtimeDownloadRunning || !pkg.available;
+        }
+        if (bubbleDownloadBtn) bubbleDownloadBtn.disabled = runtimeDownloadRunning;
+        if (note) {
+            const warnings = status.warnings || [];
+            note.textContent = warnings.length ? warnings.join(' · ') : 'Runtime ready.';
+        }
+    }
+
+    async function refreshRuntimeStatus() {
+        const note = document.getElementById('runtime-status-note');
+        if (note && !runtimeDownloadRunning) note.textContent = 'Checking runtime...';
+        try {
+            const status = await API.getRuntimeStatus(true);
+            renderRuntimeStatus(status);
+        } catch (err) {
+            renderRuntimeStatus(null, err);
+        }
+    }
+
+    async function downloadOcrAssets() {
+        const btn = document.getElementById('btn-download-ocr-assets');
+        const note = document.getElementById('runtime-status-note');
+        runtimeDownloadRunning = true;
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Downloading...';
+        }
+        if (note) note.textContent = 'Downloading OCR assets...';
+        try {
+            const status = await API.downloadOcrAssets();
+            renderRuntimeStatus(status);
+        } catch (err) {
+            renderRuntimeStatus(null, err);
+        } finally {
+            runtimeDownloadRunning = false;
+            if (btn) {
+                btn.textContent = 'Download OCR assets';
+                btn.disabled = false;
+            }
+            await refreshRuntimeStatus();
+        }
+    }
+
+    async function downloadBubbleAssets() {
+        const btn = document.getElementById('btn-download-bubble-assets');
+        const note = document.getElementById('runtime-status-note');
+        runtimeDownloadRunning = true;
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Downloading...';
+        }
+        if (note) note.textContent = 'Downloading the pinned bubble model...';
+        try {
+            const status = await API.downloadBubbleAssets();
+            renderRuntimeStatus(status);
+        } catch (err) {
+            renderRuntimeStatus(null, err);
+        } finally {
+            runtimeDownloadRunning = false;
+            if (btn) {
+                btn.textContent = 'Download bubble model';
+                btn.disabled = false;
+            }
+            await refreshRuntimeStatus();
+        }
     }
 
     function getOcrFingerprint() {
-        const options = getScanOptions();
-        return JSON.stringify({
-            ocr_quality_mode: options.ocr_quality_mode,
-            semantic_rerank: options.semantic_rerank,
-            vertical_preference: options.vertical_preference,
-            rotation_win_margin: options.rotation_win_margin,
-            preprocessing_set: options.preprocessing_set,
-            detection_sensitivity: options.detection_sensitivity,
-        });
+        return ScannerSettings.getOcrFingerprint();
     }
 
     function setTranslateEnabled(enabled) {
@@ -362,15 +450,29 @@ const Scanner = (() => {
         if (!selectedPanel) return;
         try {
             await API.deletePanelCache(selectedPanel.filename, kind);
-            latestScan = null;
-            lastScannedOcrFingerprint = null;
-            setTranslateEnabled(false);
-            document.getElementById('ocr-overlay').innerHTML = '';
-            resetTranslationView();
-            const editNote = (!kind || kind === 'ocr') ? ' Box edits were cleared.' : ' Box edits were preserved.';
-            setDebugStatus(`${kind ? kind.toUpperCase() : 'Panel'} cache cleared.${editNote}`);
-            if (!kind || kind === 'ocr') {
+            if (kind === 'ocr') {
+                setDebugStatus('OCR cache cleared. Current Reader view stays available until reload or the next edit.');
+                await refreshCacheStatus();
+                return;
+            }
+            if (!kind) {
+                latestScan = null;
+                lastScannedOcrFingerprint = null;
+                openPopupRegionIds = new Set();
+                popupOpenOrder = [];
+                popupPositionsByRegion.clear();
+                setTranslateEnabled(false);
+                document.getElementById('ocr-overlay').innerHTML = '';
+                document.getElementById('ocr-popup-layer').innerHTML = '';
+                resetTranslationView();
+                setDebugStatus('Panel data cleared.');
                 await loadPanelBoxes(selectedPanel.filename);
+            } else {
+                if (kind === 'translation') {
+                    resetTranslationView();
+                    latestScan?.annotations?.forEach(ann => delete ann.translated);
+                }
+                setDebugStatus(`${kind.toUpperCase()} cache cleared. Box edits were preserved.`);
             }
             await refreshCacheStatus();
         } catch (err) {
@@ -494,12 +596,11 @@ const Scanner = (() => {
         resetTranslationView();
         setDebugStatus('Ready to scan.');
         ocrText = '';
-        clearAllHoverCloseTimers();
-        tooltipHorizontalByRegion.clear();
-        tooltipPositionByRegion.clear();
-        pinnedRegionIds = new Set();
-        hoverSuppressedRegionIds = new Set();
-        activeRabbitholeSelection = { regionId: null, unitId: null };
+        openPopupRegionIds = new Set();
+        popupOpenOrder = [];
+        popupPositionsByRegion.clear();
+        rabbitholeCardStates.clear();
+        document.getElementById('ocr-popup-layer').innerHTML = '';
         document.getElementById('btn-add-box').disabled = !editMode;
         refreshCacheStatus();
         await loadPanelBoxes(panel.filename);
@@ -537,7 +638,7 @@ const Scanner = (() => {
             requests.push(API.getCachedRabbithole(filename, getScanOptions()).then(result => ({ kind: 'rabbithole', result })));
         }
         if (buckets.translation?.has_cache) {
-            requests.push(API.getCachedTranslation(filename, getScanOptions()).then(result => ({ kind: 'translation', result })));
+            requests.push(API.getCurrentTranslation(filename, getScanOptions()).then(result => ({ kind: 'translation', result })));
         }
         if (!requests.length) return null;
 
@@ -565,40 +666,6 @@ const Scanner = (() => {
         return hydrated;
     }
 
-    async function syncTranslatedPanelForCurrentSelection() {
-        if (!selectedPanel || !latestScan) {
-            markScanSettingsChanged();
-            return;
-        }
-        const annotations = latestScan.annotations || [];
-        if (!hasComputedText(annotations) || annotations.some(isUncomputedAnnotation)) {
-            markScanSettingsChanged();
-            return;
-        }
-        if ((document.getElementById('scan-translation-engine')?.value || 'ollama') !== 'ollama') {
-            markScanSettingsChanged();
-            return;
-        }
-
-        try {
-            const result = await API.getCachedTranslation(selectedPanel.filename, getScanOptions());
-            if (!result || result.cache_miss) {
-                markScanSettingsChanged();
-                return;
-            }
-            latestScan = mergeHydratedScanResult(latestScan, result);
-            ocrText = latestScan.text || ocrText;
-            renderDebugPanel(latestScan);
-            renderOverlays(latestScan.annotations || [], latestScan.image_width, latestScan.image_height);
-            showTranslatedPanel(latestScan.translated_image_url);
-            await refreshCacheStatus();
-        } catch (err) {
-            console.warn('Could not hydrate cached translation for current model:', err);
-        } finally {
-            markScanSettingsChanged();
-        }
-    }
-
     function mergeHydratedScanResult(baseResult, stageResult) {
         const merged = {
             ...baseResult,
@@ -606,8 +673,11 @@ const Scanner = (() => {
         };
         const baseAnnotations = baseResult.annotations || [];
         const stageAnnotations = stageResult.annotations || [];
+        const stageAnnotationsByRegion = new Map(
+            stageAnnotations.map((ann, index) => [getAnnotationRegionId(ann, index), ann])
+        );
         merged.annotations = baseAnnotations.map((ann, index) => {
-            const stageAnn = stageAnnotations[index] || {};
+            const stageAnn = stageAnnotationsByRegion.get(getAnnotationRegionId(ann, index)) || {};
             return {
                 ...ann,
                 ...stageAnn,
@@ -704,13 +774,15 @@ const Scanner = (() => {
         try {
             const ocrResult = await API.scanPanel(selectedPanel.filename, getScanOptions());
             resetTranslationView();
-            activeRabbitholeSelection = { regionId: null, unitId: null };
+            rabbitholeCardStates.clear();
             latestScan = ocrResult;
             lastScannedOcrFingerprint = getOcrFingerprint();
             ocrText = ocrResult.text || '';
             renderDebugPanel(ocrResult);
             renderOverlays(ocrResult.annotations || [], ocrResult.image_width, ocrResult.image_height);
+            setTranslateEnabled(hasComputedText(ocrResult.annotations || []) && !(ocrResult.annotations || []).some(isUncomputedAnnotation));
             try {
+                setPaneMessage('reader-rabbithole-content', 'Building Rabbithole context...');
                 const rabbitholeResult = await API.buildRabbithole(selectedPanel.filename, getScanOptions());
                 latestScan = rabbitholeResult;
                 ocrText = rabbitholeResult.text || ocrText;
@@ -1063,7 +1135,20 @@ const Scanner = (() => {
                 line_count: vision.line_count ?? (ann.lines || []).length,
                 threshold: vision.threshold,
                 bubble_source: vision.source,
+                bubble_id: vision.bubble_id,
                 bubble_confidence: vision.bubble_confidence,
+                association_score: vision.association_score,
+                text_containment: vision.text_containment,
+                model_id: vision.model_id,
+                model_revision: vision.model_revision,
+                fallback_reason: vision.fallback_reason,
+                model_fallback_reason: vision.model_fallback_reason,
+                unmatched_text_policy: vision.unmatched_text_policy,
+                possible_content_type: vision.possible_content_type,
+                border_touching: vision.border_touching,
+                open_balloon_handling: vision.open_balloon_handling,
+                page_color_mode: vision.page_color_mode,
+                page_mean_saturation: vision.page_mean_saturation,
                 bubble_area_ratio: vision.bubble_area_ratio,
                 bubble_fill_ratio: vision.bubble_fill_ratio,
                 bubble_overlap_ratio: vision.bubble_overlap_ratio,
@@ -1224,77 +1309,39 @@ const Scanner = (() => {
         return ann?.rabbithole || null;
     }
 
-    function getSelectedRabbitholeUnit(ann, fallback = 0) {
+    function getRabbitholeCardState(instanceKey) {
+        const key = String(instanceKey || 'side:default');
+        if (!rabbitholeCardStates.has(key)) {
+            rabbitholeCardStates.set(key, {
+                selection: { regionId: null, unitId: null },
+            });
+        }
+        return rabbitholeCardStates.get(key);
+    }
+
+    function getSelectedRabbitholeUnit(ann, fallback = 0, instanceKey = 'side:default') {
         const rabbit = getRabbitholeData(ann);
         const regionId = getAnnotationRegionId(ann, fallback);
-        if (!rabbit || activeRabbitholeSelection.regionId !== regionId) return null;
-        return rabbit.units_by_id?.[activeRabbitholeSelection.unitId] || null;
+        const selection = getRabbitholeCardState(instanceKey).selection;
+        if (!rabbit || selection.regionId !== regionId) return null;
+        return rabbit.units_by_id?.[selection.unitId] || null;
     }
 
-    function setActiveRabbitholeUnit(regionId, unitId) {
+    function setActiveRabbitholeUnit(regionId, unitId, instanceKey = 'side:default') {
         const nextRegion = String(regionId);
-        const nextUnit = resolveRabbitholeSelectionUnit(nextRegion, String(unitId));
-        const isSame = activeRabbitholeSelection.regionId === nextRegion && activeRabbitholeSelection.unitId === nextUnit;
-        activeRabbitholeSelection = isSame
-            ? { regionId: null, unitId: null }
-            : { regionId: nextRegion, unitId: nextUnit };
+        getRabbitholeCardState(instanceKey).selection = { regionId: nextRegion, unitId: String(unitId) };
         if (latestScan) {
             renderDebugPanel(latestScan);
-            rerenderLatestOverlays();
+            renderOpenPopups();
         }
     }
 
-    function resolveRabbitholeSelectionUnit(regionId, unitId) {
-        const ann = (latestScan?.annotations || []).find(candidate => getAnnotationRegionId(candidate) === regionId);
-        const rabbit = getRabbitholeData(ann);
-        const unit = rabbit?.units_by_id?.[unitId];
-        if (!rabbit || !unit || unit.kind !== 'kanji') return unitId;
-
-        const exactBreakUnit = getBreakdownSegments(ann, activeRabbitholeLayer)
-            .map(segment => getUnitForSegment(rabbit, segment))
-            .find(candidate =>
-                candidate
-                && candidate.kind !== 'kanji'
-                && candidate.text === unit.text
-                && candidate.start === unit.start
-                && candidate.end === unit.end
-        );
-        return exactBreakUnit?.id || unitId;
-    }
-
-    function isSameUnitSpan(a, b) {
-        if (!a || !b) return false;
-        return String(a.text || '') === String(b.text || '')
-            && Number(a.start) === Number(b.start)
-            && Number(a.end) === Number(b.end);
-    }
-
-    function isRabbitholeItemActive(ann, targetUnitId) {
+    function isRabbitholeItemActive(ann, targetUnitId, instanceKey = 'side:default') {
         if (!targetUnitId) return false;
         const regionId = getAnnotationRegionId(ann);
-        if (activeRabbitholeSelection.regionId !== regionId) return false;
-        if (activeRabbitholeSelection.unitId === targetUnitId) return true;
-
-        const rabbit = getRabbitholeData(ann);
-        const selectedUnit = rabbit?.units_by_id?.[activeRabbitholeSelection.unitId];
-        const targetUnit = rabbit?.units_by_id?.[targetUnitId];
-        if (!selectedUnit || !targetUnit) return false;
-        if (isSameUnitSpan(selectedUnit, targetUnit)) return true;
-
-        const selectedChildren = new Set(Array.isArray(selectedUnit.children) ? selectedUnit.children.map(String) : []);
-        const targetChildren = new Set(Array.isArray(targetUnit.children) ? targetUnit.children.map(String) : []);
-        if (selectedChildren.has(String(targetUnit.id)) || targetChildren.has(String(selectedUnit.id))) return true;
-
-        if (selectedUnit.kind === 'kanji' || targetUnit.kind === 'kanji') {
-            const sameText = String(selectedUnit.text || '') === String(targetUnit.text || '');
-            const selectedWithinTarget = Number(selectedUnit.start) >= Number(targetUnit.start)
-                && Number(selectedUnit.end) <= Number(targetUnit.end);
-            const targetWithinSelected = Number(targetUnit.start) >= Number(selectedUnit.start)
-                && Number(targetUnit.end) <= Number(selectedUnit.end);
-            if (sameText && (selectedWithinTarget || targetWithinSelected)) return true;
-        }
-
-        return false;
+        const selection = getRabbitholeCardState(instanceKey).selection;
+        if (selection.regionId !== regionId) return false;
+        return selection.unitId === targetUnitId;
     }
 
     function createRabbitholeTextRow(label, value, compact = false, className = '') {
@@ -1313,43 +1360,7 @@ const Scanner = (() => {
         return row;
     }
 
-    function setActiveRabbitholeLayer(layerId) {
-        const target = RABBITHOLE_LAYER_DEFS.find(layer => layer.id === layerId && !layer.upcoming);
-        if (!target || activeRabbitholeLayer === target.id) return;
-        activeRabbitholeLayer = target.id;
-        if (latestScan) {
-            renderDebugPanel(latestScan);
-            rerenderLatestOverlays();
-        }
-    }
-
-    function createRabbitholeLayerTabs(compact = false) {
-        const tabs = document.createElement('div');
-        tabs.className = `rabbithole-layer-tabs${compact ? ' compact' : ''}`;
-
-        RABBITHOLE_LAYER_DEFS.forEach(layer => {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.className = `rabbithole-layer-tab${activeRabbitholeLayer === layer.id ? ' active' : ''}${layer.upcoming ? ' upcoming' : ''}`;
-            button.textContent = layer.label;
-            button.disabled = Boolean(layer.upcoming);
-            button.setAttribute('aria-pressed', String(activeRabbitholeLayer === layer.id));
-            if (layer.upcoming) {
-                button.title = `${layer.label} is planned for the next rabbithole phase.`;
-            } else {
-                button.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setActiveRabbitholeLayer(layer.id);
-                });
-            }
-            tabs.appendChild(button);
-        });
-
-        return tabs;
-    }
-
-    function createRabbitholeUnitRow(label, ann, items, compact = false, fallback = '', className = '') {
+    function createRabbitholeUnitRow(label, ann, items, compact = false, fallback = '', className = '', instanceKey = 'side:default') {
         const row = document.createElement('div');
         row.className = `rabbithole-row${compact ? ' compact' : ''}`;
 
@@ -1378,12 +1389,12 @@ const Scanner = (() => {
                 button.textContent = text;
             }
             button.setAttribute('data-text', text);
-            button.classList.toggle('active', Boolean(targetUnitId) && isRabbitholeItemActive(ann, targetUnitId));
+            button.classList.toggle('active', Boolean(targetUnitId) && isRabbitholeItemActive(ann, targetUnitId, instanceKey));
             if (targetUnitId) {
                 button.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    setActiveRabbitholeUnit(regionId, targetUnitId);
+                    setActiveRabbitholeUnit(regionId, targetUnitId, instanceKey);
                 });
             } else {
                 button.disabled = true;
@@ -1434,115 +1445,75 @@ const Scanner = (() => {
         return segment?.hiragana || segment?.text || '';
     }
 
-    function extractKanjiCharacters(text) {
-        const kanji = [];
-        Array.from(text || '').forEach((char, index) => {
-            if (/[\u3400-\u9fff]/.test(char)) {
-                kanji.push({ char, start: index, end: index + char.length });
-            }
-        });
-        return kanji;
+    function isMeaningfulRabbitholeUnit(unit) {
+        if (!unit) return false;
+        const text = String(unit.text || '').trim();
+        if (!text) return false;
+        if (unit.kind === 'kanji') return true;
+        const pos = Array.isArray(unit.pos) ? unit.pos.map(String) : [];
+        if (pos.some(part => part.includes('補助記号'))) return false;
+        const hasJapaneseOrAlnum = Array.from(text).some(char => /[\u3040-\u30ff\u3400-\u9fff\p{L}\p{N}]/u.test(char));
+        if (!hasJapaneseOrAlnum) return Boolean(unit.unicode_metadata?.codepoint || unit.dictionary_entries?.length);
+        return unit.kind !== 'token'
+            || Boolean(unit.reading_hiragana)
+            || Boolean(unit.reading_romaji)
+            || Boolean(unit.reading_romanji)
+            || Boolean(unit.dictionary_entries?.length);
     }
 
-    function findExactBreakUnitForKanji(ann, char, start, end) {
-        const rabbit = getRabbitholeData(ann);
-        return getBreakdownSegments(ann, activeRabbitholeLayer)
-            .map(segment => getUnitForSegment(rabbit, segment))
-            .find(unit =>
-                unit
-                && unit.kind !== 'kanji'
-                && unit.text === char
-                && Number(unit.start) === start
-                && Number(unit.end) === end
-            ) || null;
+    function isMeaningfulRabbitholeSegment(ann, segment) {
+        const unit = getUnitForSegment(getRabbitholeData(ann), segment);
+        return isMeaningfulRabbitholeUnit(unit);
     }
 
-    function findContainingBreakUnitForKanji(ann, char, start, end) {
-        const rabbit = getRabbitholeData(ann);
-        return getBreakdownSegments(ann, activeRabbitholeLayer)
-            .map(segment => getUnitForSegment(rabbit, segment))
-            .find(unit => {
-                if (!unit || unit.kind === 'kanji') return false;
-                const unitStart = Number(unit.start);
-                const unitEnd = Number(unit.end);
-                const relativeStart = start - unitStart;
-                return unitStart <= start
-                    && unitEnd >= end
-                    && String(unit.text || '').slice(relativeStart, relativeStart + char.length) === char;
-            }) || null;
-    }
-
-    function buildKanjiItems(ann) {
+    function buildKanjiItems(ann, instanceKey = 'side:default') {
         const rabbit = getRabbitholeData(ann);
         const units = rabbit?.units_by_id || {};
-        const kanjiSpans = extractKanjiCharacters(ann.text || '');
+        const kanjiSpans = getBreakdownSegments(ann)
+            .map(segment => getUnitForSegment(rabbit, segment))
+            .filter(unit => unit && unit.kind !== 'kanji')
+            .flatMap(unit => (unit.children || [])
+                .map(childId => units[childId])
+                .filter(child => child?.kind === 'kanji')
+                .map(child => ({
+                    char: child.text,
+                    start: Number(child.start),
+                    end: Number(child.end),
+                    container: unit,
+                    child,
+                })));
         const seen = new Set();
 
         return kanjiSpans
-            .filter(({ char, start, end }) => {
+            .filter(({ char, start, end, child }) => {
                 const key = `${char}:${start}:${end}`;
-                if (seen.has(key)) return false;
+                if (!child?.id || seen.has(key)) return false;
                 seen.add(key);
                 return true;
             })
-            .map(({ char, start, end }) => {
-                const exactBreakUnit = findExactBreakUnitForKanji(ann, char, start, end);
-                if (exactBreakUnit) {
-                    return {
-                        unitId: exactBreakUnit.id,
-                        text: char,
-                        className: 'rabbithole-kanji',
-                    };
-                }
-
-                const container = findContainingBreakUnitForKanji(ann, char, start, end);
-                if (container) {
-                    const child = (container.children || [])
-                        .map(childId => units[childId])
-                        .find(unit =>
-                            unit?.kind === 'kanji'
-                            && unit.text === char
-                            && Number(unit.start) === start
-                            && Number(unit.end) === end
-                        );
-                    const index = start - Number(container.start);
-                    const containerText = String(container.text || '');
-                    return {
-                        unitId: child?.id || '',
-                        text: char,
-                        prefix: index > 0 ? containerText.slice(0, index) : '',
-                        suffix: index >= 0 ? containerText.slice(index + char.length) : '',
-                        className: 'rabbithole-kanji',
-                    };
-                }
-
-                const kanjiUnit = Object.values(units).find(unit =>
-                    unit.kind === 'kanji'
-                    && unit.text === char
-                    && Number(unit.start) === start
-                    && Number(unit.end) === end
-                );
-                if (kanjiUnit) {
-                    return {
-                        unitId: kanjiUnit.id,
-                        text: char,
-                        className: 'rabbithole-kanji',
-                    };
-                }
-                return { unitId: '', text: char, context: '', className: 'rabbithole-kanji' };
-            })
-            .filter(item => item.unitId);
+            .map(({ char, start, container, child }) => {
+                const index = start - Number(container.start);
+                const containerText = String(container.text || '');
+                return {
+                    unitId: child.id,
+                    text: char,
+                    prefix: index > 0 ? containerText.slice(0, index) : '',
+                    suffix: index >= 0 ? containerText.slice(index + char.length) : '',
+                    className: 'rabbithole-kanji',
+                };
+            });
     }
 
-    function getRabbitholeBreakdown(ann, layerId = activeRabbitholeLayer) {
+    function getRabbitholeBreakdown(ann, layerId = 'words') {
         const rabbit = getRabbitholeData(ann);
         const breakdowns = rabbit?.breakdowns || {};
         if (breakdowns[layerId]) return breakdowns[layerId];
         return null;
     }
 
-    function getBreakdownSegments(ann, layerId = activeRabbitholeLayer) {
-        return getRabbitholeBreakdown(ann, layerId)?.segments || [];
+    function getBreakdownSegments(ann, layerId = 'words') {
+        return (getRabbitholeBreakdown(ann, layerId)?.segments || [])
+            .filter(segment => isMeaningfulRabbitholeSegment(ann, segment));
     }
 
     function buildSegmentItems(ann, layerId, valueSelector = segment => segment.text || '') {
@@ -1552,37 +1523,27 @@ const Scanner = (() => {
         })));
     }
 
-    function buildBaseFormItems(ann, layerId) {
-        const rabbit = getRabbitholeData(ann);
-        return uniqueRabbitholeItems(getBreakdownSegments(ann, layerId).map(segment => {
-            const unit = getUnitForSegment(rabbit, segment);
-            return {
-                unitId: segment.unit_id,
-                text: unit?.lemma || segment.text || '',
-            };
-        }));
-    }
-
     function buildRabbitholeItems(ann, layerId) {
         const rabbit = getRabbitholeData(ann);
         if (layerId === 'hiragana') {
-            return buildSegmentItems(ann, activeRabbitholeLayer, getSegmentHiragana);
+            return buildSegmentItems(ann, 'words', getSegmentHiragana);
         }
         if (layerId === 'romaji') {
-            return buildSegmentItems(ann, activeRabbitholeLayer, segment => segment.romanji || getUnitForSegment(rabbit, segment)?.reading_romanji || '');
+            return buildSegmentItems(ann, 'words', segment => segment.romaji || segment.romanji
+                || getUnitForSegment(rabbit, segment)?.reading_romaji
+                || getUnitForSegment(rabbit, segment)?.reading_romanji || '');
         }
         if (layerId === 'glossary') {
-            return buildSegmentItems(ann, activeRabbitholeLayer, segment => segment.gloss || getUnitForSegment(rabbit, segment)?.primary_meaning || '');
+            return buildSegmentItems(ann, 'words', segment => segment.gloss || getUnitForSegment(rabbit, segment)?.primary_meaning || '');
         }
-        if (layerId === 'words' || layerId === 'morphemes') return buildSegmentItems(ann, layerId);
-        if (layerId === 'base_forms') return buildBaseFormItems(ann, activeRabbitholeLayer);
+        if (layerId === 'words') return buildSegmentItems(ann, layerId);
         return [];
     }
 
     function getRabbitholeUnitKindLabel(unit) {
         const labels = {
             whole: 'full text',
-            word: 'lexical unit',
+            word: 'segment',
             particle: 'particle',
             aux: 'auxiliary',
             suffix: 'suffix',
@@ -1596,36 +1557,255 @@ const Scanner = (() => {
         const rabbit = getRabbitholeData(ann);
         return [
             createRabbitholeTextRow('Recognized Text', ann.text || '', compact),
-            createRabbitholeTextRow('Hiragana', getRabbitHiragana(rabbit), compact),
             createRabbitholeTextRow('EN', ann.translated?.trim() || TRANSLATION_PENDING_TEXT, compact, 'rabbithole-translation'),
         ];
     }
 
-    function createRabbitholeLayerRows(ann, compact = false) {
-        const layer = activeRabbitholeLayer;
+    function createRabbitholeRows(ann, compact = false, instanceKey = 'side:default') {
         const rows = createRabbitholeBaseRows(ann, compact);
-        const label = RABBITHOLE_LAYER_DEFS.find(item => item.id === layer)?.label || 'Breakdown';
 
-        rows.push(createRabbitholeUnitRow(label, ann, buildRabbitholeItems(ann, layer), compact, ann.text || ''));
-        rows.push(createRabbitholeUnitRow('Hiragana Parts', ann, buildRabbitholeItems(ann, 'hiragana'), compact, getRabbitHiragana(getRabbitholeData(ann))));
+        rows.push(createRabbitholeUnitRow('Lexical Break', ann, buildRabbitholeItems(ann, 'words'), compact, ann.text || '', '', instanceKey));
+        rows.push(createRabbitholeUnitRow('Hiragana', ann, buildRabbitholeItems(ann, 'hiragana'), compact, getRabbitHiragana(getRabbitholeData(ann)), '', instanceKey));
 
-        const kanjiItems = buildKanjiItems(ann);
+        const kanjiItems = buildKanjiItems(ann, instanceKey);
         if (kanjiItems.length) {
-            rows.push(createRabbitholeUnitRow('Kanji', ann, kanjiItems, compact, 'No kanji units available.'));
+            rows.push(createRabbitholeUnitRow('Kanji', ann, kanjiItems, compact, 'No kanji units available.', '', instanceKey));
         }
 
-        rows.push(createRabbitholeUnitRow('Base Forms', ann, buildRabbitholeItems(ann, 'base_forms'), compact, 'No base forms available.'));
-        rows.push(createRabbitholeUnitRow('Romaji Parts', ann, buildRabbitholeItems(ann, 'romaji'), compact, getRabbitholeData(ann)?.reading_romanji || '', 'rabbithole-romanji-row'));
+        rows.push(createRabbitholeUnitRow('Romaji', ann, buildRabbitholeItems(ann, 'romaji'), compact,
+            getRabbitholeData(ann)?.reading_romaji || getRabbitholeData(ann)?.reading_romanji || '', 'rabbithole-romanji-row', instanceKey));
         return rows;
     }
 
-    function createDictionaryEntriesBlock(unit) {
+    function createExternalLink(label, href, className = '') {
+        const link = document.createElement('a');
+        link.textContent = label;
+        link.href = href;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        if (className) link.className = className;
+        return link;
+    }
+
+    function clearHelpPopoverHideTimer() {
+        window.clearTimeout(rabbitholeHelpHideTimer);
+        rabbitholeHelpHideTimer = null;
+    }
+
+    function hideHelpPopover(force = false) {
+        clearHelpPopoverHideTimer();
+        if (rabbitholeHelpPinned && !force) return;
+        if (rabbitholeHelpOwner) {
+            rabbitholeHelpOwner.setAttribute('aria-expanded', 'false');
+        }
+        if (rabbitholeHelpOverlay) {
+            rabbitholeHelpOverlay.hidden = true;
+        }
+        rabbitholeHelpOwner = null;
+        rabbitholeHelpPinned = false;
+    }
+
+    function scheduleHelpPopoverHide() {
+        clearHelpPopoverHideTimer();
+        rabbitholeHelpHideTimer = window.setTimeout(() => hideHelpPopover(), 120);
+    }
+
+    function ensureHelpPopoverOverlay() {
+        if (rabbitholeHelpOverlay) return rabbitholeHelpOverlay;
+        const overlay = document.createElement('div');
+        overlay.id = 'rabbithole-help-overlay';
+        overlay.className = 'rabbithole-help-content';
+        overlay.setAttribute('role', 'dialog');
+        overlay.setAttribute('aria-label', 'Rabbithole help');
+        overlay.hidden = true;
+        overlay.addEventListener('pointerenter', clearHelpPopoverHideTimer);
+        overlay.addEventListener('pointerleave', scheduleHelpPopoverHide);
+        overlay.addEventListener('focusin', clearHelpPopoverHideTimer);
+        overlay.addEventListener('focusout', scheduleHelpPopoverHide);
+        document.body.appendChild(overlay);
+        rabbitholeHelpOverlay = overlay;
+
+        window.addEventListener('resize', () => hideHelpPopover(true));
+        document.addEventListener('scroll', () => hideHelpPopover(true), true);
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape') hideHelpPopover(true);
+        });
+        document.addEventListener('pointerdown', event => {
+            if (!rabbitholeHelpOwner || overlay.hidden) return;
+            if (event.target === rabbitholeHelpOwner || overlay.contains(event.target)) return;
+            hideHelpPopover(true);
+        }, true);
+        return overlay;
+    }
+
+    function positionHelpPopover(button, overlay) {
+        const margin = 10;
+        const gap = 6;
+        overlay.style.left = '0px';
+        overlay.style.top = '0px';
+        overlay.style.visibility = 'hidden';
+        const triggerRect = button.getBoundingClientRect();
+        const overlayRect = overlay.getBoundingClientRect();
+        const maxLeft = Math.max(margin, window.innerWidth - overlayRect.width - margin);
+        const left = Math.max(margin, Math.min(triggerRect.left, maxLeft));
+        let top = triggerRect.bottom + gap;
+        if (top + overlayRect.height > window.innerHeight - margin) {
+            top = triggerRect.top - overlayRect.height - gap;
+        }
+        top = Math.max(margin, Math.min(top, window.innerHeight - overlayRect.height - margin));
+        overlay.style.left = `${Math.round(left)}px`;
+        overlay.style.top = `${Math.round(top)}px`;
+        overlay.style.visibility = 'visible';
+    }
+
+    function showHelpPopover(button, help, pinned = false) {
+        clearHelpPopoverHideTimer();
+        const overlay = ensureHelpPopoverOverlay();
+        if (rabbitholeHelpOwner && rabbitholeHelpOwner !== button) {
+            rabbitholeHelpOwner.setAttribute('aria-expanded', 'false');
+        }
+        overlay.replaceChildren(
+            document.createTextNode(`${help[0]} `),
+            createExternalLink('Learn more', help[1]),
+        );
+        overlay.hidden = false;
+        rabbitholeHelpOwner = button;
+        rabbitholeHelpPinned = pinned;
+        button.setAttribute('aria-expanded', 'true');
+        positionHelpPopover(button, overlay);
+    }
+
+    function createHelpPopover(helpKey) {
+        const help = RABBITHOLE_HELP[helpKey];
+        if (!help) return null;
+        const wrapper = document.createElement('span');
+        wrapper.className = 'rabbithole-help';
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'rabbithole-help-trigger';
+        button.textContent = '?';
+        button.setAttribute('aria-label', `Explain ${helpKey}`);
+        button.setAttribute('aria-expanded', 'false');
+        button.setAttribute('aria-controls', 'rabbithole-help-overlay');
+        wrapper.addEventListener('pointerenter', () => showHelpPopover(button, help));
+        wrapper.addEventListener('pointerleave', scheduleHelpPopoverHide);
+        button.addEventListener('focus', () => showHelpPopover(button, help));
+        button.addEventListener('blur', scheduleHelpPopoverHide);
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (rabbitholeHelpOwner === button && rabbitholeHelpPinned) {
+                hideHelpPopover(true);
+                return;
+            }
+            showHelpPopover(button, help, true);
+        });
+        wrapper.appendChild(button);
+        return wrapper;
+    }
+
+    function getSourceRecord(unit, sourceId, rabbit = null) {
+        return unit?.sources?.[sourceId]
+            || unit?.kanji_details?.sources?.[sourceId]
+            || rabbit?.source_catalog?.[sourceId]
+            || latestScan?.rabbithole?.source_catalog?.[sourceId]
+            || null;
+    }
+
+    function createSourceBadge(sourceId, unit, rabbit = null) {
+        if (!sourceId) return null;
+        const record = getSourceRecord(unit, sourceId, rabbit);
+        const label = record?.name || ({
+            jmdict: 'JMdict',
+            kanjidic2: 'KANJIDIC2',
+            app_editorial: 'Editorial',
+            sudachi: 'Sudachi',
+            pykakasi: 'pykakasi',
+            local_romaji: 'Local Hepburn fallback',
+            kanjivg: 'KanjiVG',
+            wiktionary: 'Wiktionary',
+            unicode: 'Unicode',
+            mangaocr: 'Manga OCR',
+            translation_engine: 'Translation engine',
+        }[sourceId] || sourceId);
+        const badge = document.createElement(record?.canonical_url ? 'a' : 'span');
+        badge.className = 'rabbithole-source-badge';
+        badge.textContent = label;
+        if (record?.canonical_url) {
+            badge.href = record.canonical_url;
+            badge.target = '_blank';
+            badge.rel = 'noopener noreferrer';
+        }
+        badge.title = [record?.dataset, record?.version].filter(Boolean).join(' · ');
+        return badge;
+    }
+
+    function sourceIdsFor(unit, field, fallback = []) {
+        const direct = unit?.field_sources?.[field]
+            || unit?.kanji_details?.field_sources?.[field];
+        return Array.isArray(direct) && direct.length ? direct : fallback;
+    }
+
+    function appendInspectorValue(container, value) {
+        if (value instanceof Node) {
+            container.appendChild(value);
+            return;
+        }
+        if (Array.isArray(value)) {
+            value.filter(item => item !== null && item !== undefined && String(item).trim()).forEach(item => {
+                const chip = document.createElement('span');
+                chip.className = 'rabbithole-value-chip';
+                chip.textContent = String(item);
+                container.appendChild(chip);
+            });
+            return;
+        }
+        container.textContent = String(value ?? '—');
+    }
+
+    function createInspectorRow(label, value, { helpKey = '', sources = [], unit = null, rabbit = null, className = '' } = {}) {
+        if (value === null || value === undefined || value === '' || (Array.isArray(value) && !value.length)) return null;
+        const row = document.createElement('div');
+        row.className = `rabbithole-inspector-row${className ? ` ${className}` : ''}`;
+        const labelEl = document.createElement('div');
+        labelEl.className = 'rabbithole-inspector-label';
+        labelEl.appendChild(document.createTextNode(label));
+        const help = createHelpPopover(helpKey);
+        if (help) labelEl.appendChild(help);
+        const valueEl = document.createElement('div');
+        valueEl.className = 'rabbithole-inspector-value';
+        appendInspectorValue(valueEl, value);
+        const badges = document.createElement('span');
+        badges.className = 'rabbithole-source-badges';
+        [...new Set(sources.filter(Boolean))].forEach(sourceId => {
+            const badge = createSourceBadge(sourceId, unit, rabbit);
+            if (badge) badges.appendChild(badge);
+        });
+        if (badges.children.length) valueEl.appendChild(badges);
+        row.append(labelEl, valueEl);
+        return row;
+    }
+
+    function createInspectorSection(title, rows, className = '') {
+        const filtered = rows.filter(Boolean);
+        if (!filtered.length) return null;
+        const section = document.createElement('section');
+        section.className = `rabbithole-feature-section${className ? ` ${className}` : ''}`;
+        section.appendChild(createDebugBlockTitle(title));
+        const grid = document.createElement('div');
+        grid.className = 'rabbithole-inspector-grid';
+        filtered.forEach(row => grid.appendChild(row));
+        section.appendChild(grid);
+        return section;
+    }
+
+    function createDictionaryEntriesBlock(unit, rabbit = null, title = 'Dictionary', suppressRepeatedHeadword = false) {
         const entries = Array.isArray(unit?.dictionary_entries) ? unit.dictionary_entries : [];
         if (!entries.length) return null;
 
         const block = document.createElement('div');
         block.className = 'rabbithole-dictionary';
-        block.appendChild(createDebugBlockTitle('Dictionary'));
+        block.appendChild(createDebugBlockTitle(title));
 
         entries.slice(0, 3).forEach((entry, index) => {
             const article = document.createElement('article');
@@ -1637,7 +1817,7 @@ const Scanner = (() => {
             const primaryVariant = variants[0] || {};
             const term = document.createElement('strong');
             term.textContent = primaryVariant.written || unit.text || `Entry ${index + 1}`;
-            header.appendChild(term);
+            if (!suppressRepeatedHeadword || term.textContent !== unit.text) header.appendChild(term);
 
             const reading = primaryVariant.reading_hiragana || '';
             if (reading && reading !== term.textContent) {
@@ -1647,10 +1827,11 @@ const Scanner = (() => {
             }
 
             if (entry.source) {
-                const sourceEl = document.createElement('span');
-                sourceEl.className = 'rabbithole-dictionary-source';
-                sourceEl.textContent = entry.source;
-                header.appendChild(sourceEl);
+                const sourceEl = createSourceBadge(entry.source, unit, rabbit);
+                if (sourceEl) {
+                    sourceEl.classList.add('rabbithole-dictionary-source');
+                    header.appendChild(sourceEl);
+                }
             }
             article.appendChild(header);
 
@@ -1666,6 +1847,8 @@ const Scanner = (() => {
                     chip.textContent = tag.text;
                     tagRow.appendChild(chip);
                 });
+                const help = createHelpPopover('frequency');
+                if (help) tagRow.appendChild(help);
                 article.appendChild(tagRow);
             }
 
@@ -1685,9 +1868,342 @@ const Scanner = (() => {
         return block;
     }
 
-    function createRabbitholeUnitInspector(ann, compact = false) {
+    function createNestedUnitsBlock(ann, rabbit, unit, instanceKey = 'side:default') {
+        if (!Array.isArray(unit.children) || !unit.children.length) return null;
+        const block = document.createElement('section');
+        block.className = 'rabbithole-feature-section rabbithole-children';
+        block.appendChild(createDebugBlockTitle('Nested units'));
+        unit.children.forEach(childId => {
+            const child = rabbit.units_by_id?.[childId];
+            if (!child) return;
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'rabbithole-child';
+            chip.textContent = `${child.text} · ${child.unit_label || getRabbitholeUnitKindLabel(child)}`;
+            chip.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setActiveRabbitholeUnit(getAnnotationRegionId(ann), child.id, instanceKey);
+            });
+            block.appendChild(chip);
+        });
+        return block.children.length > 1 ? block : null;
+    }
+
+    function mergeRichKanji(unit, data) {
+        if (!data || unit?.kind !== 'kanji') return;
+        unit.kanji_details = { ...(unit.kanji_details || {}), ...data };
+        unit.sources = { ...(unit.sources || {}), ...(data.sources || {}) };
+        unit.field_sources = { ...(unit.field_sources || {}), ...(data.field_sources || {}) };
+    }
+
+    function ensureRichKanji(unit) {
+        const character = String(unit?.text || '').slice(0, 1);
+        if (!character || unit?.kind !== 'kanji') return;
+        if (richKanjiCache.has(character)) {
+            mergeRichKanji(unit, richKanjiCache.get(character));
+            return;
+        }
+        if (richKanjiRequests.has(character)) return;
+        unit.rich_kanji_loading = true;
+        const request = API.lookupKanji(character)
+            .then(data => {
+                richKanjiCache.set(character, data);
+                mergeRichKanji(unit, data);
+            })
+            .catch(error => {
+                const fallback = { rich_load_error: error?.message || 'Kanji enrichment unavailable.' };
+                richKanjiCache.set(character, fallback);
+                mergeRichKanji(unit, fallback);
+            })
+            .finally(() => {
+                unit.rich_kanji_loading = false;
+                richKanjiRequests.delete(character);
+                if (latestScan) {
+                    renderDebugPanel(latestScan);
+                    renderOpenPopups();
+                }
+            });
+        richKanjiRequests.set(character, request);
+    }
+
+    function createReadingValue(readings) {
+        const list = document.createElement('div');
+        list.className = 'rabbithole-reading-list';
+        let hasOkuriganaMarker = false;
+        (readings || []).forEach(reading => {
+            const item = document.createElement('span');
+            const kana = typeof reading === 'string' ? reading : reading?.kana;
+            const romaji = typeof reading === 'string' ? '' : reading?.romaji;
+            if (String(kana || '').includes('.')) hasOkuriganaMarker = true;
+            item.appendChild(document.createTextNode(kana || ''));
+            if (romaji) {
+                const romanized = document.createElement('small');
+                romanized.textContent = romaji;
+                item.appendChild(romanized);
+            }
+            list.appendChild(item);
+        });
+        if (list.children.length) {
+            const romajiHelp = createHelpPopover('romaji');
+            if (romajiHelp) list.appendChild(romajiHelp);
+        }
+        if (hasOkuriganaMarker) {
+            const okuriganaHelp = createHelpPopover('okurigana');
+            if (okuriganaHelp) list.appendChild(okuriganaHelp);
+        }
+        return list;
+    }
+
+    function createStrokeOrderValue(strokeOrder, character) {
+        if (!strokeOrder?.available || !Array.isArray(strokeOrder.paths) || !strokeOrder.paths.length) {
+            const status = document.createElement('span');
+            status.className = 'rabbithole-muted';
+            status.textContent = strokeOrder?.error ? 'Stroke order unavailable.' : 'Loading stroke order…';
+            return status;
+        }
+        const wrapper = document.createElement('div');
+        wrapper.className = 'kanji-stroke-order';
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        const validViewBox = /^-?[\d.]+(?:\s+-?[\d.]+){3}$/.test(String(strokeOrder.view_box || ''));
+        svg.setAttribute('viewBox', validViewBox ? strokeOrder.view_box : '0 0 109 109');
+        svg.setAttribute('role', 'img');
+        svg.setAttribute('aria-label', `Animated stroke order for ${character}`);
+        strokeOrder.paths.forEach((stroke, index) => {
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', String(stroke.d || ''));
+            path.setAttribute('pathLength', '1');
+            path.style.setProperty('--stroke-index', index);
+            svg.appendChild(path);
+        });
+        const replay = document.createElement('button');
+        replay.type = 'button';
+        replay.className = 'kanji-stroke-replay';
+        replay.textContent = 'Replay';
+        replay.addEventListener('click', () => {
+            svg.classList.remove('playing');
+            requestAnimationFrame(() => requestAnimationFrame(() => svg.classList.add('playing')));
+        });
+        svg.classList.add('playing');
+        wrapper.append(svg, replay);
+        return wrapper;
+    }
+
+    function createGlyphOriginValue(origin) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'rabbithole-origin-note';
+        const text = document.createElement('p');
+        text.textContent = origin?.text || origin?.message || 'No glyph-origin note available';
+        wrapper.appendChild(text);
+        const caveat = document.createElement('small');
+        caveat.className = 'rabbithole-origin-caveat';
+        caveat.textContent = 'Wiktionary is an editorial starting point, not an authoritative etymology. ';
+        caveat.appendChild(createExternalLink(
+            'CUHK character database (further research)',
+            'https://humanum.arts.cuhk.edu.hk/Lexis/lexi-mf/',
+        ));
+        wrapper.appendChild(caveat);
+        if (origin?.revision_url) {
+            wrapper.appendChild(createExternalLink(
+                origin.revision_id ? `Wiktionary revision ${origin.revision_id}` : 'Wiktionary page',
+                origin.revision_url,
+            ));
+        }
+        if (origin?.stale) {
+            const stale = document.createElement('span');
+            stale.className = 'rabbithole-stale';
+            stale.textContent = 'Cached copy (network refresh failed)';
+            wrapper.appendChild(stale);
+        }
+        return wrapper;
+    }
+
+    function createSourcesDrawer(unit, rabbit) {
+        const records = {
+            ...(rabbit?.source_catalog || {}),
+            ...(unit?.sources || {}),
+            ...(unit?.kanji_details?.sources || {}),
+        };
+        const usedIds = new Set(Object.values(unit?.field_sources || {}).flat().filter(Boolean));
+        Object.values(unit?.kanji_details?.field_sources || {}).flat().filter(Boolean).forEach(id => usedIds.add(id));
+        if (!usedIds.size) Object.keys(unit?.sources || {}).forEach(id => usedIds.add(id));
+        const details = document.createElement('details');
+        details.className = 'rabbithole-sources-drawer';
+        const summary = document.createElement('summary');
+        summary.textContent = 'Sources used';
+        details.appendChild(summary);
+        [...usedIds].forEach(sourceId => {
+            const record = records[sourceId];
+            if (!record) return;
+            const article = document.createElement('article');
+            const heading = document.createElement('strong');
+            if (record.canonical_url) heading.appendChild(createExternalLink(record.name || sourceId, record.canonical_url));
+            else heading.textContent = record.name || sourceId;
+            article.appendChild(heading);
+            const meta = [
+                record.dataset && `Dataset: ${record.dataset}`,
+                record.intermediary && `Via: ${record.intermediary}`,
+                record.version && `Version: ${record.version}`,
+                record.license && `License: ${record.license}`,
+                record.retrieved_at && `Retrieved: ${new Date(Number(record.retrieved_at) * 1000).toLocaleString()}`,
+            ].filter(Boolean);
+            const paragraph = document.createElement('p');
+            paragraph.textContent = meta.join(' · ');
+            article.appendChild(paragraph);
+            details.appendChild(article);
+        });
+        return details;
+    }
+
+    function createKanjiInspectorContent(inspector, ann, rabbit, unit, instanceKey) {
+        ensureRichKanji(unit);
+        const details = unit.kanji_details || {};
+        const writing = createInspectorSection('Writing & origin', [
+            createInspectorRow('Stroke order', createStrokeOrderValue(details.stroke_order, unit.text), {
+                sources: sourceIdsFor(details, 'stroke_order', ['kanjivg']), unit, rabbit,
+            }),
+            createInspectorRow('Stroke count', details.stroke_count, {
+                sources: sourceIdsFor(details, 'stroke_count', ['kanjidic2']), unit, rabbit,
+            }),
+            createInspectorRow('Visual components', (details.components || []).map(component => {
+                if (typeof component === 'string') return component;
+                return [component.element, component.position && `(${component.position})`].filter(Boolean).join(' ');
+            }), {
+                helpKey: 'components', sources: sourceIdsFor(details, 'components', ['kanjivg']), unit, rabbit,
+            }),
+            createInspectorRow('Unicode', [details.unicode_metadata?.codepoint || (details.unicode && `U+${details.unicode}`), details.unicode_metadata?.name].filter(Boolean).join(' — '), {
+                helpKey: 'unicode', sources: sourceIdsFor(details, 'unicode', ['unicode']), unit, rabbit,
+            }),
+            createInspectorRow('Glyph origin', details.glyph_origin
+                ? createGlyphOriginValue(details.glyph_origin)
+                : (unit.rich_kanji_loading ? 'Loading glyph-origin note…' : 'No glyph-origin note available'), {
+                sources: sourceIdsFor(details, 'glyph_origin', ['wiktionary']), unit, rabbit, className: 'wide',
+            }),
+        ]);
+        if (writing) inspector.appendChild(writing);
+
+        const readings = details.structured_readings || {};
+        const readingSection = createInspectorSection('Readings', [
+            createInspectorRow('Kun’yomi', createReadingValue(readings.kun || []), {
+                helpKey: 'kunyomi', sources: sourceIdsFor(details, 'structured_readings', ['kanjidic2', 'pykakasi']), unit, rabbit,
+            }),
+            createInspectorRow('On’yomi', createReadingValue(readings.on || []), {
+                helpKey: 'onyomi', sources: sourceIdsFor(details, 'structured_readings', ['kanjidic2', 'pykakasi']), unit, rabbit,
+            }),
+            createInspectorRow('Nanori', createReadingValue(readings.nanori || []), {
+                helpKey: 'nanori', sources: sourceIdsFor(details, 'structured_readings', ['kanjidic2', 'pykakasi']), unit, rabbit,
+            }),
+        ]);
+        if (readingSection) inspector.appendChild(readingSection);
+
+        const dictionary = createDictionaryEntriesBlock(unit, rabbit, 'Dictionary', true);
+        if (dictionary) {
+            const metadata = createInspectorSection('Dictionary metadata', [
+                createInspectorRow('School grade', details.grade, {
+                    helpKey: 'grade', sources: sourceIdsFor(details, 'grade', ['kanjidic2']), unit, rabbit,
+                }),
+                createInspectorRow('Legacy JLPT (pre-2010)', details.jlpt, {
+                    helpKey: 'jlpt', sources: sourceIdsFor(details, 'jlpt', ['kanjidic2']), unit, rabbit,
+                }),
+                createInspectorRow('Mainichi rank', details.freq_mainichi_shinbun, {
+                    helpKey: 'frequency', sources: sourceIdsFor(details, 'freq_mainichi_shinbun', ['kanjidic2']), unit, rabbit,
+                }),
+            ]);
+            inspector.appendChild(dictionary);
+            if (metadata) inspector.appendChild(metadata);
+        } else {
+            const fallback = createInspectorSection('Dictionary', [
+                createInspectorRow('KANJIDIC character gloss', details.meanings || [], {
+                    sources: sourceIdsFor(details, 'meanings', ['kanjidic2']), unit, rabbit,
+                }),
+                createInspectorRow('School grade', details.grade, {
+                    helpKey: 'grade', sources: sourceIdsFor(details, 'grade', ['kanjidic2']), unit, rabbit,
+                }),
+                createInspectorRow('Legacy JLPT (pre-2010)', details.jlpt, {
+                    helpKey: 'jlpt', sources: sourceIdsFor(details, 'jlpt', ['kanjidic2']), unit, rabbit,
+                }),
+            ]);
+            if (fallback) inspector.appendChild(fallback);
+        }
+
+        if (details.heisig_en) {
+            const learning = document.createElement('details');
+            learning.className = 'rabbithole-learning-references';
+            const summary = document.createElement('summary');
+            summary.textContent = 'Learning references';
+            learning.appendChild(summary);
+            const row = createInspectorRow('Heisig mnemonic keyword', details.heisig_en, {
+                sources: sourceIdsFor(details, 'heisig_en', ['kanjidic2']), unit, rabbit,
+            });
+            if (row) learning.appendChild(row);
+            inspector.appendChild(learning);
+        }
+        const nested = createNestedUnitsBlock(ann, rabbit, unit, instanceKey);
+        if (nested) inspector.appendChild(nested);
+    }
+
+    function createGeneralInspectorContent(inspector, ann, rabbit, unit, instanceKey) {
+        const romaji = unit.reading_romaji || unit.reading_romanji || '';
+        const identity = createInspectorSection('Identity', [
+            createInspectorRow('Lemma', unit.lemma !== unit.text ? unit.lemma : '', {
+                helpKey: 'lemma', sources: sourceIdsFor(unit, 'lemma', ['sudachi']), unit, rabbit,
+            }),
+            createInspectorRow('Part of speech', unit.part_of_speech_labels || unit.pos || [], {
+                helpKey: 'pos', sources: sourceIdsFor(unit, 'pos', ['sudachi']), unit, rabbit,
+            }),
+        ]);
+        if (identity) inspector.appendChild(identity);
+        const reading = createInspectorSection('Reading', [
+            createInspectorRow('Hiragana', unit.reading_hiragana, {
+                sources: sourceIdsFor(unit, 'reading_hiragana', ['sudachi']), unit, rabbit,
+            }),
+            createInspectorRow('Romaji', romaji, {
+                helpKey: 'romaji', sources: sourceIdsFor(unit, 'reading_romaji', ['sudachi', 'pykakasi']), unit, rabbit,
+            }),
+        ]);
+        if (reading) inspector.appendChild(reading);
+        if (unit.grammar_detail && Object.keys(unit.grammar_detail).length) {
+            const helpKey = unit.kind === 'particle' ? 'particle' : (unit.kind === 'aux' ? 'auxiliary' : '');
+            const grammar = createInspectorSection('Grammar', [
+                createInspectorRow(unit.grammar_detail.label || 'Function', unit.grammar_detail.notes || [], {
+                    helpKey, sources: sourceIdsFor(unit, 'grammar_detail', ['app_editorial']), unit, rabbit,
+                }),
+            ]);
+            if (grammar) inspector.appendChild(grammar);
+        }
+        const dictionary = createDictionaryEntriesBlock(unit, rabbit);
+        if (dictionary) inspector.appendChild(dictionary);
+        else if (unit.primary_meaning && unit.kind !== 'whole') {
+            const fallback = createInspectorSection('Dictionary', [
+                createInspectorRow('Contextual gloss', unit.primary_meaning, {
+                    sources: sourceIdsFor(unit, 'primary_meaning', ['app_editorial']), unit, rabbit,
+                }),
+            ]);
+            if (fallback) inspector.appendChild(fallback);
+        }
+        if (unit.kind === 'whole') {
+            const translation = createInspectorSection('Translation', [
+                createInspectorRow('English', ann.translated?.trim() || TRANSLATION_PENDING_TEXT, {
+                    sources: ['translation_engine'], unit, rabbit,
+                }),
+            ]);
+            if (translation) inspector.appendChild(translation);
+        }
+        if (unit.unicode_metadata?.codepoint) {
+            const writing = createInspectorSection('Writing & origin', [
+                createInspectorRow('Unicode', `${unit.unicode_metadata.codepoint} — ${unit.unicode_metadata.name}`, {
+                    helpKey: 'unicode', sources: sourceIdsFor(unit, 'unicode_metadata', ['unicode']), unit, rabbit,
+                }),
+            ]);
+            if (writing) inspector.appendChild(writing);
+        }
+        const nested = createNestedUnitsBlock(ann, rabbit, unit, instanceKey);
+        if (nested) inspector.appendChild(nested);
+    }
+
+    function createRabbitholeUnitInspector(ann, compact = false, instanceKey = 'side:default') {
         const rabbit = getRabbitholeData(ann);
-        const unit = getSelectedRabbitholeUnit(ann);
+        const unit = getSelectedRabbitholeUnit(ann, 0, instanceKey);
         if (!rabbit || !unit) return null;
 
         const inspector = document.createElement('div');
@@ -1695,46 +2211,22 @@ const Scanner = (() => {
 
         const title = document.createElement('div');
         title.className = 'rabbithole-inspector-title';
-        title.textContent = `${unit.text} · ${getRabbitholeUnitKindLabel(unit)}`;
+        const titleText = document.createElement('strong');
+        titleText.textContent = unit.text;
+        const kind = document.createElement('span');
+        kind.textContent = getRabbitholeUnitKindLabel(unit);
+        title.append(titleText, kind);
+        const kindHelpKey = unit.kind === 'particle' ? 'particle'
+            : (unit.kind === 'aux' ? 'auxiliary' : '');
+        const kindHelp = createHelpPopover(kindHelpKey);
+        if (kindHelp) title.appendChild(kindHelp);
+        const identitySource = createSourceBadge(sourceIdsFor(unit, 'text', [unit.kind === 'kanji' ? 'kanjidic2' : 'sudachi'])[0], unit, rabbit);
+        if (identitySource) title.appendChild(identitySource);
         inspector.appendChild(title);
 
-        inspector.appendChild(createKeyValueGrid({
-            base_form: unit.lemma,
-            hiragana: getUnitHiragana(unit),
-            romaji: unit.reading_romanji,
-            glossary: unit.primary_meaning,
-            alternate_glossary: unit.alternate_meanings,
-            part_of_speech: unit.part_of_speech_labels,
-            analysis_tags: unit.pos,
-            kanji_details: unit.kanji_details,
-            dictionary_source: unit.dictionary_source,
-            dictionary_sources: unit.dictionary_sources,
-            span: `${unit.start}-${unit.end}`,
-        }));
-
-        const dictionaryBlock = createDictionaryEntriesBlock(unit);
-        if (dictionaryBlock) inspector.appendChild(dictionaryBlock);
-
-        if (Array.isArray(unit.children) && unit.children.length) {
-            const childBlock = document.createElement('div');
-            childBlock.className = 'rabbithole-children';
-            childBlock.appendChild(createDebugBlockTitle('Nested units'));
-            unit.children.forEach(childId => {
-                const child = rabbit.units_by_id?.[childId];
-                if (!child) return;
-                const chip = document.createElement('button');
-                chip.type = 'button';
-                chip.className = 'rabbithole-child';
-                chip.textContent = `${child.text} · ${child.primary_meaning || child.kind}`;
-                chip.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setActiveRabbitholeUnit(getAnnotationRegionId(ann), child.id);
-                });
-                childBlock.appendChild(chip);
-            });
-            inspector.appendChild(childBlock);
-        }
+        if (unit.kind === 'kanji') createKanjiInspectorContent(inspector, ann, rabbit, unit, instanceKey);
+        else createGeneralInspectorContent(inspector, ann, rabbit, unit, instanceKey);
+        inspector.appendChild(createSourcesDrawer(unit, rabbit));
 
         return inspector;
     }
@@ -1770,7 +2262,7 @@ const Scanner = (() => {
         return actions;
     }
 
-    function createRabbitholeCard(ann, index, compact = false) {
+    function createRabbitholeCard(ann, index, compact = false, instanceKey = `side:${getAnnotationRegionId(ann, index)}`) {
         const entry = document.createElement('section');
         entry.className = `rabbithole-card${compact ? ' compact' : ''}`;
         const rabbit = getRabbitholeData(ann);
@@ -1813,20 +2305,18 @@ const Scanner = (() => {
         closeBtn.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            dismissHoverboxRegion(regionId);
+            closePopupRegion(regionId);
         });
-        header.appendChild(closeBtn);
+        if (compact) header.appendChild(closeBtn);
 
         entry.appendChild(header);
 
-        entry.appendChild(createRabbitholeLayerTabs(compact));
-
         const grid = document.createElement('div');
         grid.className = 'rabbithole-table';
-        createRabbitholeLayerRows(ann, compact).forEach(row => grid.appendChild(row));
+        createRabbitholeRows(ann, compact, instanceKey).forEach(row => grid.appendChild(row));
         entry.appendChild(grid);
 
-        const inspector = createRabbitholeUnitInspector(ann, compact);
+        const inspector = createRabbitholeUnitInspector(ann, compact, instanceKey);
         if (inspector) entry.appendChild(inspector);
 
         return entry;
@@ -2127,9 +2617,51 @@ const Scanner = (() => {
         return svg;
     }
 
+    function createBubbleShape(ann, scaleX, scaleY, className) {
+        const vision = getVisionDebug(ann);
+        const bubblePoints = scalePolygonPoints(vision.bubble_points, scaleX, scaleY);
+        if (bubblePoints) {
+            const bubble = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+            bubble.setAttribute('class', className);
+            bubble.setAttribute('points', bubblePoints);
+            return bubble;
+        }
+
+        const bubbleBox = normalizeRectBox(vision.bubble_box);
+        if (!bubbleBox) return null;
+
+        const [x, y, width, height] = bubbleBox;
+        const bubbleRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        bubbleRect.setAttribute('class', className);
+        bubbleRect.setAttribute('x', String(x * scaleX));
+        bubbleRect.setAttribute('y', String(y * scaleY));
+        bubbleRect.setAttribute('width', String(width * scaleX));
+        bubbleRect.setAttribute('height', String(height * scaleY));
+        bubbleRect.setAttribute('rx', '10');
+        bubbleRect.setAttribute('ry', '10');
+        return bubbleRect;
+    }
+
+    function createHoverBubbleOverlay(annotations, scaleX, scaleY, displayW, displayH) {
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('class', 'ocr-hover-bubble-overlay');
+        svg.setAttribute('viewBox', `0 0 ${Math.max(1, displayW)} ${Math.max(1, displayH)}`);
+        svg.setAttribute('preserveAspectRatio', 'none');
+
+        annotations.forEach((ann, index) => {
+            const regionId = String(ann.region_id ?? ann.id ?? index);
+            const bubble = createBubbleShape(ann, scaleX, scaleY, 'ocr-hover-bubble');
+            if (!bubble) return;
+            bubble.dataset.regionId = regionId;
+            svg.appendChild(bubble);
+        });
+
+        return svg;
+    }
+
     function renderOverlays(annotations, imgNatW, imgNatH) {
+        hideHelpPopover(true);
         const overlay = document.getElementById('ocr-overlay');
-        const previouslyOpenRegions = captureOpenTooltipRegions();
         const panelImg = document.getElementById('scanner-panel-img');
         overlay.innerHTML = '';
 
@@ -2147,6 +2679,7 @@ const Scanner = (() => {
         if (activeVisionOverlay !== 'none') {
             frag.appendChild(createDetectorOverlay(withBbox, scaleX, scaleY, displayW, displayH));
         }
+        frag.appendChild(createHoverBubbleOverlay(withBbox, scaleX, scaleY, displayW, displayH));
 
         withBbox.forEach((ann, index) => {
             if (!ann.bbox || ann.bbox.length < 4) return;
@@ -2167,8 +2700,8 @@ const Scanner = (() => {
             const uncomputed = isUncomputedAnnotation(ann);
             const quality = uncomputed ? 'warn' : (ann.ocr_debug?.quality || qualityFromConfidence(ann.confidence));
             const regionId = String(ann.region_id ?? ann.id ?? index);
-            const isOpen = pinnedRegionIds.has(regionId) || previouslyOpenRegions.has(regionId);
-            box.className = `ocr-box ocr-quality-${quality}${uncomputed ? ' ocr-uncomputed' : ''}${pinnedRegionIds.has(regionId) ? ' pinned' : ''}${hoverSuppressedRegionIds.has(regionId) ? ' hover-suppressed' : ''}${isOpen ? ' tooltip-open' : ''}`;
+            const isOpen = openPopupRegionIds.has(regionId);
+            box.className = `ocr-box ocr-quality-${quality}${uncomputed ? ' ocr-uncomputed' : ''}${isOpen ? ' tooltip-open' : ''}`;
             box.style.cssText = `left:${left}px;top:${top}px;width:${width}px;height:${height}px`;
             box.title = uncomputed
                 ? 'Uncomputed OCR box'
@@ -2181,220 +2714,117 @@ const Scanner = (() => {
                 box.addEventListener('keydown', (e) => handleBoxKeydown(e, box, ann));
             }
 
-            const tooltip = document.createElement('div');
-            tooltip.className = 'ocr-tooltip';
-            const messageDiv = document.createElement('div');
-            messageDiv.className = 'ocr-tooltip-message';
-            messageDiv.textContent = UNCOMPUTED_TEXT;
-            const orientationBtn = document.createElement('button');
-            orientationBtn.className = 'ocr-orientation-toggle';
-            const orientation = ann.recognized_orientation || (ann.vertical ? 'vertical' : 'horizontal');
-            orientationBtn.textContent = `orientation: ${orientation} ${orientation === 'vertical' ? '↓' : '→'}`;
-            orientationBtn.hidden = !editMode;
-            orientationBtn.addEventListener('click', async (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                await handleOrientationToggle(ann);
-            });
-            const removeBtn = document.createElement('button');
-            removeBtn.className = 'ocr-remove-box';
-            removeBtn.textContent = 'Remove box';
-            removeBtn.hidden = !editMode;
-            removeBtn.addEventListener('click', async (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                await handleRemoveBox(ann);
-            });
-            const metaDiv = document.createElement('div');
-            metaDiv.className = 'ocr-tooltip-meta';
-            metaDiv.textContent = uncomputed
-                ? `UNCOMPUTED | ${orientation}`
-                : `${quality.toUpperCase()} | ${ann.ocr_variant || 'unknown'} | ${formatConfidence(ann.confidence)}`;
-            if (uncomputed) {
-                tooltip.appendChild(messageDiv);
-            } else {
-                tooltip.appendChild(createRabbitholeCard(ann, index, true));
-            }
-            tooltip.appendChild(orientationBtn);
-            tooltip.appendChild(removeBtn);
-            tooltip.appendChild(metaDiv);
-            box.appendChild(tooltip);
             box.addEventListener('click', (e) => {
                 if (editMode && e.target.classList.contains('ocr-resize-handle')) return;
                 if (e.target !== box) return;
-                if (e.target.closest('.ocr-tooltip')) return;
                 e.stopPropagation();
-                togglePinnedRegion(regionId);
-                scheduleTooltipPosition(box, tooltip);
+                togglePopupRegion(regionId);
             });
-            tooltip.addEventListener('click', (e) => e.stopPropagation());
-            tooltip.addEventListener('pointerdown', (e) => e.stopPropagation());
-            box.addEventListener('pointerenter', () => prepareActiveHoverbox(box, tooltip, regionId));
-            box.addEventListener('pointerleave', (e) => {
-                const next = e.relatedTarget;
-                if (next && tooltip.contains(next)) return;
-                if (pinnedRegionIds.has(regionId)) return;
-                scheduleHoverClose(regionId);
-            });
-            box.addEventListener('focusin', () => prepareActiveHoverbox(box, tooltip, regionId));
-            tooltip.addEventListener('pointerenter', () => prepareActiveHoverbox(box, tooltip, regionId));
-            tooltip.addEventListener('pointerleave', (e) => {
-                const next = e.relatedTarget;
-                if (next && box.contains(next)) return;
-                if (pinnedRegionIds.has(regionId)) return;
-                scheduleHoverClose(regionId);
+            box.addEventListener('pointerenter', () => setActiveHoverBubble(regionId));
+            box.addEventListener('pointerleave', () => {
+                setActiveHoverBubble(null, regionId);
             });
 
             frag.appendChild(box);
         });
 
         overlay.appendChild(frag);
-        requestAnimationFrame(() => {
-            const bounds = document.querySelector('.reader-shell') || overlay;
-            const boundsRect = bounds?.getBoundingClientRect();
-            if (!boundsRect) return;
-            document.querySelectorAll('#ocr-overlay .ocr-box.tooltip-open .ocr-tooltip').forEach(tooltip => {
-                const box = tooltip.closest('.ocr-box');
-                if (!box) return;
-                tooltip.style.visibility = 'hidden';
-                if (!restoreTooltipPosition(box, tooltip, overlay, boundsRect)) {
-                    positionTooltipWithinImage(box, tooltip, { keepHorizontal: true });
-                } else {
-                    tooltip.style.visibility = '';
-                }
-            });
-            const openEntries = collectOpenTooltipEntries(boundsRect);
-            if (hasTooltipCollision(openEntries)) {
-                openEntries.forEach(entry => {
-                    entry.tooltip.style.visibility = 'hidden';
-                    positionTooltipWithinImage(entry.box, entry.tooltip, { keepHorizontal: true });
-                });
-            }
-            positionPinnedTooltips();
-        });
+        requestAnimationFrame(renderOpenPopups);
     }
 
-    function prepareActiveHoverbox(box, tooltip, regionId) {
-        cancelHoverClose(regionId);
+    function togglePopupRegion(regionId) {
         const key = String(regionId);
-        if (!pinnedRegionIds.has(key) && hoverSuppressedRegionIds.has(key)) return;
-        const wasOpen = box.classList.contains('tooltip-open');
-        box.classList.add('tooltip-open');
-        if (wasOpen) return;
-        tooltip.style.visibility = 'hidden';
-        scheduleTooltipPosition(box, tooltip, { keepHorizontal: wasOpen });
-    }
-
-    function scheduleHoverClose(regionId, delayMs = 140) {
-        cancelHoverClose(regionId);
-        const key = String(regionId);
-        const timerId = window.setTimeout(() => {
-            hoverCloseTimers.delete(key);
-            if (pinnedRegionIds.has(key)) return;
-            closeHoverboxRegion(key);
-            clearHoverSuppressedRegion(key);
-        }, delayMs);
-        hoverCloseTimers.set(key, timerId);
-    }
-
-    function cancelHoverClose(regionId) {
-        const key = String(regionId);
-        const timerId = hoverCloseTimers.get(key);
-        if (timerId == null) return;
-        window.clearTimeout(timerId);
-        hoverCloseTimers.delete(key);
-    }
-
-    function togglePinnedRegion(regionId) {
-        const nextRegionId = String(regionId);
-        if (pinnedRegionIds.has(nextRegionId)) {
-            pinnedRegionIds.delete(nextRegionId);
-            hoverSuppressedRegionIds.add(nextRegionId);
-            scheduleHoverClose(nextRegionId, 0);
-        } else {
-            pinnedRegionIds.add(nextRegionId);
-            hoverSuppressedRegionIds.delete(nextRegionId);
-            cancelHoverClose(nextRegionId);
+        if (openPopupRegionIds.has(key)) {
+            closePopupRegion(key);
+            return;
         }
-        const overlay = document.getElementById('ocr-overlay');
-        overlay?.classList.toggle('has-pinned-tooltip', pinnedRegionIds.size > 0);
-        document.querySelectorAll('#ocr-overlay .ocr-box').forEach(box => {
-            const currentRegionId = String(box.dataset.regionId);
-            box.classList.toggle('pinned', pinnedRegionIds.has(currentRegionId));
-            box.classList.toggle('hover-suppressed', hoverSuppressedRegionIds.has(currentRegionId));
-            if (pinnedRegionIds.has(currentRegionId)) {
-                box.classList.add('tooltip-open');
-            }
-        });
-        if (pinnedRegionIds.size) {
-            requestAnimationFrame(positionPinnedTooltips);
+        openPopupRegionIds.add(key);
+        popupOpenOrder = popupOpenOrder.filter(item => item !== key);
+        popupOpenOrder.push(key);
+        while (popupOpenOrder.length > MAX_OPEN_POPUPS) {
+            closePopupRegion(popupOpenOrder[0], { render: false });
         }
+        setActiveHoverBubble(key);
+        renderOpenPopups();
     }
 
-    function dismissHoverboxRegion(regionId) {
-        const nextRegionId = String(regionId);
-        cancelHoverClose(nextRegionId);
-        pinnedRegionIds.delete(nextRegionId);
-        hoverSuppressedRegionIds.add(nextRegionId);
-        closeHoverboxRegion(nextRegionId);
-        const overlay = document.getElementById('ocr-overlay');
-        overlay?.classList.toggle('has-pinned-tooltip', pinnedRegionIds.size > 0);
-        document.querySelectorAll('#ocr-overlay .ocr-box').forEach(box => {
-            const currentRegionId = String(box.dataset.regionId);
-            box.classList.toggle('pinned', pinnedRegionIds.has(currentRegionId));
-            box.classList.toggle('hover-suppressed', hoverSuppressedRegionIds.has(currentRegionId));
-        });
-    }
-
-    function closeHoverboxRegion(regionId) {
+    function closePopupRegion(regionId, options = {}) {
         const key = String(regionId);
-        tooltipHorizontalByRegion.delete(key);
-        tooltipPositionByRegion.delete(key);
+        openPopupRegionIds.delete(key);
+        popupOpenOrder = popupOpenOrder.filter(item => item !== key);
+        popupPositionsByRegion.delete(key);
+        setActiveHoverBubble(null, key);
         document
             .querySelector(`#ocr-overlay .ocr-box[data-region-id="${CSS.escape(key)}"]`)
             ?.classList.remove('tooltip-open');
+        if (options.render !== false) renderOpenPopups();
     }
 
-    function clearHoverSuppressedRegion(regionId) {
-        const nextRegionId = String(regionId);
-        if (!hoverSuppressedRegionIds.has(nextRegionId)) return;
-        hoverSuppressedRegionIds.delete(nextRegionId);
-        document
-            .querySelector(`#ocr-overlay .ocr-box[data-region-id="${CSS.escape(nextRegionId)}"]`)
-            ?.classList.remove('hover-suppressed');
+    function setActiveHoverBubble(regionId, closingRegionId = null) {
+        const activeKey = regionId == null ? null : String(regionId);
+        const closingKey = closingRegionId == null ? null : String(closingRegionId);
+        document.querySelectorAll('#ocr-overlay .ocr-hover-bubble').forEach(bubble => {
+            const currentRegionId = String(bubble.dataset.regionId);
+            if (activeKey != null) {
+                bubble.classList.toggle('active', currentRegionId === activeKey);
+            } else if (closingKey == null || currentRegionId === closingKey) {
+                bubble.classList.remove('active');
+            }
+        });
     }
 
-    function scheduleTooltipPosition(box, tooltip, options = {}) {
-        requestAnimationFrame(() => positionTooltipWithinImage(box, tooltip, options));
-    }
-
-    function positionPinnedTooltips() {
+    function renderOpenPopups() {
+        const layer = document.getElementById('ocr-popup-layer');
+        const wrapper = document.getElementById('reader-panel-wrapper');
         const overlay = document.getElementById('ocr-overlay');
-        const bounds = document.querySelector('.reader-shell') || overlay;
-        if (!overlay || !bounds) return;
-        const entries = Array.from(document.querySelectorAll('#ocr-overlay .ocr-box.pinned .ocr-tooltip'))
-            .map(tooltip => ({ tooltip, box: tooltip.closest('.ocr-box') }))
-            .filter(entry => entry.box && entry.tooltip.isConnected);
-        if (entries.length < 2) return;
-        const boundsRect = bounds.getBoundingClientRect();
-        const hasPinnedCollision = hasTooltipCollision(
-            entries
-                .map(entry => {
-                    const rect = entry.tooltip.getBoundingClientRect();
-                    if (!rect.width || !rect.height) return null;
-                    return {
-                        rect: {
-                            left: rect.left - boundsRect.left,
-                            top: rect.top - boundsRect.top,
-                            right: rect.right - boundsRect.left,
-                            bottom: rect.bottom - boundsRect.top,
-                        },
-                    };
-                })
-                .filter(Boolean)
+        if (!layer || !wrapper || !overlay || !latestScan) return;
+        layer.innerHTML = '';
+        const annotations = latestScan.annotations || [];
+        const byRegion = new Map(
+            annotations.map((ann, index) => [getAnnotationRegionId(ann, index), { ann, index }])
         );
-        if (!hasPinnedCollision) return;
-        realignPinnedTooltips(entries, bounds, overlay);
+        openPopupRegionIds = new Set([...openPopupRegionIds].filter(regionId => byRegion.has(regionId)));
+        popupOpenOrder = popupOpenOrder.filter(regionId => openPopupRegionIds.has(regionId));
+        document.querySelectorAll('#ocr-overlay .ocr-box').forEach(box => {
+            box.classList.toggle('tooltip-open', openPopupRegionIds.has(String(box.dataset.regionId || '')));
+        });
+        popupOpenOrder.forEach(regionId => {
+            const item = byRegion.get(regionId);
+            const box = document.querySelector(`#ocr-overlay .ocr-box[data-region-id="${CSS.escape(regionId)}"]`);
+            if (!item || !box) return;
+            const popup = document.createElement('div');
+            popup.className = 'ocr-popup';
+            popup.dataset.regionId = regionId;
+            popup.addEventListener('click', e => e.stopPropagation());
+            popup.addEventListener('pointerdown', e => e.stopPropagation());
+            if (isUncomputedAnnotation(item.ann)) {
+                const closeBtn = document.createElement('button');
+                closeBtn.type = 'button';
+                closeBtn.className = 'rabbithole-close';
+                closeBtn.setAttribute('aria-label', `Close Box ${item.ann.reading_order || item.index + 1} popup`);
+                closeBtn.textContent = '×';
+                closeBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closePopupRegion(regionId);
+                });
+                popup.appendChild(closeBtn);
+                const message = document.createElement('div');
+                message.className = 'ocr-tooltip-message';
+                message.textContent = UNCOMPUTED_TEXT;
+                popup.appendChild(message);
+            } else {
+                popup.appendChild(createRabbitholeCard(item.ann, item.index, true, `popup:${regionId}`));
+                if (!item.ann.rabbithole) {
+                    const message = document.createElement('div');
+                    message.className = 'ocr-tooltip-message';
+                    message.textContent = 'Rabbithole analysis loading...';
+                    popup.appendChild(message);
+                }
+            }
+            layer.appendChild(popup);
+            positionPopupNearBox(box, popup, wrapper);
+        });
     }
 
     function rectsOverlap(a, b) {
@@ -2421,253 +2851,56 @@ const Scanner = (() => {
         };
     }
 
-    function getTooltipObstacleRects(boundsRect, sourceBox, sourceTooltip) {
-        const obstacles = [];
-        const debugPanel = document.getElementById('reader-debug-panel');
-        if (debugPanel && !debugPanel.classList.contains('hidden')) {
-            const rect = debugPanel.getBoundingClientRect();
-            obstacles.push({
-                left: rect.left - boundsRect.left,
-                top: rect.top - boundsRect.top,
-                right: rect.right - boundsRect.left,
-                bottom: rect.bottom - boundsRect.top,
-            });
-        }
-
-        document.querySelectorAll('#ocr-overlay .ocr-box').forEach(box => {
-            const rect = box.getBoundingClientRect();
-            obstacles.push({
-                left: rect.left - boundsRect.left,
-                top: rect.top - boundsRect.top,
-                right: rect.right - boundsRect.left,
-                bottom: rect.bottom - boundsRect.top,
-            });
-        });
-
-        document.querySelectorAll('#ocr-overlay .ocr-tooltip').forEach(tooltip => {
-            if (tooltip === sourceTooltip || !tooltip.isConnected) return;
-            if (getComputedStyle(tooltip).display === 'none') return;
-            const rect = tooltip.getBoundingClientRect();
-            if (!rect.width || !rect.height) return;
-            obstacles.push({
-                left: rect.left - boundsRect.left,
-                top: rect.top - boundsRect.top,
-                right: rect.right - boundsRect.left,
-                bottom: rect.bottom - boundsRect.top,
-            });
-        });
-
-        return obstacles;
-    }
-
-    function positionTooltipWithinImage(box, tooltip, options = {}) {
-        const overlay = document.getElementById('ocr-overlay');
-        const bounds = document.querySelector('.reader-shell') || overlay;
-        if (!overlay || !bounds || !box.isConnected || !tooltip.isConnected) return;
-        if (getComputedStyle(tooltip).display === 'none') return;
-
-        const boundsRect = bounds.getBoundingClientRect();
-        if (!boundsRect.width || !boundsRect.height) return;
-
-        const margin = 16;
-        const gap = 12;
-        tooltip.style.visibility = 'hidden';
-        tooltip.style.removeProperty('left');
-        tooltip.style.removeProperty('top');
-        tooltip.style.removeProperty('right');
-        tooltip.style.removeProperty('bottom');
-        tooltip.style.removeProperty('transform');
-        tooltip.style.setProperty('--tooltip-max-width', `${Math.max(1, boundsRect.width - margin * 2)}px`);
-        tooltip.style.setProperty('--tooltip-max-height', `${Math.max(1, boundsRect.height - margin * 2)}px`);
-
+    function positionPopupNearBox(box, popup, wrapper) {
+        const boundsRect = wrapper.getBoundingClientRect();
         const boxRect = box.getBoundingClientRect();
-        const tooltipRect = tooltip.getBoundingClientRect();
-        const boxLeft = boxRect.left - boundsRect.left;
-        const boxTop = boxRect.top - boundsRect.top;
-        const boxWidth = boxRect.width;
-        const boxHeight = boxRect.height;
-        const tooltipWidth = tooltipRect.width;
-        const tooltipHeight = tooltipRect.height;
-        const preferredLeft = boxLeft + (boxWidth - tooltipWidth) / 2;
-        const spaceAbove = boxTop - margin - gap;
-        const spaceBelow = boundsRect.height - (boxTop + boxHeight) - margin - gap;
-        const preferAbove = tooltipHeight <= spaceAbove || spaceAbove >= spaceBelow;
-        const obstacles = getTooltipObstacleRects(boundsRect, box, tooltip);
-        const regionId = String(box.dataset.regionId || '');
-        const lockedLeft = tooltipHorizontalByRegion.get(regionId);
-        const keepHorizontal = Boolean(options.keepHorizontal && Number.isFinite(lockedLeft));
-        let bestCandidate = { left: margin, top: margin };
-
-        if (keepHorizontal) {
-            const maxLeft = Math.max(margin, boundsRect.width - tooltipWidth - margin);
-            const fixedLeft = clamp(Number(lockedLeft), margin, maxLeft);
-            const topSeeds = [
-                { top: preferAbove ? boxTop - tooltipHeight - gap : boxTop + boxHeight + gap, rank: 0 },
-                { top: preferAbove ? boxTop + boxHeight + gap : boxTop - tooltipHeight - gap, rank: 1 },
-                { top: boxTop - tooltipHeight - gap, rank: 2 },
-                { top: boxTop + boxHeight + gap, rank: 3 },
-                { top: boxTop, rank: 4 },
-                { top: boxTop + boxHeight - tooltipHeight, rank: 5 },
-            ];
-            const scoredByTop = topSeeds.map(seed => {
-                const position = clampTooltipCandidate(fixedLeft, seed.top, tooltipWidth, tooltipHeight, boundsRect, margin);
-                const rect = {
-                    left: fixedLeft,
-                    top: position.top,
-                    right: fixedLeft + tooltipWidth,
-                    bottom: position.top + tooltipHeight,
-                };
-                const overlap = obstacles.reduce((sum, obstacle) => sum + overlapArea(rect, obstacle), 0);
-                const verticalDistance = Math.abs(position.top - seed.top);
-                return {
-                    left: fixedLeft,
-                    top: position.top,
-                    overlap,
-                    verticalDistance,
-                    rank: seed.rank,
-                };
-            });
-            scoredByTop.sort((a, b) => {
-                if (a.overlap !== b.overlap) return a.overlap - b.overlap;
-                if (a.verticalDistance !== b.verticalDistance) return a.verticalDistance - b.verticalDistance;
-                return a.rank - b.rank;
-            });
-            bestCandidate = scoredByTop[0] || bestCandidate;
-        } else {
-            const candidateSeeds = [
-                { left: preferredLeft, top: preferAbove ? boxTop - tooltipHeight - gap : boxTop + boxHeight + gap, rank: 0 },
-                { left: preferredLeft, top: preferAbove ? boxTop + boxHeight + gap : boxTop - tooltipHeight - gap, rank: 1 },
-                { left: boxLeft - tooltipWidth - gap, top: boxTop, rank: 2 },
-                { left: boxLeft + boxWidth + gap, top: boxTop, rank: 3 },
-                { left: boxLeft - tooltipWidth - gap, top: boxTop + boxHeight - tooltipHeight, rank: 4 },
-                { left: boxLeft + boxWidth + gap, top: boxTop + boxHeight - tooltipHeight, rank: 5 },
-                { left: boxLeft, top: boxTop - tooltipHeight - gap, rank: 6 },
-                { left: boxLeft + boxWidth - tooltipWidth, top: boxTop - tooltipHeight - gap, rank: 7 },
-                { left: boxLeft, top: boxTop + boxHeight + gap, rank: 8 },
-                { left: boxLeft + boxWidth - tooltipWidth, top: boxTop + boxHeight + gap, rank: 9 },
-            ];
-            const scoredCandidates = candidateSeeds.map(seed => {
-                const position = clampTooltipCandidate(seed.left, seed.top, tooltipWidth, tooltipHeight, boundsRect, margin);
-                const rect = {
-                    left: position.left,
-                    top: position.top,
-                    right: position.left + tooltipWidth,
-                    bottom: position.top + tooltipHeight,
-                };
-                const overlap = obstacles.reduce((sum, obstacle) => sum + overlapArea(rect, obstacle), 0);
-                const distance = Math.abs(position.left - preferredLeft) + Math.abs(position.top - seed.top);
-                return {
-                    ...position,
-                    overlap,
-                    distance,
-                    rank: seed.rank,
-                };
-            });
-            scoredCandidates.sort((a, b) => {
-                if (a.overlap !== b.overlap) return a.overlap - b.overlap;
-                if (a.distance !== b.distance) return a.distance - b.distance;
-                return a.rank - b.rank;
-            });
-            bestCandidate = scoredCandidates[0] || bestCandidate;
-        }
-
-        const overlayRect = overlay.getBoundingClientRect();
-        const relativeBoxLeft = boxRect.left - overlayRect.left;
-        const relativeBoxTop = boxRect.top - overlayRect.top;
-        tooltip.style.left = `${Math.round(bestCandidate.left + boundsRect.left - overlayRect.left - relativeBoxLeft)}px`;
-        tooltip.style.top = `${Math.round(bestCandidate.top + boundsRect.top - overlayRect.top - relativeBoxTop)}px`;
-        tooltip.style.bottom = 'auto';
-        tooltip.style.transform = 'none';
-        if (regionId) {
-            tooltipHorizontalByRegion.set(regionId, bestCandidate.left);
-            tooltipPositionByRegion.set(regionId, { left: bestCandidate.left, top: bestCandidate.top });
-        }
-        tooltip.style.visibility = '';
-    }
-
-    function realignPinnedTooltips(entries, bounds, overlay) {
-        const boundsRect = bounds.getBoundingClientRect();
         if (!boundsRect.width || !boundsRect.height) return;
-        const margin = 16;
-        const gap = 12;
-        const ordered = entries
-            .map((entry, index) => {
-                const boxRect = entry.box.getBoundingClientRect();
-                return { ...entry, boxRect, order: index };
-            })
-            .sort((a, b) => a.boxRect.top - b.boxRect.top || a.boxRect.left - b.boxRect.left || a.order - b.order);
-        const placed = [];
-        ordered.forEach(item => {
-            const chosen = pickTooltipCandidate(item.box, item.tooltip, boundsRect, margin, gap, placed);
-            if (!chosen) return;
-            applyTooltipPosition(item.box, item.tooltip, overlay, boundsRect, chosen.left, chosen.top);
-            placed.push({ left: chosen.left, top: chosen.top, right: chosen.left + chosen.width, bottom: chosen.top + chosen.height });
+        const margin = 12;
+        const gap = 10;
+        popup.style.visibility = 'hidden';
+        popup.style.maxWidth = `${Math.max(260, boundsRect.width - margin * 2)}px`;
+        popup.style.maxHeight = `${Math.max(220, boundsRect.height - margin * 2)}px`;
+        const popupRect = popup.getBoundingClientRect();
+        const popupWidth = popupRect.width || 360;
+        const popupHeight = popupRect.height || 260;
+        const boxBounds = {
+            left: boxRect.left - boundsRect.left,
+            top: boxRect.top - boundsRect.top,
+            right: boxRect.right - boundsRect.left,
+            bottom: boxRect.bottom - boundsRect.top,
+        };
+        const seeds = [
+            { left: boxBounds.left + (boxBounds.right - boxBounds.left - popupWidth) / 2, top: boxBounds.top - popupHeight - gap, rank: 0 },
+            { left: boxBounds.left + (boxBounds.right - boxBounds.left - popupWidth) / 2, top: boxBounds.bottom + gap, rank: 1 },
+            { left: boxBounds.right + gap, top: boxBounds.top, rank: 2 },
+            { left: boxBounds.left - popupWidth - gap, top: boxBounds.top, rank: 3 },
+        ];
+        const obstacles = Array.from(document.querySelectorAll('#ocr-popup-layer .ocr-popup'))
+            .filter(item => item !== popup)
+            .map(item => elementRectWithinBounds(item, boundsRect))
+            .filter(Boolean);
+        const scored = seeds.map(seed => {
+            const position = clampTooltipCandidate(seed.left, seed.top, popupWidth, popupHeight, boundsRect, margin);
+            const rect = {
+                left: position.left,
+                top: position.top,
+                right: position.left + popupWidth,
+                bottom: position.top + popupHeight,
+            };
+            const overlap = obstacles.reduce((sum, obstacle) => sum + overlapArea(rect, obstacle), 0);
+            const drift = Math.abs(position.left - seed.left) + Math.abs(position.top - seed.top);
+            return { ...position, overlap, drift, rank: seed.rank };
         });
-    }
-
-    function pickTooltipCandidate(box, tooltip, boundsRect, margin, gap, placedRects) {
-        const previousVisibility = tooltip.style.visibility;
-        tooltip.style.visibility = 'hidden';
-        tooltip.style.removeProperty('left');
-        tooltip.style.removeProperty('top');
-        tooltip.style.removeProperty('right');
-        tooltip.style.removeProperty('bottom');
-        tooltip.style.removeProperty('transform');
-        tooltip.style.setProperty('--tooltip-max-width', `${Math.max(1, boundsRect.width - margin * 2)}px`);
-        tooltip.style.setProperty('--tooltip-max-height', `${Math.max(1, boundsRect.height - margin * 2)}px`);
-        const boxRect = box.getBoundingClientRect();
-        const tooltipRect = tooltip.getBoundingClientRect();
-        const boxLeft = boxRect.left - boundsRect.left;
-        const boxTop = boxRect.top - boundsRect.top;
-        const boxWidth = boxRect.width;
-        const boxHeight = boxRect.height;
-        const tooltipWidth = tooltipRect.width;
-        const tooltipHeight = tooltipRect.height;
-        const preferredLeft = boxLeft + (boxWidth - tooltipWidth) / 2;
-        const preferredTop = boxTop + boxHeight + gap;
-        const candidates = [
-            { left: preferredLeft, top: boxTop - tooltipHeight - gap, rank: 0 },
-            { left: preferredLeft, top: boxTop + boxHeight + gap, rank: 1 },
-            { left: boxLeft - tooltipWidth - gap, top: boxTop + (boxHeight - tooltipHeight) * 0.5, rank: 2 },
-            { left: boxLeft + boxWidth + gap, top: boxTop + (boxHeight - tooltipHeight) * 0.5, rank: 3 },
-            { left: boxLeft - tooltipWidth - gap, top: boxTop - tooltipHeight - gap, rank: 4 },
-            { left: boxLeft + boxWidth + gap, top: boxTop - tooltipHeight - gap, rank: 5 },
-            { left: boxLeft - tooltipWidth - gap, top: boxTop + boxHeight + gap, rank: 6 },
-            { left: boxLeft + boxWidth + gap, top: boxTop + boxHeight + gap, rank: 7 },
-            { left: preferredLeft - tooltipWidth * 0.5, top: preferredTop, rank: 8 },
-            { left: preferredLeft + tooltipWidth * 0.5, top: preferredTop, rank: 9 },
-        ].map(candidate => {
-            const clamped = clampTooltipCandidate(candidate.left, candidate.top, tooltipWidth, tooltipHeight, boundsRect, margin);
-            const rect = { left: clamped.left, top: clamped.top, right: clamped.left + tooltipWidth, bottom: clamped.top + tooltipHeight };
-            const overlap = placedRects.reduce((sum, obstacle) => sum + overlapArea(rect, obstacle), 0);
-            const horizontalDrift = Math.abs((clamped.left + tooltipWidth * 0.5) - (boxLeft + boxWidth * 0.5));
-            const verticalDrift = Math.abs(clamped.top - preferredTop);
-            return { ...clamped, width: tooltipWidth, height: tooltipHeight, overlap, horizontalDrift, verticalDrift, rank: candidate.rank };
-        });
-        candidates.sort((a, b) => {
+        scored.sort((a, b) => {
             if (a.overlap !== b.overlap) return a.overlap - b.overlap;
-            if (a.horizontalDrift !== b.horizontalDrift) return a.horizontalDrift - b.horizontalDrift;
-            if (a.verticalDrift !== b.verticalDrift) return a.verticalDrift - b.verticalDrift;
+            if (a.drift !== b.drift) return a.drift - b.drift;
             return a.rank - b.rank;
         });
-        tooltip.style.visibility = previousVisibility;
-        return candidates[0] || null;
-    }
-
-    function applyTooltipPosition(box, tooltip, overlay, boundsRect, left, top) {
-        const overlayRect = overlay.getBoundingClientRect();
-        const boxRect = box.getBoundingClientRect();
-        const relativeBoxLeft = boxRect.left - overlayRect.left;
-        const relativeBoxTop = boxRect.top - overlayRect.top;
-        tooltip.style.left = `${Math.round(left + boundsRect.left - overlayRect.left - relativeBoxLeft)}px`;
-        tooltip.style.top = `${Math.round(top + boundsRect.top - overlayRect.top - relativeBoxTop)}px`;
-        tooltip.style.bottom = 'auto';
-        tooltip.style.transform = 'none';
-        const regionId = String(box.dataset.regionId || '');
-        if (regionId) {
-            tooltipHorizontalByRegion.set(regionId, left);
-            tooltipPositionByRegion.set(regionId, { left, top });
-        }
+        const best = scored[0] || { left: margin, top: margin };
+        popup.style.left = `${Math.round(best.left)}px`;
+        popup.style.top = `${Math.round(best.top)}px`;
+        popup.style.visibility = '';
+        popupPositionsByRegion.set(String(box.dataset.regionId || ''), { left: best.left, top: best.top });
     }
 
     function createResizeHandle() {
@@ -2681,7 +2914,6 @@ const Scanner = (() => {
 
     function startBoxDrag(e, box, ann) {
         if (!editMode || e.button !== 0) return;
-        if (e.target.closest('.ocr-tooltip')) return;
         e.preventDefault();
         e.stopPropagation();
         const geom = getOverlayGeometry();
@@ -2778,11 +3010,9 @@ const Scanner = (() => {
         if (!ok) return;
         try {
             const data = await API.deleteRegion(selectedPanel.filename, ann.region_id);
-            clearAllHoverCloseTimers();
-            tooltipHorizontalByRegion.clear();
-            tooltipPositionByRegion.clear();
-            pinnedRegionIds = new Set();
-            hoverSuppressedRegionIds = new Set();
+            closePopupRegion(ann.region_id, { render: false });
+            rabbitholeCardStates.delete(`popup:${ann.region_id}`);
+            rabbitholeCardStates.delete(`side:${ann.region_id}`);
             applyRegionPayload(data);
             resetTranslationView();
             setDebugStatus('Box removed.');

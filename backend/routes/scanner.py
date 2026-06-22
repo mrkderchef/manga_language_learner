@@ -1,18 +1,20 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from services.storage.image_service import ImageService
 import services.recognition.mangaocr as manga_ocr_service
 import services.rabbithole.nlp as rabbithole_service
 import services.translation.engine as translation_engine
 from services.rendering.panel_renderer import render_translated_panel
 from services.detection.region_detector import detect_text_regions
+from services.model_assets import BUBBLE_MODEL_REVISION
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
 import json
 import logging
 import shutil
-import traceback
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -34,6 +36,11 @@ OCR_CACHE_VERSION = "ocr-stepwise-state-v1"
 MISSING_TRANSLATION_TEXT = "No translation available"
 STATE_CACHE_BUCKETS = ("ocr",)
 PANEL_CACHE_BUCKETS = ("ocr", "rabbithole", "translation")
+RABBITHOLE_JOB_TTL_SECONDS = 15 * 60
+RABBITHOLE_JOB_WORKERS = 2
+_RABBITHOLE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=RABBITHOLE_JOB_WORKERS, thread_name_prefix="rabbithole")
+_RABBITHOLE_JOBS: dict[str, dict] = {}
+_RABBITHOLE_JOBS_LOCK = threading.Lock()
 
 
 def _normalize_scan_result(result: dict | None) -> dict | None:
@@ -122,28 +129,87 @@ def _stage_cache_path(panel_path: Path, kind: str, cache_key: str) -> Path:
     return _stage_cache_dir(panel_path, kind) / f"{cache_key}.json"
 
 
-def _load_persisted_stage(panel_path: Path, kind: str, cache_key: str) -> dict | None:
-    path = _stage_cache_path(panel_path, kind, cache_key)
+def _read_persisted_stage(path: Path) -> tuple[dict | None, dict | None]:
     if not path.exists():
-        return None
+        return None, None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    result = payload.get("result") if "result" in payload else payload
+    return (result if isinstance(result, dict) else None), payload
+
+
+def _translation_current_path(panel_path: Path) -> Path:
+    return _stage_root_dir(panel_path, "translation") / "current.json"
+
+
+def _legacy_translation_paths(panel_path: Path) -> list[Path]:
+    root = _stage_root_dir(panel_path, "translation")
+    paths = list((root / "cache").glob("*.json")) if (root / "cache").exists() else []
+    legacy_latest = root / "latest.json"
+    if legacy_latest.exists():
+        paths.append(legacy_latest)
+    return paths
+
+
+def _remove_legacy_translation_artifacts(panel_path: Path) -> None:
+    root = _stage_root_dir(panel_path, "translation")
+    shutil.rmtree(root / "cache", ignore_errors=True)
+    legacy_latest = root / "latest.json"
+    if legacy_latest.exists():
+        legacy_latest.unlink()
+
+
+def _load_current_translation(panel_path: Path) -> dict | None:
+    current, _payload = _read_persisted_stage(_translation_current_path(panel_path))
+    if current is not None:
+        _remove_legacy_translation_artifacts(panel_path)
+        return current
+
+    # One-time migration: retain only the newest result from the former
+    # model/settings-keyed cache, then remove the obsolete cache directory.
+    candidates: list[tuple[float, str, dict]] = []
+    for path in _legacy_translation_paths(panel_path):
+        result, payload = _read_persisted_stage(path)
+        if result is None:
+            continue
+        saved_at = float((payload or {}).get("saved_at") or path.stat().st_mtime)
+        cache_key = str((payload or {}).get("cache_key") or path.stem)
+        candidates.append((saved_at, cache_key, result))
+    if not candidates:
         return None
-    if isinstance(payload, dict) and "result" in payload:
-        return payload.get("result")
-    return payload if isinstance(payload, dict) else None
+
+    _saved_at, cache_key, result = max(candidates, key=lambda item: item[0])
+    _save_persisted_stage(panel_path, "translation", cache_key, result)
+    return result
+
+
+def _load_persisted_stage(panel_path: Path, kind: str, cache_key: str) -> dict | None:
+    if kind == "translation":
+        return _load_current_translation(panel_path)
+    result, _payload = _read_persisted_stage(_stage_cache_path(panel_path, kind, cache_key))
+    return result
 
 
 def _save_persisted_stage(panel_path: Path, kind: str, cache_key: str, result: dict) -> None:
-    cache_dir = _stage_cache_dir(panel_path, kind)
-    cache_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "cache_key": cache_key,
         "saved_at": round(time.time(), 3),
         "result": result,
     }
-    _stage_cache_path(panel_path, kind, cache_key).write_text(
+    if kind == "translation":
+        root = _stage_root_dir(panel_path, kind)
+        root.mkdir(parents=True, exist_ok=True)
+        _remove_legacy_translation_artifacts(panel_path)
+        path = _translation_current_path(panel_path)
+    else:
+        cache_dir = _stage_cache_dir(panel_path, kind)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = _stage_cache_path(panel_path, kind, cache_key)
+    path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -273,7 +339,11 @@ def _export_panel_metadata(panel_path: Path, state: dict) -> None:
         
         logger.debug(f"Exported panel metadata for {panel_path.name} to {metadata_file}")
     except Exception as e:
-        logger.warning(f"Could not export panel metadata for {panel_path.name}: {e}")
+        logger.warning(
+            'component=metadata panel="%s" status=failed error=%r msg="Could not export panel metadata"',
+            panel_path.name,
+            e,
+        )
 
 
 def _region_id(region: dict) -> str:
@@ -281,9 +351,10 @@ def _region_id(region: dict) -> str:
     return "region_" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
 
 
-def _detect_regions_with_ids(panel_path: Path) -> list[dict]:
+def _detect_regions_with_ids(panel_path: Path, options: dict | None = None) -> list[dict]:
     regions = []
-    for region in detect_text_regions(str(panel_path)):
+    options = options or {}
+    for region in detect_text_regions(str(panel_path), options=options):
         copy = dict(region)
         copy["region_id"] = _region_id(copy)
         regions.append(copy)
@@ -552,12 +623,30 @@ def _json_hash(payload: dict | list | str) -> str:
 
 def _ocr_settings_key(options: dict) -> str:
     relevant = {
+        "confidence_threshold": options.get("confidence_threshold", 0.4),
+        "nms_threshold": options.get("nms_threshold", 0.35),
+        "mask_threshold": options.get("mask_threshold", 0.3),
+        "box_threshold": options.get("box_threshold", 0.6),
+        "max_regions": options.get("max_regions"),
         "ocr_quality_mode": options.get("ocr_quality_mode", "balanced"),
         "semantic_rerank": options.get("semantic_rerank", "close"),
         "vertical_preference": options.get("vertical_preference", "normal"),
         "rotation_win_margin": options.get("rotation_win_margin", 15),
         "preprocessing_set": options.get("preprocessing_set", "standard"),
-        "detection_sensitivity": options.get("detection_sensitivity", "normal"),
+        "crop_upscale": options.get("crop_upscale", 3),
+        "crop_padding_ratio": options.get("crop_padding_ratio", 0.05),
+        "crop_padding_min": options.get("crop_padding_min", 4),
+        "enable_rotated_variants": options.get("enable_rotated_variants", True),
+        "bubble": {
+            "pipeline_version": "hybrid-v1",
+            "model_revision": BUBBLE_MODEL_REVISION,
+            "mode": (options.get("bubble") or {}).get("mode", "hybrid") if isinstance(options.get("bubble"), dict) else "hybrid",
+            "model_confidence": (options.get("bubble") or {}).get("model_confidence", 0.25) if isinstance(options.get("bubble"), dict) else 0.25,
+            "model_iou": (options.get("bubble") or {}).get("model_iou", 0.7) if isinstance(options.get("bubble"), dict) else 0.7,
+            "search_scale": (options.get("bubble") or {}).get("search_scale", 1.0) if isinstance(options.get("bubble"), dict) else 1.0,
+            "wand_enabled": (options.get("bubble") or {}).get("wand_enabled", True) if isinstance(options.get("bubble"), dict) else True,
+            "overlap_reconciliation": (options.get("bubble") or {}).get("overlap_reconciliation", True) if isinstance(options.get("bubble"), dict) else True,
+        },
     }
     return _json_hash(relevant)
 
@@ -586,13 +675,23 @@ def _texts_hash(annotations: list[dict]) -> str:
     return _json_hash(texts)
 
 
+def _translation_units_hash(annotations: list[dict]) -> str:
+    units = [
+        {
+            "region_id": str(ann.get("region_id") or ann.get("id") or f"ann_{index + 1:04d}"),
+            "text": ann.get("text", ""),
+        }
+        for index, ann in enumerate(annotations)
+        if ann.get("computed", True) and ann.get("text")
+    ]
+    return _json_hash(units)
+
+
 def _translation_engine(options: dict) -> str:
-    return options.get("translation_engine", "ollama")
+    return "ollama"
 
 
 def _translation_model(options: dict, resolve_auto: bool = False) -> str | None:
-    if _translation_engine(options) != "ollama":
-        return None
     selected = options.get("translation_model") or None
     if selected:
         return selected
@@ -604,13 +703,17 @@ def _translation_model(options: dict, resolve_auto: bool = False) -> str | None:
 def _translation_options_key(options: dict, annotations: list[dict]) -> str:
     engine = _translation_engine(options)
     relevant = {
-        "text_hash": _texts_hash(annotations),
+        "translation_units_hash": _translation_units_hash(annotations),
+        "association_version": "region-id-v1",
         "translation_engine": engine,
         "translation_model": _translation_model(options, resolve_auto=True) or "",
         "target_lang": options.get("target_lang", "en"),
         "translation_style": options.get("translation_style", "natural"),
         "temperature": options.get("temperature", 0.1),
         "prompt_version": translation_engine.PROMPT_VERSION,
+        "translation_strategy": translation_engine.MANGA_DIALOGUE_STRATEGY,
+        "target_chunk_size": translation_engine.MANGA_TARGET_CHUNK_SIZE,
+        "max_context_lines": translation_engine.MANGA_CONTEXT_LINE_LIMIT,
     }
     return _json_hash(relevant)
 
@@ -618,7 +721,7 @@ def _translation_options_key(options: dict, annotations: list[dict]) -> str:
 def _rabbithole_options_key(annotations: list[dict]) -> str:
     return _json_hash({
         "text_hash": _texts_hash(annotations),
-        "rabbithole_version": rabbithole_service.RABBITHOLE_VERSION,
+        "contract_version": rabbithole_service.RABBITHOLE_CONTRACT_VERSION,
     })
 
 
@@ -637,7 +740,13 @@ def _trace(trace: list[dict], scan_id: str, stage: str, status: str, message: st
     if started_at is not None:
         event["elapsed_ms"] = int((time.perf_counter() - started_at) * 1000)
     event.update({k: v for k, v in fields.items() if v is not None})
-    logger.info("[scan:%s] %s %s - %s %s", scan_id, stage, status, message, fields or "")
+    log_fields = " ".join(
+        f'{key}="{str(value).replace(chr(34), chr(39))}"' if isinstance(value, str) else f"{key}={value}"
+        for key, value in event.items()
+        if key not in {"scan_id", "stage", "status", "message", "ts"}
+    )
+    suffix = f" {log_fields}" if log_fields else ""
+    logger.info('scan_id=%s stage=%s status=%s msg="%s"%s', scan_id, stage, status, message.replace('"', "'"), suffix)
     trace.append(event)
 
 
@@ -648,6 +757,7 @@ def _panel_cache_status(state: dict, panel_path: Path) -> dict:
     legacy_key = _cache_key(panel_path)
     legacy_file = LEGACY_OCR_CACHE_DIR / f"{legacy_key}.json"
     legacy_count = int(legacy_file.exists())
+    has_current_translation = _translation_current_path(panel_path).exists() or bool(_legacy_translation_paths(panel_path))
     buckets = {
         "ocr": {
             "has_cache": bool(cache.get("ocr")),
@@ -658,8 +768,8 @@ def _panel_cache_status(state: dict, panel_path: Path) -> dict:
             "entries": len(list(_stage_cache_dir(panel_path, "rabbithole").glob("*.json"))) if _stage_cache_dir(panel_path, "rabbithole").exists() else 0,
         },
         "translation": {
-            "has_cache": any(_stage_cache_dir(panel_path, "translation").glob("*.json")) if _stage_cache_dir(panel_path, "translation").exists() else False,
-            "entries": len(list(_stage_cache_dir(panel_path, "translation").glob("*.json"))) if _stage_cache_dir(panel_path, "translation").exists() else 0,
+            "has_cache": has_current_translation,
+            "entries": int(has_current_translation),
         },
     }
     if state.get("annotations"):
@@ -684,8 +794,7 @@ def _panel_cache_status(state: dict, panel_path: Path) -> dict:
 
 def _clear_panel_cache_buckets(state: dict, kinds: list[str] | None = None) -> list[str]:
     requested = kinds or list(PANEL_CACHE_BUCKETS)
-    if "ocr" in requested:
-        requested = list(dict.fromkeys([*requested, "rabbithole", "translation"]))
+    full_panel_reset = kinds is None
     cleared = []
     cache = state.setdefault("cache", {})
     for kind in requested:
@@ -694,18 +803,27 @@ def _clear_panel_cache_buckets(state: dict, kinds: list[str] | None = None) -> l
             cleared.append(kind)
             if kind == "ocr":
                 state["annotations"] = {}
-                state["boxes"] = []
-                state["auto_boxes"] = []
                 state["detection"] = []
-                state["overrides"] = {}
                 state.pop("ocr_settings_key", None)
+                for box in state.get("boxes", []) + state.get("auto_boxes", []):
+                    box["computed"] = False
         elif kind in {"rabbithole", "translation"}:
             cleared.append(kind)
+    if full_panel_reset:
+        state["boxes"] = []
+        state["auto_boxes"] = []
+        state["overrides"] = {}
     return cleared
 
 
 def _delete_panel_ocr_tree(panel_path: Path) -> None:
 	shutil.rmtree(ocr_panel_dir(panel_path), ignore_errors=True)
+
+
+def _delete_panel_ocr_artifacts(panel_path: Path) -> None:
+    ocr_root = ocr_panel_dir(panel_path)
+    for child in ("debug", "cache"):
+        shutil.rmtree(ocr_root / child, ignore_errors=True)
 
 
 def _clear_cached_results(state: dict, kinds: list[str]) -> None:
@@ -733,7 +851,7 @@ def _prepare_panel_regions(panel_path: Path, options: dict, state: dict, trace: 
     boxes = manual_boxes
     detected_count = None
     if not manual_boxes:
-        detected = _detect_regions_with_ids(panel_path)
+        detected = _detect_regions_with_ids(panel_path, options)
         state["detection"] = detected
         boxes = [_normalize_box(region, source="detected", computed=False) for region in detected]
         state["auto_boxes"] = boxes
@@ -787,7 +905,7 @@ def _run_selected_ocr_engine(panel_path: Path, options: dict, regions: list[dict
     start = time.perf_counter()
     _trace(trace, scan_id, "ocr", "start", "OCR stage started", engine=ocr_engine)
 
-    # Delegate OCR invocation to the unified MangaOCR adapter.
+    # Delegate OCR invocation to the MangaOCR recognition service.
     result = run_ocr(panel_path, options=options, regions=regions)
 
     # Normalize and enrich result as before
@@ -846,7 +964,7 @@ def _run_ocr_stage(panel_path: Path, options: dict, state: dict, trace: list[dic
         cache_bucket[cache_key] = result
         return result
     except Exception as e:
-        logger.error("OCR stage exception: %s\n%s", e, traceback.format_exc())
+        logger.exception('stage=ocr status=failed msg="OCR stage exception"')
         _trace(trace, scan_id, "ocr", "error", str(e))
         return {
             "success": False,
@@ -879,7 +997,7 @@ def _empty_translation_result(text_count: int, options: dict, error: str | None 
         "success": error is None,
         "translations": [""] * text_count,
         "translation_engine_requested": engine,
-        "translation_engine_used": None if error else engine,
+        "translation_engine_used": None if error else "ollama",
         "translation_model": _translation_model(options, resolve_auto=True),
         "translation_target_lang": options.get("target_lang", "en"),
         "translation_style": options.get("translation_style", "natural"),
@@ -890,30 +1008,72 @@ def _empty_translation_result(text_count: int, options: dict, error: str | None 
     }
 
 
+def _compact_bbox(bbox: list | tuple | None) -> dict | None:
+    if not bbox:
+        return None
+    try:
+        if len(bbox) == 4 and all(isinstance(item, (int, float)) for item in bbox):
+            x, y, width, height = bbox
+            return {"x": int(x), "y": int(y), "width": int(width), "height": int(height)}
+        points = [
+            (float(point[0]), float(point[1]))
+            for point in bbox
+            if isinstance(point, (list, tuple)) and len(point) >= 2
+        ]
+        if not points:
+            return None
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        return {
+            "x": int(round(min_x)),
+            "y": int(round(min_y)),
+            "width": int(round(max_x - min_x)),
+            "height": int(round(max_y - min_y)),
+        }
+    except Exception:
+        return None
+
+
+def _translation_context_unit(annotation: dict, annotation_index: int) -> dict:
+    region_id = annotation.get("region_id") or annotation.get("id") or f"ann_{annotation_index + 1:04d}"
+    return {
+        "region_id": str(region_id),
+        "index": annotation_index,
+        "text": annotation.get("text", ""),
+        "reading_order": annotation.get("reading_order") or annotation_index + 1,
+        "orientation": annotation.get("recognized_orientation") or ("vertical" if annotation.get("vertical") else "horizontal"),
+        "vertical": bool(annotation.get("vertical")),
+        "box": _compact_bbox(annotation.get("bbox")),
+    }
+
+
 def _run_translation_stage(ocr_result: dict, options: dict, state: dict, trace: list[dict], scan_id: str) -> tuple[dict, str | None, bool]:
     annotations = ocr_result.get("annotations", []) or []
-    indexed_texts = [
-        (index, ann.get("text", ""))
+    indexed_units = [
+        (index, _translation_context_unit(ann, index))
         for index, ann in enumerate(annotations)
         if ann.get("computed", True) and ann.get("text")
     ]
-    texts = [text for _, text in indexed_texts]
+    texts = [unit["text"] for _, unit in indexed_units]
+    context_units = [unit for _, unit in indexed_units]
+    if options.get("cache_only"):
+        cached = _load_persisted_stage(state["panel_path"], "translation", "current")
+        if cached:
+            _trace(trace, scan_id, "translation", "current_hit", "Current translation loaded")
+            return copy.deepcopy(cached), None, False
+        _trace(trace, scan_id, "translation", "current_miss", "Current translation is missing")
+        return {
+            "success": True,
+            "translations": [""] * len(annotations),
+            "cache_miss": True,
+        }, None, False
+
     engine = _translation_engine(options)
     model = _translation_model(options, resolve_auto=True)
     requested_model = _translation_model(options, resolve_auto=False)
     cache_key = _translation_options_key(options, annotations)
-    use_cache = bool(options.get("use_cache", True)) and not bool(options.get("fresh", False))
-
-    if use_cache:
-        cached = _load_persisted_stage(state["panel_path"], "translation", cache_key)
-        if cached:
-            _trace(trace, scan_id, "translation", "cache_hit", "Translation cache hit", cache_key=cache_key)
-            return copy.deepcopy(cached), cache_key, False
-    if options.get("cache_only"):
-        _trace(trace, scan_id, "translation", "cache_miss", "Translation cache miss for current model", cache_key=cache_key, model=model)
-        result = _empty_translation_result(len(annotations), options)
-        result["cache_miss"] = True
-        return result, cache_key, False
 
     if not texts:
         result = _empty_translation_result(len(annotations), options)
@@ -926,6 +1086,9 @@ def _run_translation_stage(ocr_result: dict, options: dict, state: dict, trace: 
         "style": options.get("translation_style", "natural"),
         "temperature": float(options.get("temperature", 0.1)),
         "texts": texts,
+        "strategy": translation_engine.MANGA_DIALOGUE_STRATEGY,
+        "target_chunk_size": translation_engine.MANGA_TARGET_CHUNK_SIZE,
+        "max_context_lines": translation_engine.MANGA_CONTEXT_LINE_LIMIT,
     }
 
     _trace(
@@ -947,11 +1110,15 @@ def _run_translation_stage(ocr_result: dict, options: dict, state: dict, trace: 
             model=requested_model,
             style=options.get("translation_style", "natural"),
             temperature=float(options.get("temperature", 0.1)),
+            context_units=context_units,
         )
+        translated_by_region: dict[str, str] = {}
         expanded = [""] * len(annotations)
-        for (annotation_index, _text), translated in zip(indexed_texts, result.get("translations", [])):
+        for (annotation_index, _unit), translated in zip(indexed_units, result.get("translations", [])):
             expanded[annotation_index] = translated
+            translated_by_region[str(_unit["region_id"])] = translated
         result["translations"] = expanded
+        result["translations_by_region"] = translated_by_region
         result["translation_prompt_payload"] = result.get("translation_prompt_payload") or prompt_payload
         _trace(
             trace,
@@ -1042,8 +1209,14 @@ def _merge_translation_result(base_result: dict, translation_result: dict, optio
     result = copy.deepcopy(base_result)
     annotations = result.get("annotations", []) or []
     translations = translation_result.get("translations", [])
+    translations_by_region = translation_result.get("translations_by_region", {}) or {}
     for index, ann in enumerate(annotations):
-        ann["translated"] = translations[index] if index < len(translations) else ""
+        region_id = str(ann.get("region_id") or ann.get("id") or f"ann_{index + 1:04d}")
+        ann["translated"] = (
+            translations_by_region[region_id]
+            if region_id in translations_by_region
+            else translations[index] if index < len(translations) else ""
+        )
     result["annotations"] = annotations
     result.update({key: value for key, value in translation_result.items() if key != "translations"})
     result["translation_engine_requested"] = translation_result.get(
@@ -1059,46 +1232,6 @@ def _attach_cached_rabbithole(panel_path: Path, result: dict) -> dict:
     if cached:
         return _merge_rabbithole_result(result, cached)
     return result
-
-
-def _run_scan_translate(panel_path: Path, options: dict | None = None) -> dict:
-    """Run OCR first, then Rabbithole, translation, and render as separate cacheable stages."""
-    options = options or {}
-    scan_id = _new_scan_id()
-    trace: list[dict] = []
-    state = _load_state(panel_path)
-    _trace(trace, scan_id, "scan", "start", "Scan started", panel=panel_path.name)
-
-    ocr_result = _run_ocr_stage(panel_path, options, state, trace, scan_id)
-    if not ocr_result or not ocr_result.get("success"):
-        ocr_result["scan_trace"] = trace
-        ocr_result["panel_cache"] = _panel_cache_status(state, panel_path)
-        _save_state(panel_path, state)
-        return ocr_result
-
-    rabbithole_result, rabbithole_key, should_cache_rabbithole = _run_rabbithole_stage(ocr_result, panel_path, options, trace, scan_id)
-    if rabbithole_key and should_cache_rabbithole and rabbithole_result.get("success"):
-        _save_persisted_stage(panel_path, "rabbithole", rabbithole_key, rabbithole_result)
-
-    translation_result, translation_key, should_cache_translation = _run_translation_stage(
-        ocr_result,
-        options,
-        {"panel_path": panel_path},
-        trace,
-        scan_id,
-    )
-    if translation_key and should_cache_translation and not translation_result.get("translation_error"):
-        _save_persisted_stage(panel_path, "translation", translation_key, translation_result)
-
-    enriched = _merge_rabbithole_result(ocr_result, rabbithole_result)
-    enriched = _merge_translation_result(enriched, translation_result, options)
-    render_result = _run_render_stage(panel_path, enriched, trace, scan_id)
-    enriched.update(render_result)
-    _trace(trace, scan_id, "scan", "done", "Scan completed", annotations=len(enriched.get("annotations", []) or []))
-    enriched["scan_trace"] = trace
-    enriched["panel_cache"] = _panel_cache_status(state, panel_path)
-    _save_state(panel_path, state)
-    return enriched
 
 
 def _run_rabbithole_existing(panel_path: Path, options: dict | None = None) -> dict:
@@ -1139,6 +1272,85 @@ def _run_rabbithole_existing(panel_path: Path, options: dict | None = None) -> d
     enriched["panel_cache"] = _panel_cache_status(state, panel_path)
     _save_state(panel_path, state)
     return enriched
+
+
+def _prune_rabbithole_jobs(now: float | None = None) -> None:
+    now = now or time.time()
+    with _RABBITHOLE_JOBS_LOCK:
+        stale = [
+            job_id
+            for job_id, job in _RABBITHOLE_JOBS.items()
+            if job.get("status") in {"done", "error"} and now - float(job.get("updated_at", now)) > RABBITHOLE_JOB_TTL_SECONDS
+        ]
+        for job_id in stale:
+            _RABBITHOLE_JOBS.pop(job_id, None)
+
+
+def _public_rabbithole_job(job: dict | None) -> dict | None:
+    if not job:
+        return None
+    payload = {
+        "success": True,
+        "rabbithole_job": True,
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "filename": job.get("filename"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
+    if job.get("error"):
+        payload["error"] = job.get("error")
+    if job.get("result") is not None:
+        payload["result"] = job.get("result")
+    return payload
+
+
+def _update_rabbithole_job(job_id: str, **updates) -> dict | None:
+    with _RABBITHOLE_JOBS_LOCK:
+        job = _RABBITHOLE_JOBS.get(job_id)
+        if not job:
+            return None
+        job.update(updates)
+        job["updated_at"] = round(time.time(), 3)
+        return copy.deepcopy(job)
+
+
+def _run_rabbithole_job(job_id: str, panel_path: Path, options: dict) -> None:
+    _update_rabbithole_job(job_id, status="running")
+    try:
+        result = _run_rabbithole_existing(panel_path, options)
+        if result and result.get("success"):
+            _update_rabbithole_job(job_id, status="done", result=result, error=None)
+        else:
+            error = (result or {}).get("error") or (result or {}).get("rabbithole_error") or "Rabbithole processing failed"
+            _update_rabbithole_job(job_id, status="error", result=result, error=error)
+    except Exception as exc:
+        logger.exception('panel="%s" stage=rabbithole status=failed job_id=%s msg="Rabbithole background job failed"', panel_path.name, job_id)
+        _update_rabbithole_job(job_id, status="error", error=str(exc))
+
+
+def _start_rabbithole_job(filename: str, panel_path: Path, options: dict) -> dict:
+    _prune_rabbithole_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    now = round(time.time(), 3)
+    job = {
+        "job_id": job_id,
+        "filename": filename,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "result": None,
+        "error": None,
+    }
+    with _RABBITHOLE_JOBS_LOCK:
+        _RABBITHOLE_JOBS[job_id] = job
+    _RABBITHOLE_JOB_EXECUTOR.submit(_run_rabbithole_job, job_id, panel_path, copy.deepcopy(options))
+    logger.info(
+        'panel="%s" stage=rabbithole status=queued job_id=%s msg="Rabbithole background job queued"',
+        filename,
+        job_id,
+    )
+    return copy.deepcopy(job)
 
 
 def _run_render_stage(panel_path: Path, enriched: dict, trace: list[dict], scan_id: str) -> dict:
@@ -1206,32 +1418,96 @@ def _run_translate_existing(panel_path: Path, options: dict | None = None) -> di
     return enriched
 
 
-class TranslateRequest(BaseModel):
-    text: str
-    engine: str = "ollama"
-    model: str | None = None
-    target_lang: str = "en"
-    style: str = "natural"
-    temperature: float = 0.1
-
-
 class ScanOptions(BaseModel):
     use_cache: bool = True
     cache_only: bool = False
     fresh: bool = False
-    ocr_engine: str = "mangaocr"
+    detection: dict = Field(default_factory=dict)
+    ocr: dict = Field(default_factory=dict)
+    bubble: dict = Field(default_factory=dict)
+    render: dict = Field(default_factory=dict)
+    translation: dict = Field(default_factory=dict)
     ocr_quality_mode: str = "balanced"
     semantic_rerank: str = "close"
     vertical_preference: str = "normal"
     rotation_win_margin: int = 15
     preprocessing_set: str = "standard"
-    detection_sensitivity: str = "normal"
+    confidence_threshold: float = 0.4
+    nms_threshold: float = 0.35
+    mask_threshold: float = 0.3
+    box_threshold: float = 0.6
+    max_regions: int | None = None
+    crop_upscale: int = 3
+    crop_padding_ratio: float = 0.05
+    crop_padding_min: int = 4
+    enable_rotated_variants: bool = True
     translation_engine: str = "ollama"
     translation_model: str | None = None
     target_lang: str = "en"
     translation_style: str = "natural"
     temperature: float = 0.1
     reset_manual_edits: bool = False
+
+
+def _flatten_scan_options(options: dict | None) -> dict:
+    """Accept the new grouped settings payload while keeping old flat callers working."""
+    raw = dict(options or {})
+    grouped = {
+        "detection": raw.pop("detection", {}) or {},
+        "ocr": raw.pop("ocr", {}) or {},
+        "bubble": raw.pop("bubble", {}) or {},
+        "render": raw.pop("render", {}) or {},
+        "translation": raw.pop("translation", {}) or {},
+    }
+    aliases = {
+        "detection": {
+            "confidence_threshold": "confidence_threshold",
+            "nms_threshold": "nms_threshold",
+            "mask_threshold": "mask_threshold",
+            "box_threshold": "box_threshold",
+            "max_regions": "max_regions",
+        },
+        "ocr": {
+            "quality_mode": "ocr_quality_mode",
+            "semantic_rerank": "semantic_rerank",
+            "vertical_preference": "vertical_preference",
+            "rotation_win_margin": "rotation_win_margin",
+            "preprocessing_set": "preprocessing_set",
+            "crop_upscale": "crop_upscale",
+            "crop_padding_ratio": "crop_padding_ratio",
+            "crop_padding_min": "crop_padding_min",
+            "enable_rotated_variants": "enable_rotated_variants",
+        },
+        "translation": {
+            "engine": "translation_engine",
+            "model": "translation_model",
+            "target_lang": "target_lang",
+            "style": "translation_style",
+            "temperature": "temperature",
+        },
+        "bubble": {
+            "mode": "mode",
+            "model_confidence": "model_confidence",
+            "model_iou": "model_iou",
+            "search_scale": "search_scale",
+            "wand_enabled": "wand_enabled",
+            "overlap_reconciliation": "overlap_reconciliation",
+        },
+    }
+    for group_name, group_aliases in aliases.items():
+        group = grouped[group_name]
+        if not isinstance(group, dict):
+            continue
+        for source, target in group_aliases.items():
+            if source in group and group[source] is not None:
+                raw[target] = group[source]
+    raw.update({name: value for name, value in grouped.items() if isinstance(value, dict)})
+    raw["ocr_engine"] = "mangaocr"
+    return raw
+
+
+def _scan_options_dict(options: ScanOptions | None) -> dict:
+    return _flatten_scan_options(options.model_dump() if options else {})
 
 
 class RegionOverrideRequest(BaseModel):
@@ -1268,11 +1544,17 @@ async def list_panels():
 @router.post("/upload")
 async def upload_panel(file: UploadFile = File(...)):
     try:
+        if file.content_type not in {"image/jpeg", "image/png"}:
+            raise HTTPException(status_code=400, detail="Only JPEG and PNG uploads are supported")
         content = await file.read()
         result = ImageService.save_uploaded_panel(content, file.filename)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Upload failed"))
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Upload failed: {e}")
+        logger.exception('component=upload status=failed msg="Upload failed"')
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -1285,54 +1567,53 @@ async def scan_panel(filename: str, options: ScanOptions | None = None):
 
     try:
         # Run blocking OCR in thread pool to avoid blocking the event loop
-        opts = options.model_dump() if options else {}
+        opts = _scan_options_dict(options)
         result = await asyncio.get_event_loop().run_in_executor(None, _run_ocr, panel_path, opts)
     except Exception as e:
-        logger.error(f"OCR failed for {filename}: {e}\n{traceback.format_exc()}")
+        logger.exception('panel="%s" stage=ocr status=failed msg="OCR request failed"', filename)
         raise HTTPException(status_code=500, detail=f"OCR processing error: {e}")
 
     if result and result.get("success"):
         return result
-    raise HTTPException(status_code=503, detail=(result or {}).get("error", "OCR engine unavailable"))
-
-
-@router.post("/{filename}/scan-translate")
-async def scan_and_translate(filename: str, options: ScanOptions | None = None):
-    """OCR + Rabbithole + translation in one step with explicit engines."""
-    panel_path = ImageService.get_panel_by_filename(filename)
-    if not panel_path:
-        raise HTTPException(status_code=404, detail="Panel not found")
-
-    try:
-        # Run blocking OCR in thread pool to avoid blocking the event loop
-        opts = options.model_dump() if options else {}
-        result = await asyncio.get_event_loop().run_in_executor(None, _run_scan_translate, panel_path, opts)
-    except Exception as e:
-        logger.error(f"OCR+translate failed for {filename}: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"OCR processing error: {e}")
-
-    if result and result.get("success"):
-        return result
-    raise HTTPException(status_code=503, detail=(result or {}).get("error", "OCR engine unavailable"))
+    error = (result or {}).get("error", "OCR engine unavailable")
+    raise HTTPException(
+        status_code=503,
+        detail=f"OCR unavailable: {error}. Check Runtime in settings and download OCR assets if needed.",
+    )
 
 
 @router.post("/{filename}/rabbithole")
 async def build_rabbithole(filename: str, options: ScanOptions | None = None):
-    """Build Rabbithole data for the latest OCR result."""
+    """Queue Rabbithole data generation for the latest OCR result."""
     panel_path = ImageService.get_panel_by_filename(filename)
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
 
+    opts = _scan_options_dict(options)
+    if not opts.get("cache_only"):
+        job = _start_rabbithole_job(filename, panel_path, opts)
+        return _public_rabbithole_job(job)
+
     try:
-        opts = options.model_dump() if options else {}
         result = await asyncio.get_event_loop().run_in_executor(None, _run_rabbithole_existing, panel_path, opts)
     except Exception as e:
-        logger.error(f"Rabbithole failed for {filename}: {e}\n{traceback.format_exc()}")
+        logger.exception('panel="%s" stage=rabbithole status=failed msg="Rabbithole request failed"', filename)
         raise HTTPException(status_code=500, detail=f"Rabbithole processing error: {e}")
 
     if result and result.get("success"):
         return result
     raise HTTPException(status_code=409, detail=(result or {}).get("error", "Run Scan before Rabbithole"))
+
+
+@router.get("/{filename}/rabbithole/jobs/{job_id}")
+async def get_rabbithole_job(filename: str, job_id: str):
+    """Return the current status or completed result for a Rabbithole job."""
+    _prune_rabbithole_jobs()
+    with _RABBITHOLE_JOBS_LOCK:
+        job = copy.deepcopy(_RABBITHOLE_JOBS.get(job_id))
+    if not job or job.get("filename") != filename:
+        raise HTTPException(status_code=404, detail="Rabbithole job not found")
+    return _public_rabbithole_job(job)
 
 
 @router.post("/{filename}/translate")
@@ -1343,33 +1624,15 @@ async def translate_panel(filename: str, options: ScanOptions | None = None):
         raise HTTPException(status_code=404, detail="Panel not found")
 
     try:
-        opts = options.model_dump() if options else {}
+        opts = _scan_options_dict(options)
         result = await asyncio.get_event_loop().run_in_executor(None, _run_translate_existing, panel_path, opts)
     except Exception as e:
-        logger.error(f"Translate failed for {filename}: {e}\n{traceback.format_exc()}")
+        logger.exception('panel="%s" stage=translation status=failed msg="Translate request failed"', filename)
         raise HTTPException(status_code=500, detail=f"Translation processing error: {e}")
 
     if result and result.get("success"):
         return result
     raise HTTPException(status_code=409, detail=(result or {}).get("error", "Run Scan before Translate"))
-
-
-@router.post("/translate")
-async def translate_text(req: TranslateRequest):
-    if not req.text.strip():
-        raise HTTPException(status_code=400, detail="No text provided")
-
-    try:
-        return translation_engine.translate_text(
-            req.text,
-            engine=req.engine,
-            model=req.model if req.engine == "ollama" else None,
-            target_lang=req.target_lang,
-            style=req.style,
-            temperature=req.temperature,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
 
 
 @router.get("/{filename}/cache-status")
@@ -1389,11 +1652,16 @@ async def delete_cache(filename: str, kind: str | None = None):
     state = _load_state(panel_path)
     kinds = [kind] if kind else None
     cleared = _clear_panel_cache_buckets(state, kinds)
-    if kind is None or kind == "ocr":
+    if kind is None:
         _delete_panel_ocr_tree(panel_path)
         _delete_stage_artifacts(panel_path, "rabbithole")
         _delete_stage_artifacts(panel_path, "translation")
         _delete_rendered_output(panel_path)
+        legacy = LEGACY_OCR_CACHE_DIR / f"{_cache_key(panel_path)}.json"
+        if legacy.exists():
+            legacy.unlink()
+    elif kind == "ocr":
+        _delete_panel_ocr_artifacts(panel_path)
         legacy = LEGACY_OCR_CACHE_DIR / f"{_cache_key(panel_path)}.json"
         if legacy.exists():
             legacy.unlink()
@@ -1404,12 +1672,7 @@ async def delete_cache(filename: str, kind: str | None = None):
         _delete_rendered_output(panel_path)
     _save_state(panel_path, state)
     status = _panel_cache_status(state, panel_path)
-    return {"success": True, "cleared": cleared, "overrides_preserved": kind not in {None, "ocr"}, **status}
-
-
-@router.get("/ocr-engines")
-async def ocr_engines():
-    return {"engines": _ocr_engine_status()}
+    return {"success": True, "cleared": cleared, "overrides_preserved": kind is not None, **status}
 
 
 @router.get("/translation-engines")
@@ -1513,7 +1776,7 @@ async def recompute_region(filename: str, region_id: str, options: ScanOptions |
     panel_path = ImageService.get_panel_by_filename(filename)
     if not panel_path:
         raise HTTPException(status_code=404, detail="Panel not found")
-    opts = options.model_dump() if options else {}
+    opts = _scan_options_dict(options)
     result = await asyncio.get_event_loop().run_in_executor(None, _run_ocr, panel_path, opts)
     if result and result.get("success"):
         annotation = next((a for a in result.get("annotations", []) if a.get("region_id") == region_id), None)

@@ -23,13 +23,6 @@ def _env(name: str, default: str = "") -> str:
 	return os.getenv(name, default)
 
 
-def _env_configured(name: str, default: str = "", placeholders: set[str] | None = None) -> str:
-	value = _env(name, default).strip()
-	if placeholders and value.lower() in {placeholder.lower() for placeholder in placeholders}:
-		return ""
-	return value
-
-
 def _env_int(name: str, default: int) -> int:
 	value = os.getenv(name)
 	if value is None or value.strip() == "":
@@ -40,24 +33,32 @@ def _env_int(name: str, default: int) -> int:
 		return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+	value = os.getenv(name)
+	if value is None or value.strip() == "":
+		return default
+	return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Paths:
 	base_dir: Path = PROJECT_ROOT
 	panels_dir: Path = PROJECT_ROOT / "panels"
 	uploads_dir: Path = PROJECT_ROOT / "panels" / "uploads"
+	models_dir: Path = PROJECT_ROOT / "backend" / "models"
+	manga_ocr_model_dir: Path = PROJECT_ROOT / "backend" / "models" / "manga-ocr-base"
+	bubble_model_dir: Path = PROJECT_ROOT / "backend" / "models" / "manga-bubble-segmentation"
 	lookup_cache_dir: Path = PROJECT_ROOT / "backend" / "data" / "lookup_cache"
 	thumbs_dir: Path = PROJECT_ROOT / "backend" / "data" / "thumbs"
 
 
 @dataclass(frozen=True)
 class Services:
-	google_application_credentials: str = _env_configured("GOOGLE_APPLICATION_CREDENTIALS", "", {"path/to/your/credentials.json"})
-	google_project_id: str = _env_configured("GOOGLE_PROJECT_ID", "", {"your-project-id"})
-	gemini_api_key: str = _env_configured("GEMINI_API_KEY", "", {"your-gemini-api-key"})
 	ollama_base_url: str = _env("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 	ollama_text_model: str = _env("OLLAMA_TEXT_MODEL", "hf.co/sugoitoolkit/Sugoi-14B-Ultra-GGUF:Q4_K_M")
 	kanjiapi_base_url: str = _env("KANJIAPI_BASE_URL", "https://kanjiapi.dev/v1").rstrip("/")
 	render_font_path: str = _env("RENDER_FONT_PATH", "")
+	rabbithole_ginza_enabled: bool = _env_bool("RABBITHOLE_GINZA_ENABLED", False)
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,7 @@ PANEL_DATA_DIR = DATA_DIR / "panel_data"
 for path in (
 	PATHS.panels_dir,
 	PATHS.uploads_dir,
+	PATHS.models_dir,
 	PATHS.lookup_cache_dir,
 	PATHS.thumbs_dir,
 	PANEL_DATA_DIR,
@@ -104,6 +106,11 @@ for path in (
 BASE_DIR = PATHS.base_dir
 PANELS_DIR = PATHS.panels_dir
 UPLOADS_DIR = PATHS.uploads_dir
+MODELS_DIR = PATHS.models_dir
+MANGA_OCR_MODEL_DIR = PATHS.manga_ocr_model_dir
+BUBBLE_MODEL_DIR = PATHS.bubble_model_dir
+BUBBLE_MODEL_PATH = BUBBLE_MODEL_DIR / "best.pt"
+TEXT_REGION_MODEL_PATH = MODELS_DIR / "comictextdetector.pt.onnx"
 LOOKUP_CACHE_DIR = PATHS.lookup_cache_dir
 THUMBS_DIR = PATHS.thumbs_dir
 
@@ -200,13 +207,11 @@ def panel_metadata_path(panel_path: Path) -> Path:
 # - backend/data/lookup_cache/ ... NLP cache entries (kanji, words, readings)
 # - backend/data/lookup_cache/kanji/, lookup/, readings/, words/ ... keyed by content, not panel
 
-GOOGLE_APPLICATION_CREDENTIALS = SERVICES.google_application_credentials
-GOOGLE_PROJECT_ID = SERVICES.google_project_id
-GEMINI_API_KEY = SERVICES.gemini_api_key
 OLLAMA_BASE_URL = SERVICES.ollama_base_url
 OLLAMA_TEXT_MODEL = SERVICES.ollama_text_model
 KANJIAPI_BASE_URL = SERVICES.kanjiapi_base_url
 RENDER_FONT_PATH = SERVICES.render_font_path
+RABBITHOLE_GINZA_ENABLED = SERVICES.rabbithole_ginza_enabled
 
 API_HOST = API.host
 API_PORT = API.port

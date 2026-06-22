@@ -1,185 +1,113 @@
 # Manga Language Learner
 
-Learn Japanese playfully through manga panels. Upload a manga panel, detect Japanese text, explore Rabbithole analysis, and translate it when you want a rendered English panel.
+Manga Language Learner is a local-first reader for Japanese manga panels. It detects text regions, runs MangaOCR on panel crops, builds learner-oriented dictionary context, and renders translations back onto the panel.
 
-## Core Features
+## Architecture Rules
 
-- **Panel Management:** Load and list manga panels from `panels/` or `panels/uploads/`.
-- **Text Detection:** Detect text regions per panel and process them as isolated OCR crops.
-- **Deep Inspection:** View OCR results, translations, reading data (furigana/romanji), and debug crop-previews per region.
-- **Rendering:** Automatically render translated dialogue back into panels (saved as `current.png`).
-- **Rabbithole Mode:** Explore vocabulary, Kanji details, glosses, and reading lookups directly from scanned text.
-- **Granular Caching:** Clear caches at the panel level without destroying global NLP lookup data.
+- **OCR engine: MangaOCR.** Recognition code is tailored to MangaOCR crop quality, orientation, and manga text behavior.
+- **Translation service: Ollama.** Translation requests go through the local Ollama runtime.
+- **Recommended model: Sugoi.** `OLLAMA_TEXT_MODEL` defaults to `hf.co/sugoitoolkit/Sugoi-14B-Ultra-GGUF:Q4_K_M`, and any installed Ollama text model can be selected.
+- **Runtime data is generated.** Panel state, OCR debug crops, translation cache, rendered panels, and thumbnails live under `backend/data/` as local runtime artifacts.
 
-## Architecture & Data Flow
+## Folder Guide
 
-```text
-manga_language_learner/
-|-- backend/                  Python FastAPI Backend
-|   |-- app.py                FastAPI app, static files, thumbnail cache
-|   |-- config.py             Central configuration, env loading, path resolutions
-|   |-- data/                 Runtime data storage (gitignored)
-|   |   |-- lookup_cache/     Global NLP and Kanji caches
-|   |   |-- panel_data/       Isolated panel artifacts (state, OCR, renders)
-|   |   `-- thumbs/           Generated image thumbnails
-|   |-- routes/               HTTP endpoints (scanner, rabbithole)
-|   `-- services/
-|       |-- text_region_detector.py  ONNX-based text region boundary detection
-|       |-- manga_ocr_service.py     Crop preprocessing and MangaOCR execution
-|       |-- translation_engine.py    Ollama/Gemini translation backends
-|       `-- rabbithole/                NLP tokenization, glossing, and dictionary lookups
-|-- frontend/                 Vanilla HTML/CSS/JS frontend
-|-- panels/                   Manga images (synthetic tests & uploads)
-`-- .env.example              Configuration template
-```
+- [backend](backend/README.md): FastAPI app, config, runtime health, routes, and services.
+- [backend/routes](backend/routes/README.md): HTTP route modules.
+- [backend/services](backend/services/README.md): OCR, detection, translation, rendering, storage, NLP, and runtime helpers.
+- [frontend](frontend/README.md): Vanilla HTML/CSS/JS reader UI.
+- [panels](panels/README.md): Sample panel source area and upload boundary.
+- [tests](tests/README.md): Contract tests for the pipeline and API surface.
 
-## Data Storage Layout
+Every tracked source folder has a local `README.md`. Generated and reference folders such as `backend/data/`, `panels/uploads/`, `__pycache__/`, and `inspiration/` are documented from the source folders that create or consume them.
 
-Panel data is stored in isolated directories to prevent cluttering the global data folder. Each panel's runtime artifacts live under `backend/data/panel_data/<panel_id>/`:
+## Setup
 
-```text
-backend/data/
-|-- lookup_cache/                 Global cached NLP lookups
-|-- panel_data/
-|   |-- <panel_id>/               e.g. ch01_p042-a1b2c3d4
-|   |   |-- ocr/
-|   |   |   |-- state/            OCR state JSON (boxes, annotations)
-|   |   |   |-- debug/            OCR crop debug previews
-|   |   |   `-- cache/            Intermediary OCR cache
-|   |   |-- rendered/
-|   |   |   `-- current.png       Target language rendered panel
-|   |   |-- rabbithole/
-|   |   |   |-- cache/
-|   |   |   `-- latest.json       Panel-specific Rabbithole analysis
-|   |   |-- translations/
-|   |   |   |-- cache/
-|   |   |   `-- latest.json       Panel-specific translation snapshots
-|   |   `-- metadata.json         Source tracking, timestamps, edit history
-|   `-- ...
-`-- thumbs/                       Panel thumbnails
-```
-
-## Pipeline Components
-
-| Component | Status | Role |
-| --- | --- | --- |
-| Text Detection Engine | active | Detects text regions, orientation, and reading order |
-| MangaOCR | active | Primary Japanese manga OCR (HuggingFace-based, runs locally) |
-| Preprocessing | active | Crop upscaling, contrast scaling, denoising, adaptive thresholding |
-| Sugoi Translation Model | active/default | Primary translation model: provides smooth, fluent dialogue translation |
-| Ollama Text (llama3.1) | active | Fallback translation model |
-| Gemini | optional | Highly capable remote translation fallback |
-
-## Setup & Installation
-
-### 1. Start the Backend
-
-```powershell
-# Setup virtual environment
-cd manga_language_learner
+```bash
 python -m venv .venv
-
-# Activate (Windows)
-.venv\Scripts\Activate.ps1
-# Activate (macOS/Linux)
-# source .venv/bin/activate
-
-# Install dependencies
-pip install -r backend/requirements.txt
-
-# Prepare config
+source .venv/bin/activate
+pip install -r requirements.txt
 cp .env.example .env
-# Windows PowerShell: Copy-Item .env.example .env
-
-# Run FastAPI server
-cd backend
-python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-The UI will be accessible at: `http://localhost:8000`
+Install and start Ollama:
 
-### 2. Configure Translation (Ollama)
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve
+```
 
-Translations run locally via Ollama by default. You can run Ollama on your machine or connect to a remote GPU host.
-
-Required models:
+Pull the recommended manga dialogue model:
 
 ```bash
 ollama pull hf.co/sugoitoolkit/Sugoi-14B-Ultra-GGUF:Q4_K_M
-ollama pull llama3.1:8b  # Fallback translation model
 ```
 
-If connecting to a remote host:
+Run the app:
+
 ```bash
-ssh user@GPU_HOST
-bash setup_ollama_remote.sh
+./run_backend.sh
 ```
 
-### 3. Environment Variables
+The UI is served at `http://localhost:8000`.
 
-Define your configuration in the `.env` file (copied from `.env.example`). The application centralizes all configuration inside `backend/config.py`.
+## Runtime Configuration
+
+Key `.env` values:
 
 ```env
 API_HOST=0.0.0.0
 API_PORT=8000
-
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-# Translation model (MangaOCR handles text recognition locally)
 OLLAMA_TEXT_MODEL=hf.co/sugoitoolkit/Sugoi-14B-Ultra-GGUF:Q4_K_M
-
-# Optional external integrations
-GEMINI_API_KEY=optional
-GOOGLE_APPLICATION_CREDENTIALS=optional
-GOOGLE_PROJECT_ID=optional
-
-# Dictionary and rendering dependencies
 KANJIAPI_BASE_URL=https://kanjiapi.dev/v1
 RENDER_FONT_PATH=optional/path/to/font.ttf
 ```
 
-> **Note:** The backend automatically ensures that necessary model caches (like the text-detector ONNX model and the `kha-white/manga-ocr-base` HuggingFace snapshot) are present during startup.
+Startup checks runtime readiness. Asset downloads happen through the Reader runtime panel or `POST /api/runtime/ocr-assets/download`.
 
-## API Overview
+Backend-owned model assets are stored under `backend/models/`. The text detector is
+`backend/models/comictextdetector.pt.onnx`; the explicit OCR asset download installs
+the pinned MangaOCR snapshot into `backend/models/manga-ocr-base/`. OCR requests never
+download model files implicitly. Ollama remains an external service and manages its own
+translation-model storage.
+
+Bubble allocation defaults to hybrid mode. The optional, revision- and checksum-pinned
+balloon segmentation checkpoint is installed explicitly through the Reader runtime panel
+or `POST /api/runtime/bubble-assets/download`; when absent or unusable, scans fall back to
+the classical adaptive-topology allocator.
+
+## Main API
 
 ```text
-# Scanner & Processing
+GET    /api/runtime/status
+POST   /api/runtime/ocr-assets/download
+
 GET    /api/scanner/panels
 POST   /api/scanner/upload
 POST   /api/scanner/{filename}/ocr
-POST   /api/scanner/{filename}/scan-translate
-POST   /api/scanner/translate
-GET    /api/scanner/{filename}/cache-status
 POST   /api/scanner/{filename}/rabbithole
+GET    /api/scanner/{filename}/rabbithole/jobs/{job_id}
+POST   /api/scanner/{filename}/translate
+GET    /api/scanner/{filename}/cache-status
+GET    /api/scanner/{filename}/regions
 DELETE /api/scanner/{filename}/cache?kind=ocr|translation|rabbithole
+GET    /api/scanner/translation-engines
+GET    /api/scanner/ollama/models
 
-# Rabbithole & Vocabulary
-GET    /api/rabbithole/panels
-GET    /api/rabbithole/{filename}/vocab
-POST   /api/rabbithole/{filename}/answer
-GET    /api/rabbithole/progress
+GET    /api/rabbithole/lookup?text=...
+GET    /api/rabbithole/kanji/{character}
+GET    /api/rabbithole/word?text=...
+GET    /api/rabbithole/reading/{reading}
+POST   /api/runtime/bubble-assets/download
+
+GET    /api/learning/panels
+GET    /api/learning/{filename}/vocab
+POST   /api/learning/{filename}/answer
+GET    /api/learning/progress
 ```
 
-## Tech Stack
+## Tests
 
-- **Backend:** Python, FastAPI, Uvicorn
-- **Detection & Vision:** ONNX, OpenCV DNN, Pillow, NumPy
-- **OCR:** MangaOCR (with heavily optimized crop-preprocessing)
-- **Geometry Processing:** Shapely, pyclipper
-- **Translation:** Ollama (default), Gemini (optional)
-- **Frontend:** Vanilla HTML/CSS/JS with modular components
-
-## Dictionary Sources
-
-- Word dictionary entries in Rabbithole come from `kanjiapi.dev` `/words` and are JMdict-backed.
-- Tokenization, lemmas, and part-of-speech tags come from `SudachiPy` (`sudachidict_core`).
-- Kanji metadata comes from `kanjiapi.dev` `/kanji/{character}`.
-- Reading lookups come from `kanjiapi.dev` `/reading/{kana}`.
-- Extended local entries are added for particles/auxiliaries, punctuation symbols, and short hiragana symbol references.
-
-## Detector Notes
-
-- The text-region detector lives in `backend/services/detection/region_detector.py` and follows the `comic-text-detector` pipeline.
-- Current stages are: letterbox resize, YOLOv5 text blocks, UNet text mask, DBNet line extraction, grouping, mask refinement, and manga reading-order sorting.
-- The raw `mask` is a coarse text-region prediction. It is useful for text localization, but it is not a speech-bubble boundary.
-- The `mask_refined` output is a per-text-block cleanup pass around detected text. It is a better candidate for allocatable text area than the raw mask, but it still does not represent a stable balloon shape by itself.
-- The reader debug overlay therefore treats the current detector output as a candidate text-space estimate. True bubble extraction would need an additional contour/shape pass that grows outward from the text mask and separates adjacent balloons reliably.
+```bash
+python -m unittest discover -s tests
+```
