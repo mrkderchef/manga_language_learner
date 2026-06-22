@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 import asyncio
+import io
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -629,6 +630,42 @@ class ApiContractTests(unittest.TestCase):
         result = ImageService.save_uploaded_panel(b"not an image", "bad.png")
         self.assertFalse(result["success"])
 
+    def test_upload_normalizes_client_paths_and_common_filename_characters(self):
+        uploads_dir = Path(tempfile.mkdtemp(prefix="panel-uploads-"))
+        panels_dir = Path(tempfile.mkdtemp(prefix="panel-library-"))
+        image_bytes = io.BytesIO()
+        Image.new("RGB", (20, 20), "white").save(image_bytes, format="PNG")
+        try:
+            with patch("services.storage.image_service.UPLOADS_DIR", uploads_dir), \
+                    patch("services.storage.image_service.PANELS_DIR", panels_dir):
+                result = ImageService.save_uploaded_panel(
+                    image_bytes.getvalue(),
+                    r"C:\fakepath\Screenshot 2026-06-22 (1).PNG",
+                )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["filename"], "Screenshot-2026-06-22-1.png")
+            self.assertTrue((uploads_dir / result["filename"]).is_file())
+        finally:
+            shutil.rmtree(uploads_dir, ignore_errors=True)
+            shutil.rmtree(panels_dir, ignore_errors=True)
+
+    def test_upload_does_not_overwrite_an_existing_panel(self):
+        uploads_dir = Path(tempfile.mkdtemp(prefix="panel-uploads-"))
+        panels_dir = Path(tempfile.mkdtemp(prefix="panel-library-"))
+        image_bytes = io.BytesIO()
+        Image.new("RGB", (20, 20), "white").save(image_bytes, format="PNG")
+        (panels_dir / "panel.png").write_bytes(image_bytes.getvalue())
+        try:
+            with patch("services.storage.image_service.UPLOADS_DIR", uploads_dir), \
+                    patch("services.storage.image_service.PANELS_DIR", panels_dir):
+                result = ImageService.save_uploaded_panel(image_bytes.getvalue(), "panel.png")
+
+            self.assertEqual(result["filename"], "panel-2.png")
+        finally:
+            shutil.rmtree(uploads_dir, ignore_errors=True)
+            shutil.rmtree(panels_dir, ignore_errors=True)
+
 
 class RuntimeHealthTests(unittest.TestCase):
     def test_runtime_routes_are_present(self):
@@ -661,13 +698,14 @@ class RuntimeHealthTests(unittest.TestCase):
 
     def test_missing_mangaocr_package_status_does_not_crash(self):
         with patch.object(bootstrap, "_manga_ocr_package_available", return_value=False), \
+                patch.object(bootstrap, "_manga_ocr_model_status", return_value={"available": True, "status": "ready"}), \
                 patch.object(bootstrap, "_detector_status", return_value={"available": True, "status": "ready"}), \
                 patch.object(bootstrap, "_ollama_status", return_value={"available": False, "status": "missing"}):
             status = bootstrap.check_runtime_status()
 
         self.assertFalse(status["ocr"]["ready"])
         self.assertEqual(status["ocr"]["package"]["status"], "missing")
-        self.assertEqual(status["ocr"]["mangaocr_model"]["status"], "blocked")
+        self.assertEqual(status["ocr"]["mangaocr_model"]["status"], "ready")
 
     def test_missing_mangaocr_model_status_does_not_crash(self):
         with patch.object(bootstrap, "_manga_ocr_package_available", return_value=True), \
@@ -699,6 +737,28 @@ class RuntimeHealthTests(unittest.TestCase):
             )
         finally:
             shutil.rmtree(model_dir, ignore_errors=True)
+
+    def test_zero_byte_mangaocr_file_is_treated_as_incomplete(self):
+        model_dir = Path(tempfile.mkdtemp(prefix="mangaocr-model-"))
+        try:
+            for filename in model_assets.MANGA_OCR_REQUIRED_FILES:
+                (model_dir / filename).write_bytes(b"ok")
+            (model_dir / "pytorch_model.bin").write_bytes(b"")
+
+            self.assertEqual(model_assets.missing_manga_ocr_files(model_dir), ["pytorch_model.bin"])
+        finally:
+            shutil.rmtree(model_dir, ignore_errors=True)
+
+    def test_ocr_model_download_does_not_require_mangaocr_package(self):
+        fake_status = {"success": True, "ocr": {"ready": False}, "warnings": []}
+        with patch.object(bootstrap, "_manga_ocr_package_available", return_value=False), \
+                patch.object(bootstrap, "download_manga_ocr_model", return_value=Path("/tmp/manga-ocr")) as download, \
+                patch.object(bootstrap, "ensure_text_region_model"), \
+                patch.object(bootstrap, "check_runtime_status", return_value=fake_status):
+            result = bootstrap.ensure_ocr_assets()
+
+        download.assert_called_once()
+        self.assertTrue(result["setup"]["success"])
 
     def test_mangaocr_loader_never_downloads_missing_assets(self):
         previous = mangaocr_service._mocr

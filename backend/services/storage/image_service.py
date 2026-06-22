@@ -5,6 +5,7 @@ from typing import Dict, Optional
 from PIL import Image
 import io
 import re
+import unicodedata
 from config import PANELS_DIR, UPLOADS_DIR, ALLOWED_EXTENSIONS, MAX_FILE_SIZE
 import logging
 
@@ -26,6 +27,30 @@ class ImageService:
         if Path(name).suffix.lower() not in ALLOWED_EXTENSIONS:
             return None
         return name
+
+    @staticmethod
+    def _upload_filename(filename: str | None) -> str | None:
+        """Turn a client filename/path into a safe, non-conflicting local name."""
+        # Some upload clients send a full POSIX path or the browser-style
+        # C:\\fakepath\\... value. Only the final component belongs on disk.
+        raw_name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+        suffix = Path(raw_name).suffix.lower()
+        if suffix not in ALLOWED_EXTENSIONS:
+            return None
+
+        stem = unicodedata.normalize("NFKD", Path(raw_name).stem)
+        stem = stem.encode("ascii", "ignore").decode("ascii")
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "-", stem).strip("-._") or "panel"
+        stem = stem[:100].rstrip("-._") or "panel"
+
+        candidate = f"{stem}{suffix}"
+        counter = 2
+        # Also avoid names from the bundled panel directory: media lookup checks
+        # that directory first, which would otherwise hide the new upload.
+        while (UPLOADS_DIR / candidate).exists() or (PANELS_DIR / candidate).exists():
+            candidate = f"{stem}-{counter}{suffix}"
+            counter += 1
+        return candidate
     
     @staticmethod
     def get_all_panels() -> Dict:
@@ -113,11 +138,11 @@ class ImageService:
     def save_uploaded_panel(file_content: bytes, filename: str) -> Dict:
         """Save an uploaded panel file"""
         try:
-            safe_name = ImageService._safe_filename(filename)
+            safe_name = ImageService._upload_filename(filename)
             if not safe_name:
                 return {
                     "success": False,
-                    "error": "Unsafe or unsupported filename"
+                    "error": "Only JPEG and PNG filenames are supported"
                 }
             if len(file_content) > MAX_FILE_SIZE:
                 return {

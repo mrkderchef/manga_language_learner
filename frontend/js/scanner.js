@@ -325,12 +325,16 @@ const Scanner = (() => {
         );
 
         if (downloadBtn) {
-            downloadBtn.disabled = runtimeDownloadRunning || !pkg.available;
+            // Downloading model files is valid even before manga-ocr imports.
+            downloadBtn.disabled = runtimeDownloadRunning;
         }
         if (bubbleDownloadBtn) bubbleDownloadBtn.disabled = runtimeDownloadRunning;
         if (note) {
+            const setupErrors = status.setup?.errors || [];
             const warnings = status.warnings || [];
-            note.textContent = warnings.length ? warnings.join(' · ') : 'Runtime ready.';
+            note.textContent = setupErrors.length
+                ? setupErrors.join(' · ')
+                : (warnings.length ? warnings.join(' · ') : 'Runtime ready.');
         }
     }
 
@@ -354,18 +358,19 @@ const Scanner = (() => {
             btn.textContent = 'Downloading...';
         }
         if (note) note.textContent = 'Downloading OCR assets...';
+        let completedStatus = null;
+        let downloadError = null;
         try {
             const status = await API.downloadOcrAssets();
-            renderRuntimeStatus(status);
+            completedStatus = status;
         } catch (err) {
-            renderRuntimeStatus(null, err);
+            downloadError = err;
         } finally {
             runtimeDownloadRunning = false;
             if (btn) {
                 btn.textContent = 'Download OCR assets';
-                btn.disabled = false;
             }
-            await refreshRuntimeStatus();
+            renderRuntimeStatus(completedStatus, downloadError);
         }
     }
 
@@ -378,18 +383,19 @@ const Scanner = (() => {
             btn.textContent = 'Downloading...';
         }
         if (note) note.textContent = 'Downloading the pinned bubble model...';
+        let completedStatus = null;
+        let downloadError = null;
         try {
             const status = await API.downloadBubbleAssets();
-            renderRuntimeStatus(status);
+            completedStatus = status;
         } catch (err) {
-            renderRuntimeStatus(null, err);
+            downloadError = err;
         } finally {
             runtimeDownloadRunning = false;
             if (btn) {
                 btn.textContent = 'Download bubble model';
-                btn.disabled = false;
             }
-            await refreshRuntimeStatus();
+            renderRuntimeStatus(completedStatus, downloadError);
         }
     }
 
@@ -745,14 +751,36 @@ const Scanner = (() => {
         const file = e.target.files[0];
         if (!file) return;
 
+        // Reset immediately so choosing the same file again still emits change.
+        e.target.value = '';
+        const uploadBtn = document.getElementById('upload-area');
+        const originalLabel = uploadBtn?.textContent.trim() || 'Upload';
+        if (uploadBtn) {
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = 'Uploading...';
+        }
+
         try {
             const result = await API.uploadPanel(file);
-            if (result.success) {
-                _panelsLoaded = false;
-                loadPanels(true);
+            _panelsLoaded = false;
+            await loadPanels(true);
+            const uploadedThumb = [...document.querySelectorAll('#panel-list .panel-thumb')]
+                .find(img => img.alt === result.filename);
+            if (uploadedThumb) {
+                await selectPanel({
+                    filename: result.filename,
+                    path: result.path,
+                    size: result.size,
+                    type: 'uploaded',
+                }, uploadedThumb);
             }
         } catch (err) {
             alert('Upload fehlgeschlagen: ' + err.message);
+        } finally {
+            if (uploadBtn) {
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = originalLabel;
+            }
         }
     }
 

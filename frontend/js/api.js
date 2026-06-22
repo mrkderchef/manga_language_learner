@@ -99,7 +99,11 @@ const API = (() => {
             return fetch(`${BASE_URL}/api/scanner/upload`, {
                 method: 'POST',
                 body: formData,
-            }).then(r => r.json()).then(data => {
+            }).then(async response => {
+                const data = await response.json().catch(() => ({ detail: response.statusText }));
+                if (!response.ok || !data.success) {
+                    throw new Error(data.detail || data.error || 'Upload failed');
+                }
                 invalidateCache('/api/scanner/panels');
                 invalidateCache('/api/learning/panels');
                 return data;

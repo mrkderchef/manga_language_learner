@@ -60,7 +60,7 @@ def _manga_ocr_model_status() -> dict[str, Any]:
 
 
 def _detector_status() -> dict[str, Any]:
-    if TEXT_REGION_MODEL_PATH.exists():
+    if TEXT_REGION_MODEL_PATH.is_file() and TEXT_REGION_MODEL_PATH.stat().st_size > 1_000_000:
         return _component(
             True,
             status="ready",
@@ -122,14 +122,10 @@ def check_runtime_status() -> dict[str, Any]:
         package="manga_ocr",
         error=None if package_available else "Python package manga-ocr is not installed",
     )
-    model = _manga_ocr_model_status() if package_available else _component(
-        False,
-        status="blocked",
-        repo_id=MANGA_OCR_REPO_ID,
-        revision=MANGA_OCR_REVISION,
-        model_path=str(MANGA_OCR_MODEL_DIR),
-        error="MangaOCR package is missing",
-    )
+    # Report package and model independently. This is especially important on a
+    # fresh machine, where assets may download successfully before an import issue
+    # in the Python package has been resolved.
+    model = _manga_ocr_model_status()
     detector = _detector_status()
     bubble_model = _bubble_model_status()
     ollama = _ollama_status()
@@ -187,20 +183,18 @@ def ensure_ocr_assets() -> dict[str, Any]:
     setup = {"success": True, "actions": [], "errors": []}
     logger.info('component=runtime action=download_ocr_assets status=start msg="OCR asset setup started"')
 
-    if not _manga_ocr_package_available():
+    # Model acquisition must not depend on manga-ocr already being importable.
+    # A fresh install may need to download assets while package setup is repaired.
+    try:
+        path = download_manga_ocr_model()
+        setup["actions"].append({"component": "mangaocr_model", "status": "ready", "path": str(path)})
+    except Exception as exc:
         setup["success"] = False
-        setup["errors"].append("Python package manga-ocr is not installed")
-    else:
-        try:
-            path = download_manga_ocr_model()
-            setup["actions"].append({"component": "mangaocr_model", "status": "ready", "path": str(path)})
-        except Exception as exc:
-            setup["success"] = False
-            setup["errors"].append(f"MangaOCR model download failed: {exc}")
-            logger.warning(
-                'component=mangaocr action=download status=failed error=%r msg="MangaOCR model download failed"',
-                exc,
-            )
+        setup["errors"].append(f"MangaOCR model download failed: {exc}")
+        logger.warning(
+            'component=mangaocr action=download status=failed error=%r msg="MangaOCR model download failed"',
+            exc,
+        )
 
     try:
         ensure_text_region_model()
@@ -226,5 +220,3 @@ def ensure_ocr_assets() -> dict[str, Any]:
 def ensure_runtime_assets() -> dict[str, Any]:
     """Compatibility alias: startup now checks only and never downloads."""
     return check_runtime_status()
-    bubble_model_available,
-    download_bubble_model,

@@ -21,6 +21,7 @@ from pathlib import Path
 from PIL import Image
 from config import (
     BASE_DIR,
+    MAX_FILE_SIZE,
     ocr_panel_dir,
     ocr_panel_state_dir,
     panel_rabbithole_dir,
@@ -1544,9 +1545,9 @@ async def list_panels():
 @router.post("/upload")
 async def upload_panel(file: UploadFile = File(...)):
     try:
-        if file.content_type not in {"image/jpeg", "image/png"}:
-            raise HTTPException(status_code=400, detail="Only JPEG and PNG uploads are supported")
-        content = await file.read()
+        # Do not reject on the client-provided MIME type. Desktop/browser clients
+        # frequently use application/octet-stream; ImageService verifies the bytes.
+        content = await file.read(MAX_FILE_SIZE + 1)
         result = ImageService.save_uploaded_panel(content, file.filename)
         if not result.get("success"):
             raise HTTPException(status_code=400, detail=result.get("error", "Upload failed"))
@@ -1556,6 +1557,8 @@ async def upload_panel(file: UploadFile = File(...)):
     except Exception as e:
         logger.exception('component=upload status=failed msg="Upload failed"')
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        await file.close()
 
 
 @router.post("/{filename}/ocr")
