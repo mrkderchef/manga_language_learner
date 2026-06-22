@@ -92,7 +92,8 @@ const Learning = (() => {
         if (knew) knownCount++;
 
         try {
-            await API.submitLearningAnswer(panels[currentPanelIndex].filename, word.japanese, knew);
+            const panelComplete = currentVocabIndex === vocab.length - 1;
+            await API.submitLearningAnswer(panels[currentPanelIndex].filename, word.japanese, knew, panelComplete);
         } catch (error) {
             console.warn('Could not save Learning answer:', error);
         }

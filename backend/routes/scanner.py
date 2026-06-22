@@ -1,6 +1,7 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException
 from pydantic import BaseModel, Field
 from services.storage.image_service import ImageService
+from services.storage.json_store import write_json_atomic
 import services.recognition.mangaocr as manga_ocr_service
 import services.rabbithole.nlp as rabbithole_service
 import services.translation.engine as translation_engine
@@ -21,6 +22,7 @@ from pathlib import Path
 from PIL import Image
 from config import (
     BASE_DIR,
+    MAX_FILE_SIZE,
     ocr_panel_dir,
     ocr_panel_state_dir,
     panel_rabbithole_dir,
@@ -209,10 +211,7 @@ def _save_persisted_stage(panel_path: Path, kind: str, cache_key: str, result: d
         cache_dir = _stage_cache_dir(panel_path, kind)
         cache_dir.mkdir(parents=True, exist_ok=True)
         path = _stage_cache_path(panel_path, kind, cache_key)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_json_atomic(path, payload)
     legacy_latest = _stage_root_dir(panel_path, kind) / "latest.json"
     if legacy_latest.exists():
         legacy_latest.unlink()
@@ -281,8 +280,7 @@ def _load_state(panel_path: Path) -> dict:
 def _save_state(panel_path: Path, state: dict) -> None:
     state["version"] = OCR_CACHE_VERSION
     state.pop("ocr_logic_version", None)
-    _state_file(panel_path).parent.mkdir(parents=True, exist_ok=True)
-    _state_file(panel_path).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(_state_file(panel_path), state)
     _export_panel_metadata(panel_path, state)
 
 
@@ -335,7 +333,7 @@ def _export_panel_metadata(panel_path: Path, state: dict) -> None:
         
         # Save metadata
         metadata_file.parent.mkdir(parents=True, exist_ok=True)
-        metadata_file.write_text(json.dumps(panel_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json_atomic(metadata_file, panel_meta)
         
         logger.debug(f"Exported panel metadata for {panel_path.name} to {metadata_file}")
     except Exception as e:
@@ -1196,12 +1194,18 @@ def _merge_rabbithole_result(ocr_result: dict, rabbithole_result: dict) -> dict:
         if rabbit:
             ann["rabbithole"] = rabbit
     result["annotations"] = annotations
-    result["rabbithole_success"] = bool(rabbithole_result.get("success"))
+    rabbithole_success = bool(rabbithole_result.get("success"))
+    result["ocr_success"] = bool(ocr_result.get("success"))
+    result["rabbithole_success"] = rabbithole_success
+    # This payload belongs to the Rabbithole endpoint/job. OCR remains available
+    # independently, but an enrichment failure must not masquerade as job success.
+    result["success"] = rabbithole_success
     result["rabbithole_source"] = rabbithole_result.get("source")
     result["rabbithole_lookup_hits"] = rabbithole_result.get("global_lookup_hits", 0)
     result["rabbithole_lookup_misses"] = rabbithole_result.get("global_lookup_misses", 0)
     if rabbithole_result.get("rabbithole_error"):
         result["rabbithole_error"] = rabbithole_result["rabbithole_error"]
+        result["error"] = rabbithole_result["rabbithole_error"]
     return result
 
 
@@ -1267,10 +1271,10 @@ def _run_rabbithole_existing(panel_path: Path, options: dict | None = None) -> d
     if rabbithole_key and should_cache_rabbithole and rabbithole_result.get("success"):
         _save_persisted_stage(panel_path, "rabbithole", rabbithole_key, rabbithole_result)
     enriched = _merge_rabbithole_result(ocr_result, rabbithole_result)
-    _trace(trace, scan_id, "rabbithole", "done", "Rabbithole completed", annotations=len(enriched.get("annotations", []) or []))
+    if rabbithole_result.get("success"):
+        _trace(trace, scan_id, "rabbithole", "done", "Rabbithole completed", annotations=len(enriched.get("annotations", []) or []))
     enriched["scan_trace"] = trace
     enriched["panel_cache"] = _panel_cache_status(state, panel_path)
-    _save_state(panel_path, state)
     return enriched
 
 
@@ -1331,11 +1335,23 @@ def _run_rabbithole_job(job_id: str, panel_path: Path, options: dict) -> None:
 
 def _start_rabbithole_job(filename: str, panel_path: Path, options: dict) -> dict:
     _prune_rabbithole_jobs()
+    current_ocr = _build_ocr_result_from_state(panel_path, _load_state(panel_path), options)
+    request_key = f"{filename}:{_rabbithole_options_key(current_ocr.get('annotations', []) or [])}"
+    with _RABBITHOLE_JOBS_LOCK:
+        existing = next((
+            copy.deepcopy(job)
+            for job in _RABBITHOLE_JOBS.values()
+            if job.get("request_key") == request_key and job.get("status") in {"queued", "running"}
+        ), None)
+    if existing:
+        return existing
+
     job_id = uuid.uuid4().hex[:12]
     now = round(time.time(), 3)
     job = {
         "job_id": job_id,
         "filename": filename,
+        "request_key": request_key,
         "status": "queued",
         "created_at": now,
         "updated_at": now,
@@ -1414,7 +1430,6 @@ def _run_translate_existing(panel_path: Path, options: dict | None = None) -> di
     _trace(trace, scan_id, "translation", "done", "Translate completed", annotations=len(enriched.get("annotations", []) or []))
     enriched["scan_trace"] = trace
     enriched["panel_cache"] = _panel_cache_status(state, panel_path)
-    _save_state(panel_path, state)
     return enriched
 
 
@@ -1544,9 +1559,9 @@ async def list_panels():
 @router.post("/upload")
 async def upload_panel(file: UploadFile = File(...)):
     try:
-        if file.content_type not in {"image/jpeg", "image/png"}:
-            raise HTTPException(status_code=400, detail="Only JPEG and PNG uploads are supported")
-        content = await file.read()
+        # Do not reject on the client-provided MIME type. Desktop/browser clients
+        # frequently use application/octet-stream; ImageService verifies the bytes.
+        content = await file.read(MAX_FILE_SIZE + 1)
         result = ImageService.save_uploaded_panel(content, file.filename)
         if not result.get("success"):
             raise HTTPException(status_code=400, detail=result.get("error", "Upload failed"))
@@ -1556,6 +1571,8 @@ async def upload_panel(file: UploadFile = File(...)):
     except Exception as e:
         logger.exception('component=upload status=failed msg="Upload failed"')
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        await file.close()
 
 
 @router.post("/{filename}/ocr")

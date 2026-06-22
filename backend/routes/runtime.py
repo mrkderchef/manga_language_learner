@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/runtime", tags=["runtime"])
 
 @router.get("/status")
 async def runtime_status():
-    return check_runtime_status()
+    return await asyncio.to_thread(check_runtime_status)
 
 
 @router.post("/ocr-assets/download")

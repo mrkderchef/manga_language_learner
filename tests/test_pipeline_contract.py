@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 import asyncio
+import io
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -23,11 +24,14 @@ from config import panel_data_dir  # noqa: E402
 from services.storage.image_service import ImageService  # noqa: E402
 from routes import scanner  # noqa: E402
 from routes import runtime as runtime_routes  # noqa: E402
+from routes import learning as learning_routes  # noqa: E402
 from services import bootstrap  # noqa: E402
 from services import model_assets  # noqa: E402
 from services import logging_config  # noqa: E402
 from services.recognition import mangaocr as mangaocr_service  # noqa: E402
 from services.rabbithole import nlp as rabbithole_nlp  # noqa: E402
+from services.rabbithole import reference_data as rabbithole_reference_data  # noqa: E402
+from services.storage.json_store import write_json_atomic  # noqa: E402
 from services.translation import engine as translation_engine  # noqa: E402
 from services.rendering import panel_renderer  # noqa: E402
 from services.vision.bubble_allocator import associate_model_bubbles, estimate_allocation_space  # noqa: E402
@@ -170,6 +174,52 @@ class PipelineContractTests(unittest.TestCase):
             result = status["result"]
             self.assertTrue(result["success"])
             self.assertEqual(result["annotations"][0]["rabbithole"]["reading_hiragana"], "ねこ")
+        finally:
+            with scanner._RABBITHOLE_JOBS_LOCK:
+                scanner._RABBITHOLE_JOBS.clear()
+            _cleanup_panel(panel)
+
+    def test_rabbithole_failure_does_not_report_ocr_success_as_job_success(self):
+        panel = _fake_panel()
+        try:
+            with patch.object(scanner, "detect_text_regions", return_value=[_fake_region()]), \
+                    patch("services.recognition.ocr_provider.run_ocr", side_effect=_fake_ocr_result):
+                scanner._run_ocr(panel, {"use_cache": False})
+
+            with patch.object(
+                scanner.rabbithole_service,
+                "build_panel_rabbithole",
+                side_effect=RuntimeError("lookup unavailable"),
+            ):
+                result = scanner._run_rabbithole_existing(panel, {"use_cache": False})
+
+            self.assertFalse(result["success"])
+            self.assertTrue(result["ocr_success"])
+            self.assertFalse(result["rabbithole_success"])
+            self.assertEqual(result["error"], "lookup unavailable")
+            self.assertEqual(result["annotations"][0]["text"], "猫")
+            self.assertFalse(any(
+                event.get("status") == "done" and event.get("message") == "Rabbithole completed"
+                for event in result["scan_trace"]
+            ))
+        finally:
+            _cleanup_panel(panel)
+
+    def test_duplicate_running_rabbithole_job_is_reused(self):
+        panel = _fake_panel()
+        try:
+            with patch.object(scanner, "detect_text_regions", return_value=[_fake_region()]), \
+                    patch("services.recognition.ocr_provider.run_ocr", side_effect=_fake_ocr_result):
+                scanner._run_ocr(panel, {"use_cache": False})
+            with scanner._RABBITHOLE_JOBS_LOCK:
+                scanner._RABBITHOLE_JOBS.clear()
+
+            with patch.object(scanner._RABBITHOLE_JOB_EXECUTOR, "submit") as submit:
+                first = scanner._start_rabbithole_job("panel.png", panel, {})
+                second = scanner._start_rabbithole_job("panel.png", panel, {})
+
+            self.assertEqual(first["job_id"], second["job_id"])
+            submit.assert_called_once()
         finally:
             with scanner._RABBITHOLE_JOBS_LOCK:
                 scanner._RABBITHOLE_JOBS.clear()
@@ -324,6 +374,16 @@ class PipelineContractTests(unittest.TestCase):
         self.assertNotIn("getCachedTranslation", scanner_source + api_source)
         self.assertNotIn("syncTranslatedPanelForCurrentSelection", scanner_source)
 
+    def test_frontend_finishes_ocr_before_background_rabbithole(self):
+        scanner_source = (ROOT / "frontend" / "js" / "scanner.js").read_text(encoding="utf-8")
+        handle_scan = scanner_source.split("async function handleScan", 1)[1].split(
+            "function hasComputedText", 1
+        )[0]
+
+        self.assertIn("void buildRabbitholeInBackground", handle_scan)
+        self.assertNotIn("await API.buildRabbithole", handle_scan)
+        self.assertIn("rabbitholeRequestGeneration", scanner_source)
+
     def test_rabbithole_help_popover_uses_unclipped_viewport_overlay(self):
         source = (ROOT / "frontend" / "js" / "scanner.js").read_text(encoding="utf-8")
         css = (ROOT / "frontend" / "css" / "scanner.css").read_text(encoding="utf-8")
@@ -463,6 +523,20 @@ class HybridBubbleTests(unittest.TestCase):
 
 
 class RabbitholeProvenanceTests(unittest.TestCase):
+    def test_lookup_cache_write_recreates_deleted_data_directories(self):
+        temp_root = Path(tempfile.mkdtemp(prefix="rabbithole-cache-"))
+        missing_cache_root = temp_root / "backend" / "data" / "lookup_cache"
+        try:
+            with patch.object(rabbithole_nlp, "LOOKUP_CACHE_DIR", missing_cache_root):
+                result = rabbithole_nlp._write_cache("readings", "ゆめ", {"reading": "ゆめ"})
+                cache_path = rabbithole_nlp._cache_path("readings", "ゆめ")
+
+            self.assertEqual(result["reading"], "ゆめ")
+            self.assertTrue(cache_path.is_file())
+            self.assertEqual(json.loads(cache_path.read_text(encoding="utf-8"))["reading"], "ゆめ")
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
     def test_kanji_readings_have_corrected_romaji_and_field_provenance(self):
         fixture = {
             "kanji": "夢",
@@ -581,6 +655,33 @@ class RabbitholeProvenanceTests(unittest.TestCase):
 
 
 class ApiContractTests(unittest.TestCase):
+    def test_atomic_json_write_recreates_parent_and_replaces_corrupt_file(self):
+        root = Path(tempfile.mkdtemp(prefix="json-store-"))
+        path = root / "deleted" / "state.json"
+        try:
+            write_json_atomic(path, {"ready": True})
+            path.write_text("{broken", encoding="utf-8")
+            write_json_atomic(path, {"ready": False})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"ready": False})
+            self.assertFalse(list(path.parent.glob("*.tmp")))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_learning_progress_recovers_from_deleted_or_invalid_data(self):
+        root = Path(tempfile.mkdtemp(prefix="learning-progress-"))
+        progress_file = root / "missing" / "learning_progress.json"
+        try:
+            with patch.object(learning_routes, "LEARNING_PROGRESS_FILE", progress_file):
+                learning_routes.save_learning_progress({"words": {}, "panels_completed": ["panel.png"]})
+                self.assertTrue(progress_file.is_file())
+                progress_file.write_text("not-json", encoding="utf-8")
+                self.assertEqual(learning_routes.load_learning_progress(), {"words": {}, "panels_completed": []})
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_editorial_fallback_has_one_unambiguous_de_entry(self):
+        self.assertEqual(rabbithole_reference_data.FUNCTION_GLOSSARY["で"], "location / means marker")
+
     @classmethod
     def setUpClass(cls):
         import app as backend_app
@@ -629,6 +730,42 @@ class ApiContractTests(unittest.TestCase):
         result = ImageService.save_uploaded_panel(b"not an image", "bad.png")
         self.assertFalse(result["success"])
 
+    def test_upload_normalizes_client_paths_and_common_filename_characters(self):
+        uploads_dir = Path(tempfile.mkdtemp(prefix="panel-uploads-"))
+        panels_dir = Path(tempfile.mkdtemp(prefix="panel-library-"))
+        image_bytes = io.BytesIO()
+        Image.new("RGB", (20, 20), "white").save(image_bytes, format="PNG")
+        try:
+            with patch("services.storage.image_service.UPLOADS_DIR", uploads_dir), \
+                    patch("services.storage.image_service.PANELS_DIR", panels_dir):
+                result = ImageService.save_uploaded_panel(
+                    image_bytes.getvalue(),
+                    r"C:\fakepath\Screenshot 2026-06-22 (1).PNG",
+                )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["filename"], "Screenshot-2026-06-22-1.png")
+            self.assertTrue((uploads_dir / result["filename"]).is_file())
+        finally:
+            shutil.rmtree(uploads_dir, ignore_errors=True)
+            shutil.rmtree(panels_dir, ignore_errors=True)
+
+    def test_upload_does_not_overwrite_an_existing_panel(self):
+        uploads_dir = Path(tempfile.mkdtemp(prefix="panel-uploads-"))
+        panels_dir = Path(tempfile.mkdtemp(prefix="panel-library-"))
+        image_bytes = io.BytesIO()
+        Image.new("RGB", (20, 20), "white").save(image_bytes, format="PNG")
+        (panels_dir / "panel.png").write_bytes(image_bytes.getvalue())
+        try:
+            with patch("services.storage.image_service.UPLOADS_DIR", uploads_dir), \
+                    patch("services.storage.image_service.PANELS_DIR", panels_dir):
+                result = ImageService.save_uploaded_panel(image_bytes.getvalue(), "panel.png")
+
+            self.assertEqual(result["filename"], "panel-2.png")
+        finally:
+            shutil.rmtree(uploads_dir, ignore_errors=True)
+            shutil.rmtree(panels_dir, ignore_errors=True)
+
 
 class RuntimeHealthTests(unittest.TestCase):
     def test_runtime_routes_are_present(self):
@@ -661,13 +798,14 @@ class RuntimeHealthTests(unittest.TestCase):
 
     def test_missing_mangaocr_package_status_does_not_crash(self):
         with patch.object(bootstrap, "_manga_ocr_package_available", return_value=False), \
+                patch.object(bootstrap, "_manga_ocr_model_status", return_value={"available": True, "status": "ready"}), \
                 patch.object(bootstrap, "_detector_status", return_value={"available": True, "status": "ready"}), \
                 patch.object(bootstrap, "_ollama_status", return_value={"available": False, "status": "missing"}):
             status = bootstrap.check_runtime_status()
 
         self.assertFalse(status["ocr"]["ready"])
         self.assertEqual(status["ocr"]["package"]["status"], "missing")
-        self.assertEqual(status["ocr"]["mangaocr_model"]["status"], "blocked")
+        self.assertEqual(status["ocr"]["mangaocr_model"]["status"], "ready")
 
     def test_missing_mangaocr_model_status_does_not_crash(self):
         with patch.object(bootstrap, "_manga_ocr_package_available", return_value=True), \
@@ -699,6 +837,28 @@ class RuntimeHealthTests(unittest.TestCase):
             )
         finally:
             shutil.rmtree(model_dir, ignore_errors=True)
+
+    def test_zero_byte_mangaocr_file_is_treated_as_incomplete(self):
+        model_dir = Path(tempfile.mkdtemp(prefix="mangaocr-model-"))
+        try:
+            for filename in model_assets.MANGA_OCR_REQUIRED_FILES:
+                (model_dir / filename).write_bytes(b"ok")
+            (model_dir / "pytorch_model.bin").write_bytes(b"")
+
+            self.assertEqual(model_assets.missing_manga_ocr_files(model_dir), ["pytorch_model.bin"])
+        finally:
+            shutil.rmtree(model_dir, ignore_errors=True)
+
+    def test_ocr_model_download_does_not_require_mangaocr_package(self):
+        fake_status = {"success": True, "ocr": {"ready": False}, "warnings": []}
+        with patch.object(bootstrap, "_manga_ocr_package_available", return_value=False), \
+                patch.object(bootstrap, "download_manga_ocr_model", return_value=Path("/tmp/manga-ocr")) as download, \
+                patch.object(bootstrap, "ensure_text_region_model"), \
+                patch.object(bootstrap, "check_runtime_status", return_value=fake_status):
+            result = bootstrap.ensure_ocr_assets()
+
+        download.assert_called_once()
+        self.assertTrue(result["setup"]["success"])
 
     def test_mangaocr_loader_never_downloads_missing_assets(self):
         previous = mangaocr_service._mocr

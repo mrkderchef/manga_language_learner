@@ -25,6 +25,7 @@ import copy
 import cv2
 import logging
 import math
+import os
 import numpy as np
 import pyclipper
 from shapely.geometry import Polygon
@@ -888,12 +889,19 @@ def refine_undetected_mask(img: np.ndarray, mask_pred: np.ndarray, mask_refined:
 # ===========================================================================
 def _ensure_model() -> None:
     """Download the ONNX model if it is not present on disk."""
-    if _MODEL_PATH.exists():
+    if _MODEL_PATH.is_file() and _MODEL_PATH.stat().st_size > 1_000_000:
         return
     import urllib.request
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    partial_path = _MODEL_PATH.with_suffix(f"{_MODEL_PATH.suffix}.part")
     logger.info("Downloading comic-text-detector model (%s) …", _MODEL_URL)
-    urllib.request.urlretrieve(_MODEL_URL, str(_MODEL_PATH))
+    try:
+        urllib.request.urlretrieve(_MODEL_URL, str(partial_path))
+        if partial_path.stat().st_size <= 1_000_000:
+            raise RuntimeError("Downloaded text detector model is incomplete")
+        os.replace(partial_path, _MODEL_PATH)
+    finally:
+        partial_path.unlink(missing_ok=True)
     logger.info("Model saved to %s", _MODEL_PATH)
 
 

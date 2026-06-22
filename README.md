@@ -13,10 +13,15 @@ Manga Language Learner is a local-first reader for Japanese manga panels. It det
 
 ## Setup
 
+The project is developed and tested with **Python 3.10.14**. Use that version
+for a reproducible environment; other Python versions are currently unverified.
+
 ```bash
-python -m venv .venv
+python3.10 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python --version  # expected: Python 3.10.14
+pip check
 cp .env.example .env
 ```
 

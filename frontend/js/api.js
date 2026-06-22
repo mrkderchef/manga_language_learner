@@ -99,7 +99,11 @@ const API = (() => {
             return fetch(`${BASE_URL}/api/scanner/upload`, {
                 method: 'POST',
                 body: formData,
-            }).then(r => r.json()).then(data => {
+            }).then(async response => {
+                const data = await response.json().catch(() => ({ detail: response.statusText }));
+                if (!response.ok || !data.success) {
+                    throw new Error(data.detail || data.error || 'Upload failed');
+                }
                 invalidateCache('/api/scanner/panels');
                 invalidateCache('/api/learning/panels');
                 return data;
@@ -254,10 +258,10 @@ const API = (() => {
             return request(`/api/learning/${encodeURIComponent(filename)}/vocab`);
         },
 
-        submitLearningAnswer(filename, word, knew) {
+        submitLearningAnswer(filename, word, knew, panelComplete = false) {
             return request(`/api/learning/${encodeURIComponent(filename)}/answer`, {
                 method: 'POST',
-                body: JSON.stringify({ word, knew }),
+                body: JSON.stringify({ word, knew, panel_complete: panelComplete }),
             }).then(data => {
                 invalidateCache('/api/learning/progress');
                 return data;
