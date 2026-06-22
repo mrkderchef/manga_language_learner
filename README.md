@@ -1,6 +1,6 @@
 # Manga Language Learner
 
-Manga Language Learner is a local-first reader for Japanese manga panels. It detects text regions, runs MangaOCR on panel crops, builds learner-oriented dictionary context, and renders translations back onto the panel.
+Manga Language Learner is a local-first reader for Japanese manga panels. It detects text regions, runs MangaOCR on panel crops, builds learner-oriented dictionary and kanji context, and renders translations back onto the panel.
 
 ## Architecture Rules
 
@@ -10,15 +10,6 @@ Manga Language Learner is a local-first reader for Japanese manga panels. It det
 - **Runtime data is generated.** Panel state, OCR debug crops, translation cache, rendered panels, and thumbnails live under `backend/data/` as local runtime artifacts.
 
 ## Folder Guide
-
-- [backend](backend/README.md): FastAPI app, config, runtime health, routes, and services.
-- [backend/routes](backend/routes/README.md): HTTP route modules.
-- [backend/services](backend/services/README.md): OCR, detection, translation, rendering, storage, NLP, and runtime helpers.
-- [frontend](frontend/README.md): Vanilla HTML/CSS/JS reader UI.
-- [panels](panels/README.md): Sample panel source area and upload boundary.
-- [tests](tests/README.md): Contract tests for the pipeline and API surface.
-
-Every tracked source folder has a local `README.md`. Generated and reference folders such as `backend/data/`, `panels/uploads/`, `__pycache__/`, and `inspiration/` are documented from the source folders that create or consume them.
 
 ## Setup
 
