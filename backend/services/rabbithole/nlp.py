@@ -468,6 +468,9 @@ def _read_cache(kind: str, key: str) -> dict[str, Any] | None:
 
 def _write_cache(kind: str, key: str, data: dict[str, Any]) -> dict[str, Any]:
     path = _cache_path(kind, key)
+    # Generated runtime data may be removed while the backend is still alive.
+    # Recreate this cache bucket here instead of relying on module-import setup.
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(data)
     payload["_cache_schema_version"] = CACHE_SCHEMA_VERSION
     payload.setdefault("retrieved_at", int(time.time()))

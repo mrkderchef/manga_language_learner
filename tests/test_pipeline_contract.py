@@ -464,6 +464,20 @@ class HybridBubbleTests(unittest.TestCase):
 
 
 class RabbitholeProvenanceTests(unittest.TestCase):
+    def test_lookup_cache_write_recreates_deleted_data_directories(self):
+        temp_root = Path(tempfile.mkdtemp(prefix="rabbithole-cache-"))
+        missing_cache_root = temp_root / "backend" / "data" / "lookup_cache"
+        try:
+            with patch.object(rabbithole_nlp, "LOOKUP_CACHE_DIR", missing_cache_root):
+                result = rabbithole_nlp._write_cache("readings", "ゆめ", {"reading": "ゆめ"})
+                cache_path = rabbithole_nlp._cache_path("readings", "ゆめ")
+
+            self.assertEqual(result["reading"], "ゆめ")
+            self.assertTrue(cache_path.is_file())
+            self.assertEqual(json.loads(cache_path.read_text(encoding="utf-8"))["reading"], "ゆめ")
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
     def test_kanji_readings_have_corrected_romaji_and_field_provenance(self):
         fixture = {
             "kanji": "夢",
