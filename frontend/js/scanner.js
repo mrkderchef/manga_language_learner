@@ -64,6 +64,7 @@ const Scanner = (() => {
     let engineControlsLoaded = false;
     let latestCacheStatus = null;
     let lastScannedOcrFingerprint = null;
+    let rabbitholeRequestGeneration = 0;
     let runtimeDownloadRunning = false;
     let activeDebugTab = 'rabbithole';
     let activeVisionOverlay = 'none';
@@ -591,6 +592,7 @@ const Scanner = (() => {
         imgEl.classList.add('selected');
 
         selectedPanel = panel;
+        rabbitholeRequestGeneration += 1;
         const panelImg = document.getElementById('scanner-panel-img');
         panelImg.src = API.panelImageUrl(panel.path || panel.filename);
         panelImg.classList.remove('hidden');
@@ -697,6 +699,50 @@ const Scanner = (() => {
         return merged;
     }
 
+    function mergeRabbitholeIntoCurrentScan(baseResult, rabbitholeResult) {
+        const rabbitholeAnnotations = new Map(
+            (rabbitholeResult.annotations || []).map((ann, index) => [getAnnotationRegionId(ann, index), ann])
+        );
+        const rabbitholeTrace = (rabbitholeResult.scan_trace || [])
+            .filter(event => event.stage === 'rabbithole');
+        return {
+            ...baseResult,
+            rabbithole_success: true,
+            rabbithole_source: rabbitholeResult.rabbithole_source,
+            rabbithole_lookup_hits: rabbitholeResult.rabbithole_lookup_hits,
+            rabbithole_lookup_misses: rabbitholeResult.rabbithole_lookup_misses,
+            panel_cache: rabbitholeResult.panel_cache || baseResult.panel_cache,
+            scan_trace: [...(baseResult.scan_trace || []), ...rabbitholeTrace],
+            annotations: (baseResult.annotations || []).map((ann, index) => {
+                const rabbitAnn = rabbitholeAnnotations.get(getAnnotationRegionId(ann, index));
+                return rabbitAnn?.rabbithole ? { ...ann, rabbithole: rabbitAnn.rabbithole } : ann;
+            }),
+        };
+    }
+
+    async function buildRabbitholeInBackground(filename, options, generation) {
+        setPaneMessage('reader-rabbithole-content', 'Building Rabbithole context...');
+        try {
+            const rabbitholeResult = await API.buildRabbithole(filename, options);
+            if (generation !== rabbitholeRequestGeneration || selectedPanel?.filename !== filename) return;
+
+            latestScan = mergeRabbitholeIntoCurrentScan(latestScan || {}, rabbitholeResult);
+            renderDebugPanel(latestScan);
+            renderOverlays(latestScan.annotations || [], latestScan.image_width, latestScan.image_height);
+            refreshCacheStatus();
+        } catch (error) {
+            if (generation !== rabbitholeRequestGeneration || selectedPanel?.filename !== filename) return;
+
+            latestScan = {
+                ...(latestScan || {}),
+                rabbithole_success: false,
+                rabbithole_error: error.message,
+            };
+            renderDebugPanel(latestScan);
+            setPaneMessage('reader-rabbithole-content', `Rabbithole error: ${error.message}`);
+        }
+    }
+
     function annotationHydrationSignature(ann) {
         return JSON.stringify({
             text: ann?.text || '',
@@ -788,6 +834,9 @@ const Scanner = (() => {
         if (!selectedPanel) return;
 
         const btn = document.getElementById('btn-scan');
+        const filename = selectedPanel.filename;
+        const options = getScanOptions();
+        const rabbitholeGeneration = ++rabbitholeRequestGeneration;
         const hadExistingScan = Boolean(latestScan?.annotations?.length);
         let scanSucceeded = false;
 
@@ -800,7 +849,11 @@ const Scanner = (() => {
         }
 
         try {
-            const ocrResult = await API.scanPanel(selectedPanel.filename, getScanOptions());
+            const ocrResult = await API.scanPanel(filename, options);
+            if (rabbitholeGeneration !== rabbitholeRequestGeneration || selectedPanel?.filename !== filename) {
+                scanSucceeded = true;
+                return;
+            }
             resetTranslationView();
             rabbitholeCardStates.clear();
             latestScan = ocrResult;
@@ -809,22 +862,9 @@ const Scanner = (() => {
             renderDebugPanel(ocrResult);
             renderOverlays(ocrResult.annotations || [], ocrResult.image_width, ocrResult.image_height);
             setTranslateEnabled(hasComputedText(ocrResult.annotations || []) && !(ocrResult.annotations || []).some(isUncomputedAnnotation));
-            try {
-                setPaneMessage('reader-rabbithole-content', 'Building Rabbithole context...');
-                const rabbitholeResult = await API.buildRabbithole(selectedPanel.filename, getScanOptions());
-                latestScan = rabbitholeResult;
-                ocrText = rabbitholeResult.text || ocrText;
-                renderDebugPanel(rabbitholeResult);
-                renderOverlays(rabbitholeResult.annotations || [], rabbitholeResult.image_width, rabbitholeResult.image_height);
-                setTranslateEnabled(hasComputedText(rabbitholeResult.annotations || []));
-            } catch (rabbitErr) {
-                renderDebugPanel(ocrResult);
-                renderOverlays(ocrResult.annotations || [], ocrResult.image_width, ocrResult.image_height);
-                setTranslateEnabled(hasComputedText(ocrResult.annotations || []));
-                setPaneMessage('reader-rabbithole-content', `Rabbithole error: ${rabbitErr.message}`);
-            }
             scanSucceeded = true;
             refreshCacheStatus();
+            void buildRabbitholeInBackground(filename, options, rabbitholeGeneration);
         } catch (err) {
             setDebugStatus('Scan error: ' + err.message);
         } finally {

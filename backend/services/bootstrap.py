@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import logging
 from typing import Any
 
@@ -35,7 +35,11 @@ def _component(available: bool, *, status: str, error: str | None = None, **extr
 
 
 def _manga_ocr_package_available() -> bool:
-    return importlib.util.find_spec("manga_ocr") is not None
+    try:
+        module = importlib.import_module("manga_ocr")
+        return getattr(module, "MangaOcr", None) is not None
+    except Exception:
+        return False
 
 
 def _manga_ocr_model_status() -> dict[str, Any]:
@@ -72,12 +76,18 @@ def _detector_status() -> dict[str, Any]:
 
 def _bubble_model_status() -> dict[str, Any]:
     available = bubble_model_available()
-    package_available = importlib.util.find_spec("ultralytics") is not None
+    package_error = None
+    try:
+        module = importlib.import_module("ultralytics")
+        package_available = getattr(module, "YOLO", None) is not None
+    except Exception as exc:
+        package_available = False
+        package_error = str(exc)
     error = None
     if not available:
         error = "Optional bubble segmentation checkpoint is not present; classical fallback will be used"
     elif not package_available:
-        error = "Python package ultralytics is missing; classical fallback will be used"
+        error = f"Ultralytics cannot be imported: {package_error or 'YOLO is unavailable'}; classical fallback will be used"
     return _component(
         available and package_available,
         status="ready" if available and package_available else "missing",

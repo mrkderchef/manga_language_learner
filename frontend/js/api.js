@@ -258,10 +258,10 @@ const API = (() => {
             return request(`/api/learning/${encodeURIComponent(filename)}/vocab`);
         },
 
-        submitLearningAnswer(filename, word, knew) {
+        submitLearningAnswer(filename, word, knew, panelComplete = false) {
             return request(`/api/learning/${encodeURIComponent(filename)}/answer`, {
                 method: 'POST',
-                body: JSON.stringify({ word, knew }),
+                body: JSON.stringify({ word, knew, panel_complete: panelComplete }),
             }).then(data => {
                 invalidateCache('/api/learning/progress');
                 return data;

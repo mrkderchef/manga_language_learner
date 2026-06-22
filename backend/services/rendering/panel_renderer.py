@@ -19,6 +19,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from config import RENDER_FONT_PATH, panel_rendered_dir, ocr_panel_slug
+from services.storage.json_store import write_json_atomic
 from services.vision.bubble_allocator import (
 	allocation_space_from_annotation,
 	bbox_xyxy as shared_bbox_xyxy,
@@ -128,7 +129,7 @@ def render_translated_panel(panel_path: Path, scan_result: dict[str, Any]) -> di
 			_paint_translation(rendered, placement, image_w, image_h)
 
 		rendered.convert("RGB").save(output_path, quality=92, optimize=True)
-		metadata_path.write_text(json.dumps({"cache_name": cache_name}, sort_keys=True), encoding="utf-8")
+		write_json_atomic(metadata_path, {"cache_name": cache_name}, indent=None)
 		panel_id = ocr_panel_slug(panel_path)
 		return {
 			"translated_image_url": _rendered_image_url(panel_id, cache_name),

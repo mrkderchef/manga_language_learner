@@ -5,11 +5,14 @@ from typing import Dict, Optional
 from PIL import Image
 import io
 import re
+import threading
 import unicodedata
+import uuid
 from config import PANELS_DIR, UPLOADS_DIR, ALLOWED_EXTENSIONS, MAX_FILE_SIZE
 import logging
 
 logger = logging.getLogger(__name__)
+_UPLOAD_LOCK = threading.Lock()
 
 
 class ImageService:
@@ -138,19 +141,13 @@ class ImageService:
     def save_uploaded_panel(file_content: bytes, filename: str) -> Dict:
         """Save an uploaded panel file"""
         try:
-            safe_name = ImageService._upload_filename(filename)
-            if not safe_name:
-                return {
-                    "success": False,
-                    "error": "Only JPEG and PNG filenames are supported"
-                }
             if len(file_content) > MAX_FILE_SIZE:
                 return {
                     "success": False,
                     "error": f"File exceeds maximum size of {MAX_FILE_SIZE} bytes"
                 }
             # Validate file extension
-            ext = Path(safe_name).suffix.lower()
+            ext = Path(str(filename or "")).suffix.lower()
             if ext not in ALLOWED_EXTENSIONS:
                 return {
                     "success": False,
@@ -165,10 +162,21 @@ class ImageService:
                     "error": "Uploaded file is not a valid image"
                 }
             
-            # Save file
-            file_path = UPLOADS_DIR / safe_name
-            with open(file_path, "wb") as f:
-                f.write(file_content)
+            with _UPLOAD_LOCK:
+                safe_name = ImageService._upload_filename(filename)
+                if not safe_name:
+                    return {"success": False, "error": "Only JPEG and PNG filenames are supported"}
+                file_path = UPLOADS_DIR / safe_name
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = file_path.with_name(f".{file_path.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    with temporary.open("wb") as handle:
+                        handle.write(file_content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, file_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
             
             return {
                 "success": True,
